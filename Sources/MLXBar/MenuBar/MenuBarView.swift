@@ -12,7 +12,7 @@ struct MenuBarView: View {
             HStack {
                 Image(systemName: model.icon).font(.title2)
                 VStack(alignment: .leading) {
-                    Text(model.loadingModelName.map { "ロード中 · \(model.loadingEngine ?? "") · \($0)" }
+                    Text(model.loadingModelName.map { model.guiLanguage == "ja" ? "ロード中 · \(model.loadingEngine ?? "") · \($0)" : "Loading · \(model.loadingEngine ?? "") · \($0)" }
                          ?? model.loadedName.map { "Loaded · \(model.loadedEngine ?? "") · \($0)" }
                          ?? model.serviceStatus)
                         .font(.headline).lineLimit(1)
@@ -93,7 +93,6 @@ struct MenuBarView: View {
             }
             Divider()
             HStack {
-                Button("ランタイム更新…") { openWindow(id: "runtimes"); dismiss() }
                 Button("設定…") { openSettings(); dismiss() }
                 Spacer()
                 Button("終了") { NSApplication.shared.terminate(nil) }

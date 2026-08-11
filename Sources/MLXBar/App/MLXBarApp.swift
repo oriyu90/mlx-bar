@@ -13,6 +13,7 @@ struct MLXBarApp: App {
     var body: some Scene {
         MenuBarExtra {
             MenuBarView(model: model)
+                .environment(\.locale, Locale(identifier: model.guiLanguage))
         } label: {
             Label(model.shortStatus, systemImage: model.icon)
         }
@@ -21,18 +22,17 @@ struct MLXBarApp: App {
         Window("モデル", id: "models") {
             ModelCatalogView(model: model)
                 .frame(minWidth: 720, minHeight: 460)
+                .environment(\.locale, Locale(identifier: model.guiLanguage))
         }
         Window("クイックチャット", id: "chat") {
             QuickChatView(model: model)
                 .frame(minWidth: 640, minHeight: 520)
+                .environment(\.locale, Locale(identifier: model.guiLanguage))
         }
         Settings {
             MLXBarSettingsView(model: model)
-                .frame(width: 640, height: 480)
-        }
-        Window("ランタイム管理", id: "runtimes") {
-            RuntimeManagerView(model: model)
-                .frame(minWidth: 700, minHeight: 460)
+                .frame(minWidth: 820, idealWidth: 920, minHeight: 620, idealHeight: 720)
+                .environment(\.locale, Locale(identifier: model.guiLanguage))
         }
     }
 }

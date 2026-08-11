@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
+import time
 from pathlib import Path
 
 from .catalog.scanner import scan_all
@@ -43,6 +45,33 @@ class AppState:
                                     "catalog_classifier_version", CATALOG_CLASSIFIER_VERSION)
             return {"count": len(models)}
         return self.jobs.create("model_scan", work)
+
+    def runtime_update_job(self, engine: str) -> dict:
+        if engine not in {"mlx-lm", "mlx-vlm"}:
+            raise ValueError("unsupported runtime")
+        existing_id = self.runtime_update_jobs.get(engine)
+        if existing_id:
+            existing = self.database.get_job(existing_id)
+            if existing and existing["state"] in {"queued", "running"}:
+                return existing
+
+        async def work(update):
+            result = await self.runtime_updates.update_latest(engine, update)
+            check = result.get("check")
+            if check:
+                check["checkedAt"] = time.time()
+                self.database.set_metadata_value(f"runtime_check:{engine}", json.dumps(check))
+            return result
+
+        job = self.jobs.create(f"runtime_update:{engine}", work)
+        self.runtime_update_jobs[engine] = job["id"]
+        return job
+
+    def install_missing_runtimes(self) -> list[dict]:
+        if not self.settings.data.get("runtimes", {}).get("autoInstallMissing", True):
+            return []
+        return [self.runtime_update_job(engine) for engine in ("mlx-lm", "mlx-vlm")
+                if not self.slots.active(engine).get("active")]
 
     @staticmethod
     def test_port(port: int, host: str = "127.0.0.1") -> dict:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 from mlxbar.catalog.classifier import classify
@@ -45,6 +46,14 @@ class ClassifierTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_english_is_default_and_only_supported_gui_languages_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["general"]["language"], "en")
+            self.assertEqual(store.update({"general": {"language": "ja"}})["general"]["language"], "ja")
+            with self.assertRaisesRegex(ValueError, "general.language"):
+                store.update({"general": {"language": "fr"}})
+
     def test_unknown_fields_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))
@@ -106,6 +115,17 @@ class PortTests(unittest.TestCase):
 
     def test_listener_host_is_restricted(self):
         self.assertEqual(AppState.test_port(12000, "192.0.2.10")["code"], "INVALID_HOST")
+
+
+class RuntimeBootstrapTests(unittest.TestCase):
+    def test_missing_runtimes_are_automatically_scheduled(self):
+        state = AppState.__new__(AppState)
+        state.settings = type("Settings", (), {"data": {"runtimes": {"autoInstallMissing": True}}})()
+        state.slots = type("Slots", (), {"active": lambda _self, engine: {"active": "slot" if engine == "mlx-lm" else None}})()
+        state.runtime_update_job = Mock(return_value={"id": "job"})
+        jobs = state.install_missing_runtimes()
+        self.assertEqual(jobs, [{"id": "job"}])
+        state.runtime_update_job.assert_called_once_with("mlx-vlm")
 
 
 class CLITests(unittest.TestCase):

@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .api.management import router as management_router
@@ -40,6 +41,16 @@ def make_public_app(state: AppState) -> FastAPI:
         if detail.get("retryable") is not None:
             error["retryable"] = detail["retryable"]
         return JSONResponse(status_code=exc.status_code, content={"error": error}, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def openai_validation_error(_request: Request, exc: RequestValidationError):
+        first = exc.errors()[0] if exc.errors() else {}
+        location = first.get("loc", ())
+        parameter = ".".join(str(item) for item in location if item != "body") or None
+        return JSONResponse(status_code=422, content={"error": {
+            "message": first.get("msg", "Invalid request body"),
+            "type": "invalid_request_error", "param": parameter, "code": "INVALID_REQUEST",
+        }})
 
     @app.middleware("http")
     async def recent_api_log(request: Request, call_next):
@@ -196,6 +207,9 @@ async def serve(root: Path | None = None) -> None:
             os.chmod(socket_path, 0o600)
             break
         await asyncio.sleep(0.1)
+    # Keep first launch responsive while isolated runtimes are installed in
+    # background jobs. Progress and failures are visible in Runtime settings.
+    state.install_missing_runtimes()
     if (state.database.metadata_value("catalog_classifier_version") != CATALOG_CLASSIFIER_VERSION
             or not state.database.list_models()
             or state.database.has_duplicate_model_paths()

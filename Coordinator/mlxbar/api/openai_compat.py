@@ -67,6 +67,15 @@ async def chat(request: Request, body: dict):
     unsupported = set(body) - allowed
     if unsupported:
         raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER", "parameters": sorted(unsupported)})
+    if not isinstance(body.get("stream", False), bool):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "stream must be a boolean", "param": "stream"})
+    stream_options = body.get("stream_options")
+    if stream_options is not None:
+        if not body.get("stream") or not isinstance(stream_options, dict):
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "stream_options requires stream=true", "param": "stream_options"})
+        unknown_stream_options = set(stream_options) - {"include_usage", "include_obfuscation"}
+        if unknown_stream_options or any(not isinstance(value, bool) for value in stream_options.values()):
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "Invalid stream_options", "param": "stream_options"})
     requested_model = body.get("model")
     if not isinstance(requested_model, str) or not requested_model.strip():
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "modelを指定してください"})
@@ -118,6 +127,8 @@ async def chat(request: Request, body: dict):
         normalized_messages.append(normalized)
     tools = _normalize_tools(body.get("tools"))
     tool_choice = _normalize_tool_choice(body.get("tool_choice"), tools)
+    if tool_choice == "required" and not tools:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "tool_choice=required needs at least one tool", "param": "tool_choice"})
     effective_tools = [] if tool_choice == "none" else tools
     if isinstance(tool_choice, dict):
         selected_name = tool_choice["function"]["name"]
@@ -129,6 +140,10 @@ async def chat(request: Request, body: dict):
                              "stream": bool(body.get("stream")), "message_count": len(messages),
                              "tool_count": len(tools)}
     max_tokens = body.get("max_completion_tokens", body.get("max_tokens", 512))
+    if max_tokens is None:
+        max_tokens = 512
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "max_tokens must be a positive integer", "param": "max_tokens"})
     generation_defaults = app_state(request).settings.data.get("generation", {})
     options = {"temperature": body.get("temperature", generation_defaults.get("defaultTemperature", 0.7)),
                "top_p": body.get("top_p", generation_defaults.get("defaultTopP", 1.0)),
@@ -157,9 +172,11 @@ async def chat(request: Request, body: dict):
         async def stream():
             usage = _usage(normalized_messages, "")
             completion_text = ""
+            created = int(time.time())
+            completed = False
+            failed = False
             try:
-                role_sent = True
-                initial = {"id": request_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                initial = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                            "model": response_model, "choices": [{"index": 0,
                            "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield "data: " + json.dumps(initial, ensure_ascii=False) + "\n\n"
@@ -168,26 +185,30 @@ async def chat(request: Request, body: dict):
                         completion_text += event["text"]
                         usage = _usage(normalized_messages, completion_text)
                         delta = {"content": event["text"]}
-                        if not role_sent:
-                            delta["role"] = "assistant"; role_sent = True
-                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
                                  "delta": delta, "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_calls":
-                        for chunk in _tool_call_stream_chunks(request_id, response_model, event.get("calls") or []):
+                        for chunk in _tool_call_stream_chunks(request_id, response_model, event.get("calls") or [], created):
                             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_call_delta":
-                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
                                  "delta": {"role": "assistant", "tool_calls": event.get("calls") or []},
                                  "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "completed":
-                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                        if completed:
+                            continue
+                        finish_reason = event.get("finish_reason", "stop")
+                        if finish_reason not in {"stop", "length", "tool_calls", "content_filter", "function_call"}:
+                            finish_reason = "stop"
+                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0, "delta": {},
-                                 "finish_reason": event.get("finish_reason", "stop")}]}
+                                 "finish_reason": finish_reason}]}
                         yield "data: " + json.dumps(chunk) + "\n\n"
+                        completed = True
                     elif event.get("type") == "usage":
                         usage = _usage_from_event(event, usage)
                     elif event.get("type") in {"phase", "heartbeat", "queue"}:
@@ -195,24 +216,32 @@ async def chat(request: Request, body: dict):
                         # connection alive during long tokenization/prefill.
                         yield ": mlxbar keep-alive\n\n"
                     elif event.get("type") == "error":
+                        failed = True
                         request.state.api_log["error_code"] = event.get("code", "GENERATION_FAILED")
                         yield "data: " + json.dumps({"error": {"code": event.get("code", "GENERATION_FAILED"),
                               "message": event.get("message", "生成に失敗しました"),
                               "retryable": event.get("retryable", False)}}, ensure_ascii=False) + "\n\n"
                         break
             except MLXBarError as exc:
+                failed = True
                 request.state.api_log["error_code"] = exc.code
                 yield "data: " + json.dumps(exc.as_dict(), ensure_ascii=False) + "\n\n"
             except Exception as exc:
+                failed = True
                 request.state.api_log["error_code"] = "INTERNAL_ERROR"
                 yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
                                                          "retryable": False}}, ensure_ascii=False) + "\n\n"
-            if (body.get("stream_options") or {}).get("include_usage"):
+            if not failed and not completed:
+                chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
+                         "model": response_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield "data: " + json.dumps(chunk) + "\n\n"
+            if not failed and (body.get("stream_options") or {}).get("include_usage"):
                 yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
-                    "created": int(time.time()), "model": response_model, "choices": [], "usage": usage}) + "\n\n"
+                    "created": created, "model": response_model, "choices": [], "usage": usage}) + "\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(stream(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                                          "X-Accel-Buffering": "no"})
     text = ""
     tool_calls: list[dict] = []
     finish_reason = "stop"
@@ -394,9 +423,9 @@ def _merge_tool_call_deltas(current: list[dict], deltas: list[dict]) -> list[dic
     return current
 
 
-def _tool_call_stream_chunks(request_id: str, model: str, calls: list[dict]):
+def _tool_call_stream_chunks(request_id: str, model: str, calls: list[dict], created: int | None = None):
     normalized = _normalize_output_tool_calls(calls)
-    created = int(time.time())
+    created = created or int(time.time())
     for index, call in enumerate(normalized):
         first = {"index": index, "id": call["id"], "type": "function",
                  "function": {"name": call["function"]["name"], "arguments": ""}}

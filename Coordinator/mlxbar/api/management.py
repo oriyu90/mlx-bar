@@ -144,23 +144,7 @@ async def runtime_update(engine: str, request: Request):
     app = state(request)
     if engine not in {"mlx-lm", "mlx-vlm"}:
         raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
-    existing_id = app.runtime_update_jobs.get(engine)
-    if existing_id:
-        existing = app.database.get_job(existing_id)
-        if existing and existing["state"] in {"queued", "running"}:
-            return existing
-
-    async def work(update):
-        result = await app.runtime_updates.update_latest(engine, update)
-        check = result.get("check")
-        if check:
-            check["checkedAt"] = time.time()
-            app.database.set_metadata_value(f"runtime_check:{engine}", json.dumps(check))
-        return result
-
-    job = app.jobs.create(f"runtime_update:{engine}", work)
-    app.runtime_update_jobs[engine] = job["id"]
-    return job
+    return app.runtime_update_job(engine)
 
 
 @router.get("/runtimes/{engine}/history")

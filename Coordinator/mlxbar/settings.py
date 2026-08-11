@@ -27,6 +27,7 @@ DEFAULTS: dict[str, Any] = {
     "runtimes": {
         "mlx-lm": {"channel": "stable", "autoCheck": True},
         "mlx-vlm": {"channel": "stable", "autoCheck": True},
+        "autoInstallMissing": True,
         "checkIntervalHours": 168,
         "keepSlots": 3,
     },
@@ -49,7 +50,7 @@ DEFAULTS: dict[str, Any] = {
         "memoryLimitRatio": 0.90,
     },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False},
-    "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info"},
+    "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info", "language": "en"},
 }
 
 
@@ -123,6 +124,8 @@ class SettingsStore:
             raise ValueError("port must be between 1024 and 65535")
         if not isinstance(data.get("models", {}).get("autoLoadOnAPIRequest"), bool):
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
+        if data.get("general", {}).get("language") not in {"en", "ja"}:
+            raise ValueError("general.language must be en or ja")
         generation = data.get("generation", {})
         integer_ranges = {
             "maxTokens": (1, 2_000_000),

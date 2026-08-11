@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleDevelopmentRegion</key><string>ja</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleDisplayName</key><string>MLXBar</string>
   <key>CFBundleExecutable</key><string>MLXBar</string>
   <key>CFBundleIdentifier</key><string>com.yukiorita.MLXBar</string>
@@ -14,5 +14,5 @@
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSLocalNetworkUsageDescription</key><string>ローカルネットワーク上の端末からMLXBar APIへ接続できるようにします。</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Allow devices on your local network to connect to the MLXBar API.</string>
 </dict></plist>

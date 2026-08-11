@@ -86,6 +86,38 @@ def test_streaming_tool_calls_use_delta_and_terminal_finish_reason():
         assert response.text.rstrip().endswith("data: [DONE]")
 
 
+def test_streaming_chunks_keep_stable_timestamp_and_single_terminal_chunk():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        response = client.post("/v1/chat/completions", json=request_body(stream=True))
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: {")]
+        chunks = [event for event in events if event.get("object") == "chat.completion.chunk"]
+        assert len({event["created"] for event in chunks}) == 1
+        terminal = [event for event in chunks
+                    if event.get("choices") and event["choices"][0].get("finish_reason") is not None]
+        assert len(terminal) == 1
+
+
+def test_invalid_stream_and_token_options_use_openai_error_shape():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        base = {"model": "Laguna-S-2.1-oQ2e", "messages": [{"role": "user", "content": "hello"}]}
+        invalid = ({"stream_options": {"include_usage": True}}, {"max_tokens": True}, {"stream": "yes"})
+        for values in invalid:
+            response = client.post("/v1/chat/completions", json={**base, **values})
+            assert response.status_code == 422
+            assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_non_object_body_uses_openai_error_shape():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        response = client.post("/v1/chat/completions", json=[])
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "INVALID_REQUEST"
+
+
 def test_specific_function_tool_choice_is_accepted_and_restricted():
     with tempfile.TemporaryDirectory() as directory:
         client, worker, _ = make_client(Path(directory))

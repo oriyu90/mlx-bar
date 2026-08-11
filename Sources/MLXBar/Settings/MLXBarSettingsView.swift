@@ -3,17 +3,20 @@ import SwiftUI
 struct MLXBarSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var selection = "APIサーバー"
+    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "ランタイム", "詳細", "削除"]
 
     var body: some View {
         NavigationSplitView {
-            List(["一般", "モデル", "APIサーバー", "LM Studio", "ランタイム", "詳細", "削除"], id: \.self, selection: $selection) { Text($0) }
+            List(pages, id: \.self, selection: $selection) { page in
+                Text(LocalizedStringKey(page))
+            }
         } detail: {
             switch selection {
             case "一般": GeneralSettingsView(model: model)
             case "モデル": ModelSourceSettingsView(model: model)
             case "APIサーバー": APISettingsView(model: model)
             case "LM Studio": LMStudioSettingsView(model: model)
-            case "ランタイム": Text("ランタイム管理画面で更新・ロールバックを操作できます。").padding()
+            case "ランタイム": RuntimeManagerView(model: model)
             case "詳細": DiagnosticsSettingsView(model: model)
             case "削除": DataRemovalSettingsView(model: model)
             default: EmptyView()
@@ -101,6 +104,15 @@ struct GeneralSettingsView: View {
     private var general: [String: Any] { model.settings["general"] as? [String: Any] ?? [:] }
     var body: some View {
         Form {
+            Picker("Language", selection: Binding(
+                get: { model.guiLanguage },
+                set: { value in Task { await model.setGUILanguage(value) } }
+            )) {
+                Text("English").tag("en")
+                Text("日本語").tag("ja")
+            }
+            Text("English is used by default. You can change the interface language here at any time.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("GUI終了後もサービスを継続", isOn: Binding(
                 get: { general["continueAfterGUIExit"] as? Bool ?? true },
                 set: { value in Task { await model.setConfig("general.continueAfterGUIExit", value: value) } }

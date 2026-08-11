@@ -89,7 +89,7 @@ struct RuntimeJobInfo {
 @MainActor
 final class MenuBarViewModel: ObservableObject {
     @Published var serviceRunning = false
-    @Published var serviceStatus = "サービス停止"
+    @Published var serviceStatus = "Service stopped"
     @Published var loadedName: String?
     @Published var loadedEngine: String?
     @Published var loadedModalities: [String] = []
@@ -129,6 +129,7 @@ final class MenuBarViewModel: ObservableObject {
     @Published var isRemovingAllData = false
     @Published var recentLogs: [[String: Any]] = []
     @Published var logStatus: String?
+    @Published var guiLanguage = "en"
     private let client = CoordinatorClient()
     private let cancellationClient = CoordinatorClient()
     private var polling: Task<Void, Never>?
@@ -137,6 +138,10 @@ final class MenuBarViewModel: ObservableObject {
     private var localLoadInProgress = false
     private var monitoredRuntimeJobIDs: Set<String> = []
 
+    private func ui(_ english: String, _ japanese: String) -> String {
+        guiLanguage == "ja" ? japanese : english
+    }
+
     var icon: String {
         if errorMessage != nil { return "exclamationmark.triangle" }
         if busy || activeRequestCount > 0 || queuedRequestCount > 0 { return "waveform" }
@@ -144,10 +149,10 @@ final class MenuBarViewModel: ObservableObject {
         return serviceRunning ? "cpu" : "cpu"
     }
     var shortStatus: String {
-        if let loadingModelName { return "ロード中 · \(loadingModelName)" }
-        if queuedRequestCount > 0 { return "応答中 · \(queuedRequestCount)件待機" }
-        if activeRequestCount > 0 { return "応答中 · \(loadedName ?? "モデル")" }
-        return loadedName ?? (serviceRunning ? "MLXBar" : "停止")
+        if let loadingModelName { return guiLanguage == "ja" ? "ロード中 · \(loadingModelName)" : "Loading · \(loadingModelName)" }
+        if queuedRequestCount > 0 { return guiLanguage == "ja" ? "応答中 · \(queuedRequestCount)件待機" : "Responding · \(queuedRequestCount) queued" }
+        if activeRequestCount > 0 { return guiLanguage == "ja" ? "応答中 · \(loadedName ?? "モデル")" : "Responding · \(loadedName ?? "Model")" }
+        return loadedName ?? (serviceRunning ? "MLXBar" : (guiLanguage == "ja" ? "停止" : "Stopped"))
     }
 
     func start() async {
@@ -177,7 +182,9 @@ final class MenuBarViewModel: ObservableObject {
             // user still needs to read. Only clear an earlier connection error
             // when the service has actually recovered.
             if !wasRunning { errorMessage = nil }
-            serviceStatus = json["service"] as? String == "running" ? "サービス稼働中" : "サービス停止"
+            serviceStatus = json["service"] as? String == "running"
+                ? (guiLanguage == "ja" ? "サービス稼働中" : "Service running")
+                : (guiLanguage == "ja" ? "サービス停止" : "Service stopped")
             activeRequestCount = (json["activeRequestCount"] as? NSNumber)?.intValue ?? 0
             queuedRequestCount = (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0
             oldestQueuedSeconds = (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0
@@ -212,7 +219,9 @@ final class MenuBarViewModel: ObservableObject {
                 lanEnabled = api["lanEnabled"] as? Bool ?? false
             }
         } catch {
-            serviceRunning = false; serviceStatus = "サービス停止"; activeRequestCount = 0
+            serviceRunning = false
+            serviceStatus = guiLanguage == "ja" ? "サービス停止" : "Service stopped"
+            activeRequestCount = 0
             queuedRequestCount = 0; oldestQueuedSeconds = 0
             errorMessage = error.localizedDescription
         }
@@ -238,7 +247,7 @@ final class MenuBarViewModel: ObservableObject {
         localLoadInProgress = true
         loadingModelName = model.name
         loadingEngine = engine == "auto" ? model.engine : engine
-        loadingPhase = "ロードを開始しています"
+        loadingPhase = ui("Starting model load", "ロードを開始しています")
         loadingStartedAt = Date()
         await perform {
             _ = try await self.json("POST", "/api/v1/models/\(self.pathComponent(model.id))/load", ["engine": engine])
@@ -284,20 +293,22 @@ final class MenuBarViewModel: ObservableObject {
     func cancelGeneration() async {
         guard let requestID = currentRequestID, !cancellationInProgress else { return }
         cancellationInProgress = true
-        cancellationStatus = "停止処理中…"
+        cancellationStatus = ui("Stopping…", "停止処理中…")
         requestedCancellations.insert(requestID)
         defer { cancellationInProgress = false }
         do {
             let data = try await cancellationClient.request("POST", "/api/v1/generate/\(pathComponent(requestID))/cancel")
             let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             if result?["cancelled"] as? Bool == true {
-                cancellationStatus = result?["forced"] as? Bool == true ? "生成を強制停止しました" : "生成を停止しました"
+                cancellationStatus = result?["forced"] as? Bool == true
+                    ? ui("Generation was force-stopped", "生成を強制停止しました")
+                    : ui("Generation stopped", "生成を停止しました")
                 if result?["forced"] as? Bool == true { await refreshStatus() }
             } else {
-                cancellationStatus = result?["message"] as? String ?? "生成はすでに終了しています"
+                cancellationStatus = ui("Generation has already finished", "生成はすでに終了しています")
             }
         } catch {
-            cancellationStatus = "停止に失敗しました"
+            cancellationStatus = ui("Could not stop generation", "停止に失敗しました")
             errorMessage = error.localizedDescription
         }
     }
@@ -305,15 +316,15 @@ final class MenuBarViewModel: ObservableObject {
     func cancelAllGenerations() async {
         guard !cancellationInProgress else { return }
         cancellationInProgress = true
-        cancellationStatus = "すべての生成を停止処理中…"
+        cancellationStatus = ui("Stopping all generations…", "すべての生成を停止処理中…")
         defer { cancellationInProgress = false }
         do {
             let data = try await cancellationClient.request("POST", "/api/v1/generate/cancel-all")
-            let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            cancellationStatus = result?["message"] as? String ?? "停止を要求しました"
+            _ = try JSONSerialization.jsonObject(with: data)
+            cancellationStatus = ui("Stop requested", "停止を要求しました")
             await refreshStatus()
         } catch {
-            cancellationStatus = "停止に失敗しました"
+            cancellationStatus = ui("Could not stop generation", "停止に失敗しました")
             errorMessage = error.localizedDescription
         }
     }
@@ -362,7 +373,9 @@ final class MenuBarViewModel: ObservableObject {
 
     func checkRuntimeUpdate(_ engine: String) async {
         guard !updatingEngines.contains(engine), !checkingRuntimeEngines.contains(engine) else { return }
-        checkingRuntimeEngines.insert(engine); runtimeProgress[engine] = "最新版を確認中…"; errorMessage = nil
+        checkingRuntimeEngines.insert(engine)
+        runtimeProgress[engine] = ui("Checking latest version…", "最新版を確認中…")
+        errorMessage = nil
         defer { checkingRuntimeEngines.remove(engine); runtimeProgress.removeValue(forKey: engine) }
         do {
             guard let value = try await json("POST", "/api/v1/runtimes/\(pathComponent(engine))/check") as? [String: Any] else { return }
@@ -425,7 +438,9 @@ final class MenuBarViewModel: ObservableObject {
     func deleteRuntimeSlot(_ engine: String, slot: String, version: String?) async {
         await perform {
             _ = try await self.json("DELETE", "/api/v1/runtimes/\(self.pathComponent(engine))/slots/\(self.pathComponent(slot))")
-            self.runtimeProgress[engine] = "\(version.map { "バージョン \($0)" } ?? "選択したランタイム")を削除しました"
+            self.runtimeProgress[engine] = self.ui(
+                "Removed \(version.map { "version \($0)" } ?? "the selected runtime")",
+                "\(version.map { "バージョン \($0)" } ?? "選択したランタイム")を削除しました")
             await self.refreshRuntimes()
         }
     }
@@ -445,6 +460,7 @@ final class MenuBarViewModel: ObservableObject {
     func refreshSettings() async {
         do {
             settings = try await json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
+            guiLanguage = ((settings["general"] as? [String: Any])?["language"] as? String) ?? "en"
             effectiveMaxTokens = loadedModelMaxTokens.map { min(configuredMaxTokens, $0) } ?? configuredMaxTokens
         }
         catch { errorMessage = error.localizedDescription }
@@ -452,6 +468,12 @@ final class MenuBarViewModel: ObservableObject {
 
     var configuredMaxTokens: Int {
         (((settings["generation"] as? [String: Any])?["maxTokens"] as? NSNumber)?.intValue) ?? 8192
+    }
+
+    func setGUILanguage(_ language: String) async {
+        guard ["en", "ja"].contains(language) else { return }
+        guiLanguage = language
+        await setConfig("general.language", value: language)
     }
 
     var configuredTemperature: Double {
@@ -471,16 +493,23 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     var modelActivityText: String {
-        if loadingModelName != nil { return "モデルをロード中" }
-        if queuedRequestCount > 0 { return "モデルが応答を生成中 · \(queuedRequestCount)件待機" }
-        if activeRequestCount > 0 { return "モデルが応答を生成中" }
-        if loadedName != nil { return "待機中" }
-        return "モデル未ロード"
+        if guiLanguage == "ja" {
+            if loadingModelName != nil { return "モデルをロード中" }
+            if queuedRequestCount > 0 { return "モデルが応答を生成中 · \(queuedRequestCount)件待機" }
+            if activeRequestCount > 0 { return "モデルが応答を生成中" }
+            if loadedName != nil { return "待機中" }
+            return "モデル未ロード"
+        }
+        if loadingModelName != nil { return "Loading model" }
+        if queuedRequestCount > 0 { return "Model is responding · \(queuedRequestCount) queued" }
+        if activeRequestCount > 0 { return "Model is responding" }
+        if loadedName != nil { return "Ready" }
+        return "No model loaded"
     }
 
     func setMaxTokenLimit(_ value: Int) async {
         guard 1...2_000_000 ~= value else {
-            errorMessage = "Max token上限は1〜2,000,000で指定してください"
+            errorMessage = ui("Maximum tokens must be between 1 and 2,000,000", "Max token上限は1〜2,000,000で指定してください")
             return
         }
         await setConfig("generation.maxTokens", value: value)
@@ -489,11 +518,11 @@ final class MenuBarViewModel: ObservableObject {
 
     func setQueueLimits(maximum: Int, timeout: Int) async {
         guard 1...64 ~= maximum else {
-            errorMessage = "生成待ち件数は1〜64で指定してください"
+            errorMessage = ui("Queue capacity must be between 1 and 64", "生成待ち件数は1〜64で指定してください")
             return
         }
         guard 10...7200 ~= timeout else {
-            errorMessage = "最大待ち時間は10〜7,200秒で指定してください"
+            errorMessage = ui("Maximum wait must be between 10 and 7,200 seconds", "最大待ち時間は10〜7,200秒で指定してください")
             return
         }
         await perform {
@@ -506,13 +535,13 @@ final class MenuBarViewModel: ObservableObject {
 
     func setSamplingDefaults(temperature: Double, topP: Double,
                              repetitionPenalty: Double, repetitionContextSize: Int) async {
-        guard 0...2 ~= temperature else { errorMessage = "温度は0〜2で指定してください"; return }
-        guard 0...1 ~= topP else { errorMessage = "Top Pは0〜1で指定してください"; return }
+        guard 0...2 ~= temperature else { errorMessage = ui("Temperature must be between 0 and 2", "温度は0〜2で指定してください"); return }
+        guard 0...1 ~= topP else { errorMessage = ui("Top P must be between 0 and 1", "Top Pは0〜1で指定してください"); return }
         guard 0.01...2 ~= repetitionPenalty else {
-            errorMessage = "繰り返しペナルティは0.01〜2で指定してください"; return
+            errorMessage = ui("Repetition penalty must be between 0.01 and 2", "繰り返しペナルティは0.01〜2で指定してください"); return
         }
         guard 1...32768 ~= repetitionContextSize else {
-            errorMessage = "ペナルティ対象範囲は1〜32,768 tokensで指定してください"; return
+            errorMessage = ui("Penalty context must be between 1 and 32,768 tokens", "ペナルティ対象範囲は1〜32,768 tokensで指定してください"); return
         }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
@@ -544,7 +573,9 @@ final class MenuBarViewModel: ObservableObject {
         do {
             guard let result = try await json("GET", "/api/v1/logs?limit=500") as? [String: Any] else { return }
             recentLogs = result["data"] as? [[String: Any]] ?? []
-            logStatus = recentLogs.isEmpty ? "記録されたAPIアクセスはありません" : "最新\(recentLogs.count)件を表示中（最大2,000件保存）"
+            logStatus = recentLogs.isEmpty
+                ? ui("No API access has been recorded", "記録されたAPIアクセスはありません")
+                : ui("Showing the latest \(recentLogs.count) entries (2,000 retained)", "最新\(recentLogs.count)件を表示中（最大2,000件保存）")
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -552,7 +583,7 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             _ = try await self.json("DELETE", "/api/v1/logs")
             self.recentLogs = []
-            self.logStatus = "ログを消去しました"
+            self.logStatus = self.ui("Logs cleared", "ログを消去しました")
         }
     }
 
@@ -560,7 +591,7 @@ final class MenuBarViewModel: ObservableObject {
         let text = recentLogs.map(Self.formatLog).joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        logStatus = "表示中のログをコピーしました"
+        logStatus = ui("Visible logs copied", "表示中のログをコピーしました")
     }
 
     static func formatLog(_ item: [String: Any]) -> String {
@@ -581,7 +612,7 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             guard let result = try await self.json("PUT", "/api/v1/settings/api-token", ["token": token]) as? [String: Any] else { return }
             self.apiToken = result["token"] as? String ?? ""
-            self.secretStatus = "APIキーを保存しました"
+            self.secretStatus = self.ui("API key saved", "APIキーを保存しました")
         }
     }
 
@@ -589,7 +620,7 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             guard let result = try await self.json("POST", "/api/v1/settings/api-token/regenerate") as? [String: Any] else { return }
             self.apiToken = result["token"] as? String ?? ""
-            self.secretStatus = "新しいAPIキーを生成しました"
+            self.secretStatus = self.ui("New API key generated", "新しいAPIキーを生成しました")
         }
     }
 
@@ -597,7 +628,9 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             guard let result = try await self.json("PUT", "/api/v1/settings/lm-studio-token", ["token": token]) as? [String: Any] else { return }
             self.lmStudioToken = result["token"] as? String ?? ""
-            self.secretStatus = self.lmStudioToken.isEmpty ? "LM Studio APIキーを削除しました" : "LM Studio APIキーを保存しました"
+            self.secretStatus = self.lmStudioToken.isEmpty
+                ? self.ui("LM Studio API key removed", "LM Studio APIキーを削除しました")
+                : self.ui("LM Studio API key saved", "LM Studio APIキーを保存しました")
         }
     }
 
@@ -617,7 +650,9 @@ final class MenuBarViewModel: ObservableObject {
             ]
             _ = try await self.json("PUT", "/api/v1/settings", patch)
             await self.refreshAll()
-            self.secretStatus = enabled ? "LAN公開を有効にしました" : "LAN公開を停止しました"
+            self.secretStatus = enabled
+                ? self.ui("LAN access enabled", "LAN公開を有効にしました")
+                : self.ui("LAN access disabled", "LAN公開を停止しました")
         }
     }
 
@@ -668,17 +703,18 @@ final class MenuBarViewModel: ObservableObject {
     func copyURL(_ url: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
-        secretStatus = "接続URLをコピーしました"
+        secretStatus = ui("Connection URL copied", "接続URLをコピーしました")
     }
 
     func copyLoadedModelName() {
         guard let loadedName else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(loadedName, forType: .string)
-        modelCopyStatus = "モデル名をコピーしました"
+        modelCopyStatus = ui("Model name copied", "モデル名をコピーしました")
+        let copiedStatus = modelCopyStatus
         Task {
             try? await Task.sleep(for: .seconds(2))
-            if self.modelCopyStatus == "モデル名をコピーしました" { self.modelCopyStatus = nil }
+            if self.modelCopyStatus == copiedStatus { self.modelCopyStatus = nil }
         }
     }
 
@@ -686,7 +722,7 @@ final class MenuBarViewModel: ObservableObject {
         guard !apiToken.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(apiToken, forType: .string)
-        secretStatus = "APIキーをコピーしました"
+        secretStatus = ui("API key copied", "APIキーをコピーしました")
     }
 
     private func json(_ method: String, _ path: String, _ body: Any? = nil) async throws -> Any {

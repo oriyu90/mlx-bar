@@ -30,7 +30,7 @@ struct RuntimeManagerView: View {
                 }
             }
         }
-        .navigationTitle("ランタイム管理")
+        .navigationTitle("ランタイム")
         .task { await model.refreshRuntimeManager() }
         .confirmationDialog("以前のランタイムを削除しますか？",
                             isPresented: Binding(
@@ -101,15 +101,25 @@ struct RuntimeManagerView: View {
     }
 
     private func updateButtonTitle(_ runtime: RuntimeInfo) -> String {
-        if runtime.active == nil { return "最新版をインストール" }
-        if model.runtimeUpdates[runtime.id]?.versionStatus == "newer_than_stable" { return "新しい版を使用中" }
-        return isConfirmedLatest(runtime) ? "最新版を使用中" : "最新版へ自動更新"
+        if model.guiLanguage == "ja" {
+            if runtime.active == nil { return "最新版をインストール" }
+            if model.runtimeUpdates[runtime.id]?.versionStatus == "newer_than_stable" { return "新しい版を使用中" }
+            return isConfirmedLatest(runtime) ? "最新版を使用中" : "最新版へ自動更新"
+        }
+        if runtime.active == nil { return "Install Latest" }
+        if model.runtimeUpdates[runtime.id]?.versionStatus == "newer_than_stable" { return "Using Newer Version" }
+        return isConfirmedLatest(runtime) ? "Up to Date" : "Update to Latest"
     }
 
     private func updateStatusText(_ runtime: RuntimeInfo, _ check: RuntimeUpdateInfo) -> String {
-        if runtime.active == nil || check.versionStatus == "not_installed" { return "最新版をインストールできます" }
-        if check.versionStatus == "newer_than_stable" { return "安定版より新しい版を使用中です" }
-        return check.updateAvailable ? "更新できます" : "最新版です"
+        if model.guiLanguage == "ja" {
+            if runtime.active == nil || check.versionStatus == "not_installed" { return "最新版をインストールできます" }
+            if check.versionStatus == "newer_than_stable" { return "安定版より新しい版を使用中です" }
+            return check.updateAvailable ? "更新できます" : "最新版です"
+        }
+        if runtime.active == nil || check.versionStatus == "not_installed" { return "Latest version can be installed" }
+        if check.versionStatus == "newer_than_stable" { return "Using a version newer than stable" }
+        return check.updateAvailable ? "Update available" : "Up to date"
     }
 
     private func updateStatusIcon(_ check: RuntimeUpdateInfo) -> String {
@@ -126,7 +136,11 @@ struct RuntimeManagerView: View {
                     Image(systemName: job.isFailed ? "xmark.circle.fill" : (job.isCancelled ? "stop.circle.fill" : "checkmark.circle.fill"))
                         .foregroundStyle(job.isFailed ? Color.red : (job.isCancelled ? Color.orange : Color.green))
                 }
-                Text(job.isActive ? job.operationName : (job.isFailed ? "処理に失敗しました" : (job.isCancelled ? "処理を中止しました" : "処理が完了しました")))
+                Text(job.isActive
+                     ? (model.guiLanguage == "ja" ? job.operationName : (job.kind.hasPrefix("runtime_stage:") ? "Download and verify runtime" : "Update runtime"))
+                     : (job.isFailed ? (model.guiLanguage == "ja" ? "処理に失敗しました" : "Operation Failed")
+                        : (job.isCancelled ? (model.guiLanguage == "ja" ? "処理を中止しました" : "Operation Cancelled")
+                           : (model.guiLanguage == "ja" ? "処理が完了しました" : "Operation Completed"))))
                     .font(.headline)
                 Spacer()
                 if let progress = job.progress {
@@ -137,7 +151,7 @@ struct RuntimeManagerView: View {
             if let progress = job.progress {
                 ProgressView(value: min(max(progress, 0), 1))
             }
-            Text(job.isFailed ? (job.errorMessage ?? job.message) : job.message)
+            Text(job.isFailed ? (job.errorMessage ?? runtimeMessage(job.message)) : runtimeMessage(job.message))
                 .font(.caption)
                 .foregroundStyle(job.isFailed ? .red : .secondary)
             if job.isActive {
@@ -251,13 +265,23 @@ struct RuntimeManagerView: View {
     }
 
     private func historyTitle(_ action: String) -> String {
+        if model.guiLanguage != "ja" {
+            switch action {
+            case "staged": return "Download and Verification Complete"
+            case "activated": return "Update Activated"
+            case "failed": return "Update Failed"
+            case "cancelled": return "Update Cancelled"
+            case "deleted": return "Runtime Removed"
+            default: return action
+            }
+        }
         switch action {
-        case "staged": "ダウンロード・検証完了"
-        case "activated": "更新・切替完了"
-        case "failed": "更新失敗"
-        case "cancelled": "更新中止"
-        case "deleted": "ランタイム削除"
-        default: action
+        case "staged": return "ダウンロード・検証完了"
+        case "activated": return "更新・切替完了"
+        case "failed": return "更新失敗"
+        case "cancelled": return "更新中止"
+        case "deleted": return "ランタイム削除"
+        default: return action
         }
     }
 
@@ -270,5 +294,23 @@ struct RuntimeManagerView: View {
         case "deleted": "trash"
         default: "clock"
         }
+    }
+
+    private func runtimeMessage(_ value: String) -> String {
+        guard model.guiLanguage != "ja" else { return value }
+        let exact = [
+            "待機中": "Queued", "開始しています": "Starting", "完了": "Completed", "失敗": "Failed",
+            "最新版を確認中": "Checking latest version", "新しいPython環境を作成中": "Creating a new Python environment",
+            "依存関係を検証中": "Verifying dependencies", "アダプター互換性を検証中": "Verifying adapter compatibility",
+            "新しいslotの検証が完了": "New runtime slot verified", "実行中の生成が終わるのを待っています": "Waiting for active generation to finish",
+            "新しいランタイムへ切替中": "Activating the new runtime", "切替後のワーカーを確認中": "Checking the new worker",
+            "使用中モデルを再ロード中": "Reloading the active model", "更新が完了しました": "Update completed",
+        ]
+        if let translated = exact[value] { return translated }
+        if value.contains("をダウンロード・インストール中") {
+            return value.replacingOccurrences(of: "をダウンロード・インストール中", with: " — downloading and installing")
+                .replacingOccurrences(of: "秒経過", with: "s elapsed")
+        }
+        return value
     }
 }
