@@ -1,0 +1,35 @@
+[project]
+name = "mlxbar"
+version = "1.0.0"
+description = "Local coordinator for MLXBar"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "packaging>=24,<27",
+  "pydantic>=2.9,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/oriyu90/mlx-bar"
+Repository = "https://github.com/oriyu90/mlx-bar"
+Issues = "https://github.com/oriyu90/mlx-bar/issues"
+
+[project.scripts]
+mlxbar-coordinator = "mlxbar.main:run"
+mlxbarctl = "mlxbar.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+  "pyinstaller>=6.16,<7",
+  "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["../Tests"]
+pythonpath = ["."]

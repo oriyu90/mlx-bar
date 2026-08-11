@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+CONTENTS=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+RESOURCE_BUNDLE="$CONTENTS/Resources/MLXBar_MLXBar.bundle"
+export PATH="$RESOURCE_BUNDLE:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+exec "$CONTENTS/Resources/coordinator/MLXBarCoordinator" "$@"

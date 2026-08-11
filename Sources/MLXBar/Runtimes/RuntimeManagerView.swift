@@ -1,0 +1,274 @@
+import SwiftUI
+
+private struct RuntimeDeletionTarget: Identifiable {
+    let engine: String
+    let slot: String
+    let version: String?
+    let isPrevious: Bool
+    var id: String { "\(engine):\(slot)" }
+}
+
+struct RuntimeManagerView: View {
+    @ObservedObject var model: MenuBarViewModel
+    @State private var versions: [String: String] = ["mlx-lm": "", "mlx-vlm": ""]
+    @State private var deletionTarget: RuntimeDeletionTarget?
+
+    var body: some View {
+        List {
+            if let error = model.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            }
+            ForEach(model.runtimes) { runtime in
+                Section {
+                    runtimeSummary(runtime)
+                    updateControls(runtime)
+                    advancedControls(runtime)
+                    history(runtime)
+                } header: {
+                    Label(runtime.id.uppercased(), systemImage: "shippingbox")
+                }
+            }
+        }
+        .navigationTitle("ランタイム管理")
+        .task { await model.refreshRuntimeManager() }
+        .confirmationDialog("以前のランタイムを削除しますか？",
+                            isPresented: Binding(
+                                get: { deletionTarget != nil },
+                                set: { if !$0 { deletionTarget = nil } }
+                            ), presenting: deletionTarget) { target in
+            Button("削除", role: .destructive) {
+                deletionTarget = nil
+                Task { await model.deleteRuntimeSlot(target.engine, slot: target.slot, version: target.version) }
+            }
+            Button("キャンセル", role: .cancel) { deletionTarget = nil }
+        } message: { target in
+            Text("\(target.engine.uppercased()) \(target.version.map { "\($0) " } ?? "")を削除します。\(target.isPrevious ? "この版は復元先として登録されています。削除後はこの版へ戻せません。" : "この操作は取り消せません。")")
+        }
+    }
+
+    @ViewBuilder
+    private func runtimeSummary(_ runtime: RuntimeInfo) -> some View {
+        LabeledContent("現在のバージョン", value: runtime.activeVersion ?? "未インストール")
+        if let active = runtime.active {
+            LabeledContent("保存領域ID", value: active)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if let check = model.runtimeUpdates[runtime.id] {
+            LabeledContent("最新安定版", value: check.candidateVersion ?? "取得できません")
+            Label(updateStatusText(runtime, check), systemImage: updateStatusIcon(check))
+                .foregroundStyle(check.updateAvailable ? .blue : .green)
+            if let checkedAt = check.checkedAt {
+                Text("最終確認: \(checkedAt.formatted(date: .abbreviated, time: .standard))")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        } else {
+            Text("最新版は未確認です")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func updateControls(_ runtime: RuntimeInfo) -> some View {
+        let updating = model.updatingEngines.contains(runtime.id)
+        let checking = model.checkingRuntimeEngines.contains(runtime.id)
+        HStack {
+            Button("更新を確認") { Task { await model.checkRuntimeUpdate(runtime.id) } }
+                .disabled(updating || checking)
+                .accessibilityLabel("\(runtime.id)の更新を確認")
+            Button(updateButtonTitle(runtime)) {
+                Task { await model.updateRuntimeAutomatically(runtime.id) }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(updating || checking || isConfirmedLatest(runtime))
+            .accessibilityLabel("\(runtime.id)を最新版へ更新")
+            Spacer()
+            if checking { ProgressView().controlSize(.small) }
+        }
+        if let progress = model.runtimeProgress[runtime.id] {
+            Text(progress).font(.caption).foregroundStyle(.secondary)
+        }
+        if let job = model.runtimeJobs[runtime.id] {
+            runtimeJobCard(runtime.id, job: job)
+        }
+        Text("新しい環境へ取得・検証してから切り替えます。失敗時は状態を確認し、安全に戻せる場合だけ以前の版へ復元します。")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func isConfirmedLatest(_ runtime: RuntimeInfo) -> Bool {
+        guard runtime.active != nil, let check = model.runtimeUpdates[runtime.id] else { return false }
+        return !check.updateAvailable
+    }
+
+    private func updateButtonTitle(_ runtime: RuntimeInfo) -> String {
+        if runtime.active == nil { return "最新版をインストール" }
+        if model.runtimeUpdates[runtime.id]?.versionStatus == "newer_than_stable" { return "新しい版を使用中" }
+        return isConfirmedLatest(runtime) ? "最新版を使用中" : "最新版へ自動更新"
+    }
+
+    private func updateStatusText(_ runtime: RuntimeInfo, _ check: RuntimeUpdateInfo) -> String {
+        if runtime.active == nil || check.versionStatus == "not_installed" { return "最新版をインストールできます" }
+        if check.versionStatus == "newer_than_stable" { return "安定版より新しい版を使用中です" }
+        return check.updateAvailable ? "更新できます" : "最新版です"
+    }
+
+    private func updateStatusIcon(_ check: RuntimeUpdateInfo) -> String {
+        check.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle.fill"
+    }
+
+    @ViewBuilder
+    private func runtimeJobCard(_ engine: String, job: RuntimeJobInfo) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                if job.isActive {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: job.isFailed ? "xmark.circle.fill" : (job.isCancelled ? "stop.circle.fill" : "checkmark.circle.fill"))
+                        .foregroundStyle(job.isFailed ? Color.red : (job.isCancelled ? Color.orange : Color.green))
+                }
+                Text(job.isActive ? job.operationName : (job.isFailed ? "処理に失敗しました" : (job.isCancelled ? "処理を中止しました" : "処理が完了しました")))
+                    .font(.headline)
+                Spacer()
+                if let progress = job.progress {
+                    Text("\(Int(min(max(progress, 0), 1) * 100))%")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            if let progress = job.progress {
+                ProgressView(value: min(max(progress, 0), 1))
+            }
+            Text(job.isFailed ? (job.errorMessage ?? job.message) : job.message)
+                .font(.caption)
+                .foregroundStyle(job.isFailed ? .red : .secondary)
+            if job.isActive {
+                Button("処理を中止", role: .destructive) {
+                    Task { await model.cancelRuntimeJob(engine) }
+                }
+                .accessibilityLabel("\(engine)のランタイム処理を中止")
+            }
+            if job.errorCode == "ROLLBACK_FAILED" {
+                Label("旧ランタイムへの復元にも失敗しました", systemImage: "exclamationmark.octagon.fill")
+                    .font(.caption).foregroundStyle(.red)
+            } else if job.errorCode == "JOB_INTERRUPTED" {
+                Text("サービス再起動により中断されました。再実行してください。")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func advancedControls(_ runtime: RuntimeInfo) -> some View {
+        let updating = model.updatingEngines.contains(runtime.id)
+        let canRollback = runtime.slots.contains { ($0["previous"] as? Bool) == true }
+        DisclosureGroup("詳細・手動操作") {
+            HStack {
+                TextField("指定バージョン", text: Binding(
+                    get: { versions[runtime.id] ?? "" },
+                    set: { versions[runtime.id] = $0 }
+                ))
+                Button("指定版をダウンロード・検証") {
+                    Task { await model.stageRuntime(runtime.id, version: versions[runtime.id]) }
+                }
+                .disabled(updating || model.busy)
+                .accessibilityLabel("\(runtime.id)の指定バージョンをダウンロードして検証")
+                Button("前の版へ戻す") { Task { await model.rollback(runtime.id) } }
+                    .disabled(!canRollback || updating || model.busy)
+                    .accessibilityLabel("\(runtime.id)を前のバージョンへ戻す")
+            }
+            ForEach(runtime.slots.indices, id: \.self) { index in
+                slotRow(runtime, slot: runtime.slots[index])
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func slotRow(_ runtime: RuntimeInfo, slot: [String: Any]) -> some View {
+        let active = (slot["active"] as? Bool) == true
+        let previous = (slot["previous"] as? Bool) == true
+        let id = slot["id"] as? String ?? "unknown"
+        let version = (slot["probe"] as? [String: Any])?["version"] as? String
+        HStack {
+            Image(systemName: active ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(active ? .green : .secondary)
+            VStack(alignment: .leading) {
+                Text(version.map { "バージョン \($0)" } ?? "バージョン不明")
+                Text(id).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if active { Text("使用中").font(.caption).foregroundStyle(.green) }
+            else if previous { Text("ロールバック用").font(.caption).foregroundStyle(.orange) }
+            Spacer()
+            if !active {
+                Button("切替") { Task { await model.activate(runtime.id, slot: id) } }
+                    .disabled(model.busy || model.updatingEngines.contains(runtime.id))
+                    .accessibilityLabel("\(runtime.id) バージョン\(version ?? "不明")へ切り替え")
+                Button("削除…", role: .destructive) {
+                    deletionTarget = RuntimeDeletionTarget(engine: runtime.id, slot: id,
+                                                           version: version, isPrevious: previous)
+                }
+                .disabled(model.busy || model.updatingEngines.contains(runtime.id))
+                .accessibilityLabel("\(runtime.id) バージョン\(version ?? "不明")を削除")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func history(_ runtime: RuntimeInfo) -> some View {
+        if !runtime.history.isEmpty {
+            DisclosureGroup("更新履歴") {
+                ForEach(runtime.history.indices, id: \.self) { index in
+                    historyRow(runtime.history[index])
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func historyRow(_ item: [String: Any]) -> some View {
+        let action = item["action"] as? String ?? "unknown"
+        let result = item["result"] as? [String: Any] ?? [:]
+        let version = (result["version"] as? String)
+            ?? ((result["probe"] as? [String: Any])?["version"] as? String)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Label(historyTitle(action), systemImage: historyIcon(action))
+                    .foregroundStyle(action == "failed" ? .red : .primary)
+                if let version { Text(version).font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                Text(item["created_at"] as? String ?? "")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if action == "failed", let message = result["message"] as? String {
+                Text(message).font(.caption).foregroundStyle(.red).lineLimit(3)
+                if result["rolledBack"] as? Bool == true {
+                    Text("旧ランタイムへ復元済み").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text("保存領域ID: \(item["slot_id"] as? String ?? "")")
+                .font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
+        }
+    }
+
+    private func historyTitle(_ action: String) -> String {
+        switch action {
+        case "staged": "ダウンロード・検証完了"
+        case "activated": "更新・切替完了"
+        case "failed": "更新失敗"
+        case "cancelled": "更新中止"
+        case "deleted": "ランタイム削除"
+        default: action
+        }
+    }
+
+    private func historyIcon(_ action: String) -> String {
+        switch action {
+        case "staged": "checkmark.shield"
+        case "activated": "arrow.triangle.2.circlepath.circle.fill"
+        case "failed": "xmark.octagon.fill"
+        case "cancelled": "stop.circle.fill"
+        case "deleted": "trash"
+        default: "clock"
+        }
+    }
+}

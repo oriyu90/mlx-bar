@@ -1,0 +1,17 @@
+.build/
+.swiftpm/
+.uv-cache/
+.release-python/
+.pyinstaller-work/
+.pyinstaller-config/
+.dmg-stage/
+Coordinator/.venv/
+Coordinator/mlxbar/__pycache__/
+Workers/**/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+.DS_Store
+icon.zip
+スクリーンショット 2026-08-11 13.49.25.png

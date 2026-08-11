@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RESOURCES_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+CONTENTS_DIR=$(CDPATH= cd -- "$RESOURCES_DIR/.." 2>/dev/null && pwd || true)
+PLIST="$CONTENTS_DIR/Library/LaunchAgents/com.yukiorita.MLXBar.Coordinator.plist"
+if [ -f "$PLIST" ]; then
+  launchctl kickstart -k "gui/$(id -u)/com.yukiorita.MLXBar.Coordinator"
+  exit 0
+fi
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../../../.." 2>/dev/null && pwd || true)
+if [ -x "$PROJECT_ROOT/Coordinator/.venv/bin/mlxbar-coordinator" ]; then
+  nohup "$PROJECT_ROOT/Coordinator/.venv/bin/mlxbar-coordinator" >/tmp/mlxbar-dev.log 2>&1 &
+  exit 0
+fi
+exit 1

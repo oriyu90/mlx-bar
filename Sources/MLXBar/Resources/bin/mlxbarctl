@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RESOURCES_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+if [ -x "$RESOURCES_DIR/cli/MLXBarCLI" ]; then
+  exec "$RESOURCES_DIR/cli/MLXBarCLI" "$@"
+fi
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../../../.." 2>/dev/null && pwd || true)
+if [ -x "$PROJECT_ROOT/Coordinator/.venv/bin/mlxbarctl" ]; then
+  exec "$PROJECT_ROOT/Coordinator/.venv/bin/mlxbarctl" "$@"
+fi
+echo "mlxbarctl runtime is missing" >&2
+exit 3

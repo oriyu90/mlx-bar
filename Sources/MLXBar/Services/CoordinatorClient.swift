@@ -1,0 +1,247 @@
+import Foundation
+import ServiceManagement
+
+enum ClientError: LocalizedError {
+    case unavailable
+    case command(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "MLXBarサービスを起動できません"
+        case .command(let message): message
+        }
+    }
+}
+
+final class CoordinatorClient: @unchecked Sendable {
+    struct StreamEvent: Sendable {
+        let type: String
+        let text: String?
+        let message: String?
+        let generationTPS: Double?
+    }
+    private let serviceLabel = "com.yukiorita.MLXBar.Coordinator"
+    private var socketPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/MLXBar/control/coordinator.sock").path
+    }
+
+    func request(_ method: String, _ path: String, bodyJSON: String? = nil) async throws -> Data {
+        var arguments = ["--silent", "--show-error", "--fail-with-body", "--unix-socket", socketPath,
+                         "--request", method, "--header", "Content-Type: application/json"]
+        if let bodyJSON {
+            arguments += ["--data-binary", bodyJSON]
+        }
+        arguments.append("http://mlxbar\(path)")
+        do {
+            return try await runProcess(URL(fileURLWithPath: "/usr/bin/curl"), arguments)
+        } catch ClientError.command(let rawMessage) {
+            // curl writes the HTTP body to stdout and its diagnostic to stderr.
+            // runProcess joins both, so parse each line and keep the structured
+            // API error instead of exposing JSON and curl internals in the UI.
+            for line in rawMessage.split(separator: "\n") {
+                guard let data = String(line).data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let detail = object["detail"] as? [String: Any] else { continue }
+                throw ClientError.command(detail["message"] as? String ?? detail["code"] as? String ?? "処理に失敗しました")
+            }
+            throw ClientError.command(rawMessage)
+        }
+    }
+
+    func stream(_ path: String, bodyJSON: String, onEvent: @Sendable (StreamEvent) -> Void) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--fail-with-body", "--no-buffer",
+                             "--max-time", "7210",
+                             "--unix-socket", socketPath, "--request", "POST",
+                             "--header", "Content-Type: application/json", "--data-binary", bodyJSON,
+                             "http://mlxbar\(path)"]
+        let output = Pipe(), error = Pipe()
+        process.standardOutput = output; process.standardError = error
+        try process.run()
+        var pending = Data()
+        while true {
+            let chunk = output.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 0x0A) {
+                let lineData = pending[..<newline]
+                pending.removeSubrange(...newline)
+                guard var line = String(data: lineData, encoding: .utf8) else { continue }
+                line = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard line.hasPrefix("data: "),
+                      let data = String(line.dropFirst(6)).data(using: .utf8),
+                      let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                onEvent(StreamEvent(type: event["type"] as? String ?? "unknown",
+                                    text: event["text"] as? String,
+                                    message: event["message"] as? String,
+                                    generationTPS: (event["generation_tps"] as? NSNumber)?.doubleValue))
+            }
+        }
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            let message = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            throw ClientError.command(message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "生成に失敗しました")
+        }
+    }
+
+    func startService() async throws {
+        if await isExpectedVersionHealthy() { return }
+        let service = SMAppService.agent(plistName: "com.yukiorita.MLXBar.Coordinator.plist")
+        var registrationError: Error?
+        switch service.status {
+        case .enabled:
+            _ = try? await launchctl(["kickstart", "-k", "gui/\(getuid())/\(serviceLabel)"])
+        case .requiresApproval:
+            throw ClientError.command("バックグラウンド実行の許可が必要です。システム設定のログイン項目でMLXBarを許可してください。")
+        case .notRegistered, .notFound:
+            do { try service.register() } catch { registrationError = error }
+        @unknown default:
+            break
+        }
+
+        if await waitUntilExpectedVersionHealthy(seconds: 5) { return }
+        do {
+            try await installFallbackLaunchAgent()
+        } catch {
+            let primary = registrationError.map { "ServiceManagement: \($0.localizedDescription)。" } ?? ""
+            throw ClientError.command("\(primary)バックエンドサービスを登録できません: \(error.localizedDescription)")
+        }
+        if await waitUntilExpectedVersionHealthy(seconds: 10) { return }
+        throw ClientError.unavailable
+    }
+
+    func removeAllData() async throws {
+        // Stop active work first so partially-created runtime environments are
+        // cleaned by the coordinator before its launch agent is unloaded.
+        if let data = try? await request("GET", "/api/v1/runtimes"),
+           let runtimes = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for engine in ["mlx-lm", "mlx-vlm"] {
+                guard let runtime = runtimes[engine] as? [String: Any],
+                      let job = runtime["activeJob"] as? [String: Any],
+                      let jobID = job["id"] as? String else { continue }
+                _ = try? await request("POST", "/api/v1/runtimes/\(engine)/jobs/\(jobID)/cancel")
+            }
+        }
+        _ = try? await request("DELETE", "/api/v1/models/loaded")
+
+        let domain = "gui/\(getuid())"
+        let fallbackPlist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(serviceLabel).plist")
+        _ = try? await launchctl(["bootout", "\(domain)/\(serviceLabel)"])
+        _ = try? await launchctl(["bootout", domain, fallbackPlist.path])
+
+        let service = SMAppService.agent(plistName: "com.yukiorita.MLXBar.Coordinator.plist")
+        try? await service.unregister()
+        try? await SMAppService.mainApp.unregister()
+
+        for _ in 0..<20 {
+            if !(await isHealthy()) { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if await isHealthy() {
+            throw ClientError.command("バックグラウンドサービスを停止できなかったため、データ削除を中止しました")
+        }
+
+        _ = try? await runProcess(URL(fileURLWithPath: "/usr/bin/defaults"),
+                                  ["delete", "com.yukiorita.MLXBar"])
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let paths = [
+            home.appendingPathComponent("Library/Application Support/MLXBar"),
+            home.appendingPathComponent("Library/Logs/MLXBar"),
+            home.appendingPathComponent("Library/Caches/com.yukiorita.MLXBar"),
+            home.appendingPathComponent("Library/Saved Application State/com.yukiorita.MLXBar.savedState"),
+            home.appendingPathComponent("Library/Preferences/com.yukiorita.MLXBar.plist"),
+            fallbackPlist,
+            URL(fileURLWithPath: "/tmp/mlxbar-coordinator.log"),
+            URL(fileURLWithPath: "/tmp/mlxbar-dev.log"),
+        ]
+        var removalErrors: [String] = []
+        for path in paths where FileManager.default.fileExists(atPath: path.path) {
+            do { try FileManager.default.removeItem(at: path) }
+            catch { removalErrors.append("\(path.lastPathComponent): \(error.localizedDescription)") }
+        }
+        if !removalErrors.isEmpty {
+            throw ClientError.command(removalErrors.joined(separator: "、"))
+        }
+    }
+
+    private func isHealthy() async -> Bool {
+        (try? await request("GET", "/api/v1/health")) != nil
+    }
+
+    private func isExpectedVersionHealthy() async -> Bool {
+        guard let data = try? await request("GET", "/api/v1/health"),
+              let health = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        guard let expected = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              !expected.isEmpty else { return true }
+        return health["status"] as? String == "ok" && health["version"] as? String == expected
+    }
+
+    private func waitUntilExpectedVersionHealthy(seconds: Int) async -> Bool {
+        for _ in 0..<(seconds * 5) {
+            if await isExpectedVersionHealthy() { return true }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return false
+    }
+
+    private func installFallbackLaunchAgent() async throws {
+        guard let coordinator = Bundle.main.executableURL?.deletingLastPathComponent()
+            .appendingPathComponent("MLXBarCoordinator"),
+              FileManager.default.isExecutableFile(atPath: coordinator.path) else {
+            throw ClientError.command("Coordinator実行ファイルが見つかりません")
+        }
+        let launchAgents = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+        let plistURL = launchAgents.appendingPathComponent("\(serviceLabel).plist")
+        let bundleResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/MLXBar_MLXBar.bundle")
+        let logs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MLXBar")
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let plist: [String: Any] = [
+            "Label": serviceLabel, "ProgramArguments": [coordinator.path], "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false], "ProcessType": "Interactive", "ThrottleInterval": 10,
+            "StandardOutPath": logs.appendingPathComponent("coordinator.log").path,
+            "StandardErrorPath": logs.appendingPathComponent("coordinator.log").path,
+            "EnvironmentVariables": ["PATH": "\(bundleResources.path):/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"]
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        let temporary = plistURL.appendingPathExtension("tmp")
+        try data.write(to: temporary, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+        _ = try? FileManager.default.removeItem(at: plistURL)
+        try FileManager.default.moveItem(at: temporary, to: plistURL)
+        let domain = "gui/\(getuid())"
+        _ = try? await launchctl(["bootout", domain, plistURL.path])
+        try await launchctl(["bootstrap", domain, plistURL.path])
+        try await launchctl(["kickstart", "-k", "\(domain)/\(serviceLabel)"])
+    }
+
+    @discardableResult
+    private func launchctl(_ arguments: [String]) async throws -> Data {
+        try await runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments)
+    }
+
+    private func runProcess(_ executable: URL, _ arguments: [String]) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = executable; process.arguments = arguments
+            let output = Pipe(), error = Pipe()
+            process.standardOutput = output; process.standardError = error
+            process.terminationHandler = { process in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                if process.terminationStatus == 0 {
+                    continuation.resume(returning: data)
+                } else {
+                    let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    let stdout = String(data: data, encoding: .utf8) ?? ""
+                    continuation.resume(throwing: ClientError.command([stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)))
+                }
+            }
+            do { try process.run() } catch { continuation.resume(throwing: error) }
+        }
+    }
+}
