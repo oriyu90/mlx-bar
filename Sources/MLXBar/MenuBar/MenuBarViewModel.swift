@@ -129,10 +129,15 @@ final class MenuBarViewModel: ObservableObject {
     @Published var isRemovingAllData = false
     @Published var recentLogs: [[String: Any]] = []
     @Published var logStatus: String?
-    @Published var guiLanguage = "en"
+    @Published var guiLanguage = "en" {
+        // Views read their strings through `LS(_:)`, which resolves against the
+        // language recorded here, so the two must move together.
+        didSet { AppLanguage.current = guiLanguage }
+    }
     private let client = CoordinatorClient()
     private let cancellationClient = CoordinatorClient()
     private var polling: Task<Void, Never>?
+    private var statusRequestToken = 0
     private var started = false
     private var requestedCancellations: Set<String> = []
     private var localLoadInProgress = false
@@ -161,10 +166,12 @@ final class MenuBarViewModel: ObservableObject {
         do { try await client.startService() } catch { errorMessage = error.localizedDescription }
         await refreshAll()
         polling?.cancel()
-        polling = Task {
+        polling = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(NSApp.isActive ? 5 : 30))
-                await refreshStatus()
+                let interval = await MainActor.run { NSApp.isActive ? 5 : 30 }
+                try? await Task.sleep(for: .seconds(interval))
+                guard let self else { return }
+                await self.refreshStatus()
             }
         }
     }
@@ -174,8 +181,14 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshStatus() async {
+        // Two loops poll status (the view model's timer and the open menu's
+        // 1-second refresh). Without a token, a slow response from one can land
+        // after a newer one and revert the display to stale state.
+        statusRequestToken &+= 1
+        let token = statusRequestToken
         do {
             guard let json = try await json("GET", "/api/v1/status") as? [String: Any] else { return }
+            guard token == statusRequestToken else { return }
             let wasRunning = serviceRunning
             serviceRunning = true
             // A successful status poll must not erase a model/runtime error the
@@ -219,6 +232,7 @@ final class MenuBarViewModel: ObservableObject {
                 lanEnabled = api["lanEnabled"] as? Bool ?? false
             }
         } catch {
+            guard token == statusRequestToken else { return }
             serviceRunning = false
             serviceStatus = guiLanguage == "ja" ? "サービス停止" : "Service stopped"
             activeRequestCount = 0
@@ -228,6 +242,7 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshModels() async {
+        errorMessage = nil
         do {
             guard let json = try await json("GET", "/api/v1/models") as? [String: Any],
                   let data = json["data"] as? [[String: Any]] else { return }
@@ -250,7 +265,9 @@ final class MenuBarViewModel: ObservableObject {
         loadingPhase = ui("Starting model load", "ロードを開始しています")
         loadingStartedAt = Date()
         await perform {
-            _ = try await self.json("POST", "/api/v1/models/\(self.pathComponent(model.id))/load", ["engine": engine])
+            _ = try await self.json("POST", "/api/v1/models/\(self.pathComponent(model.id))/load",
+                                    ["engine": engine],
+                                    timeoutSeconds: CoordinatorClient.Timeout.modelLoad)
             await self.refreshStatus()
         }
         localLoadInProgress = false
@@ -330,6 +347,7 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshRuntimes() async {
+        errorMessage = nil
         do {
             guard let json = try await json("GET", "/api/v1/runtimes") as? [String: Any] else { return }
             runtimes = ["mlx-lm", "mlx-vlm"].compactMap { engine in
@@ -361,7 +379,8 @@ final class MenuBarViewModel: ObservableObject {
         guard !updatingEngines.contains(engine) else { return }
         errorMessage = nil
         do {
-            let selectedVersion: Any = version?.isEmpty == false ? version! : NSNull()
+            let trimmed = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let selectedVersion: Any = trimmed.isEmpty ? NSNull() : trimmed
             if let job = try await json("POST", "/api/v1/runtimes/\(pathComponent(engine))/stage",
                                         ["version": selectedVersion, "gitRef": NSNull()]) as? [String: Any] {
                 attachRuntimeJob(engine, job)
@@ -559,6 +578,7 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshSecrets() async {
+        errorMessage = nil
         do {
             if let api = try await json("GET", "/api/v1/settings/api-token") as? [String: Any] {
                 apiToken = api["token"] as? String ?? ""
@@ -570,6 +590,7 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshRecentLogs() async {
+        errorMessage = nil
         do {
             guard let result = try await json("GET", "/api/v1/logs?limit=500") as? [String: Any] else { return }
             recentLogs = result["data"] as? [[String: Any]] ?? []
@@ -681,7 +702,8 @@ final class MenuBarViewModel: ObservableObject {
             NSApplication.shared.terminate(nil)
         } catch {
             isRemovingAllData = false
-            errorMessage = "データを完全に削除できませんでした: \(error.localizedDescription)"
+            errorMessage = ui("Could not remove all data: \(error.localizedDescription)",
+                              "データを完全に削除できませんでした: \(error.localizedDescription)")
         }
     }
 
@@ -725,8 +747,10 @@ final class MenuBarViewModel: ObservableObject {
         secretStatus = ui("API key copied", "APIキーをコピーしました")
     }
 
-    private func json(_ method: String, _ path: String, _ body: Any? = nil) async throws -> Any {
-        let data = try await client.request(method, path, bodyJSON: body.map { try encode($0) })
+    private func json(_ method: String, _ path: String, _ body: Any? = nil,
+                      timeoutSeconds: Int = CoordinatorClient.Timeout.standard) async throws -> Any {
+        let data = try await client.request(method, path, bodyJSON: body.map { try encode($0) },
+                                            timeoutSeconds: timeoutSeconds)
         return try JSONSerialization.jsonObject(with: data)
     }
 
@@ -740,16 +764,20 @@ final class MenuBarViewModel: ObservableObject {
         let deadline = ContinuousClock.now + .seconds(1800)
         while !["completed", "failed", "cancelled"].contains(job["state"] as? String ?? "") {
             if ContinuousClock.now >= deadline {
-                throw ClientError.command("処理が30分以内に完了しなかったため監視を終了しました")
+                throw ClientError.command(ui("Stopped monitoring: the operation did not finish within 30 minutes",
+                                             "処理が30分以内に完了しなかったため監視を終了しました"))
             }
-            guard let id = job["id"] as? String else { throw ClientError.command("ジョブIDがありません") }
+            guard let id = job["id"] as? String else {
+                throw ClientError.command(ui("The job has no identifier", "ジョブIDがありません"))
+            }
             try await Task.sleep(for: .milliseconds(300))
             job = try await json("GET", "/api/v1/jobs/\(pathComponent(id))") as? [String: Any] ?? job
             onProgress?(job)
         }
         if job["state"] as? String == "failed" {
             let detail = job["error"] as? [String: Any]
-            throw ClientError.command(detail?["message"] as? String ?? job["message"] as? String ?? "処理に失敗しました")
+            throw ClientError.command(detail?["message"] as? String ?? job["message"] as? String
+                                      ?? ui("The operation failed", "処理に失敗しました"))
         }
         return job
     }

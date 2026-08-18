@@ -19,26 +19,34 @@ final class FileSelectionService {
         }
     }
 
+    /// Outcome of a picker request, so a caller can tell "nothing chosen" from
+    /// "another picker is already open" instead of silently doing nothing.
+    enum Selection {
+        case chosen([URL])
+        case cancelled
+        case busy
+    }
+
     private var activePanel: NSOpenPanel?
 
-    func chooseFolder(startingAt directory: URL? = nil) async -> URL? {
+    func chooseFolder(startingAt directory: URL? = nil) async -> Selection {
         let panel = NSOpenPanel()
-        panel.title = "モデルフォルダを選択"
-        panel.message = "隠しフォルダも表示しています。選択したフォルダは読み取り専用で走査されます。"
-        panel.prompt = "追加"
+        panel.title = LS("モデルフォルダを選択")
+        panel.message = LS("隠しフォルダも表示しています。選択したフォルダは読み取り専用で走査されます。")
+        panel.prompt = LS("追加")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
         panel.treatsFilePackagesAsDirectories = true
         panel.directoryURL = validDirectory(directory) ?? FileManager.default.homeDirectoryForCurrentUser
-        return await present(panel).first
+        return await present(panel)
     }
 
-    func chooseImages(startingAt directory: URL? = nil) async -> [URL] {
+    func chooseImages(startingAt directory: URL? = nil) async -> Selection {
         let panel = NSOpenPanel()
-        panel.title = "画像を選択"
-        panel.prompt = "追加"
+        panel.title = LS("画像を選択")
+        panel.prompt = LS("追加")
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
@@ -55,11 +63,11 @@ final class FileSelectionService {
             ? url : nil
     }
 
-    private func present(_ panel: NSOpenPanel) async -> [URL] {
+    private func present(_ panel: NSOpenPanel) async -> Selection {
         if let activePanel {
             NSApplication.shared.activate(ignoringOtherApps: true)
             activePanel.makeKeyAndOrderFront(nil)
-            return []
+            return .busy
         }
 
         activePanel = panel
@@ -72,7 +80,7 @@ final class FileSelectionService {
                 let urls = response == .OK ? panel.urls : []
                 panel.orderOut(nil)
                 self?.activePanel = nil
-                continuation.resume(returning: urls)
+                continuation.resume(returning: urls.isEmpty ? .cancelled : .chosen(urls))
             }
             panel.makeKeyAndOrderFront(nil)
         }

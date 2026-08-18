@@ -17,6 +17,42 @@ import uvicorn
 
 
 GENERATION_HEARTBEAT_SECONDS = 10.0
+# A cancel that lands after its generation already finished has nothing left to
+# discard its id, so the set is bounded and aged instead of growing for the life
+# of the worker process.
+CANCEL_RETENTION_SECONDS = 900.0
+CANCEL_MAX_ENTRIES = 256
+
+
+class CancellationRegistry:
+    """Bounded, self-expiring record of cancel requests by request id."""
+
+    def __init__(self, retention: float = CANCEL_RETENTION_SECONDS,
+                 maximum: int = CANCEL_MAX_ENTRIES):
+        self._entries: dict[str, float] = {}
+        self._retention = retention
+        self._maximum = maximum
+
+    def add(self, request_id: str) -> None:
+        self._prune()
+        self._entries[request_id] = time.monotonic()
+        while len(self._entries) > self._maximum:
+            self._entries.pop(next(iter(self._entries)))
+
+    def discard(self, request_id: str) -> None:
+        self._entries.pop(request_id, None)
+
+    def _prune(self) -> None:
+        cutoff = time.monotonic() - self._retention
+        for key in [key for key, stamp in self._entries.items() if stamp < cutoff]:
+            self._entries.pop(key, None)
+
+    def __contains__(self, request_id: object) -> bool:
+        self._prune()
+        return request_id in self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 class BaseAdapter:
@@ -25,7 +61,7 @@ class BaseAdapter:
     def __init__(self):
         self.model: Any = None
         self.processor: Any = None
-        self.cancelled: set[str] = set()
+        self.cancelled = CancellationRegistry()
 
     def capabilities(self) -> dict:
         return {"engine": self.engine, "protocolVersion": 1, "streaming": True,
@@ -196,8 +232,20 @@ def run(adapter: BaseAdapter) -> None:
         os.unlink(args.socket)
     except FileNotFoundError:
         pass
-    uvicorn.run(create_app(adapter), uds=args.socket, log_level="warning", access_log=False)
+    app = create_app(adapter)
+
+    @app.on_event("startup")
+    async def restrict_socket() -> None:
+        # Tighten the socket as soon as uvicorn has bound it. Doing this after
+        # `uvicorn.run` returns would only ever run at shutdown, leaving the
+        # socket at its default permissions for its entire useful life.
+        try:
+            os.chmod(args.socket, 0o600)
+        except OSError:
+            pass
+
+    uvicorn.run(app, uds=args.socket, log_level="warning", access_log=False)
     try:
-        os.chmod(args.socket, 0o600)
-    except FileNotFoundError:
+        os.unlink(args.socket)
+    except (FileNotFoundError, OSError):
         pass

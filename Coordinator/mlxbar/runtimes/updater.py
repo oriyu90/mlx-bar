@@ -18,6 +18,10 @@ from ..errors import MLXBarError
 
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z]+){1,3}$")
 SHA = re.compile(r"^[0-9a-f]{7,40}$")
+# A stalled download would otherwise keep a job "running" for the coordinator's
+# whole lifetime, since only an explicit user cancel could ever end it.
+INSTALL_TIMEOUT_SECONDS = 3600
+COMMAND_TIMEOUT_SECONDS = 600
 
 
 class RuntimeUpdater:
@@ -107,7 +111,8 @@ class RuntimeUpdater:
 
                 await self._command(uv, "pip", "install", "--python", str(python), spec,
                                     "fastapi>=0.115,<1", "uvicorn>=0.30,<1",
-                                    heartbeat=download_heartbeat)
+                                    heartbeat=download_heartbeat,
+                                    timeout=INSTALL_TIMEOUT_SECONDS)
                 await update(0.65, "依存関係を検証中")
                 await self._command(uv, "pip", "check", "--python", str(python))
                 frozen = await self._command(uv, "pip", "freeze", "--python", str(python))
@@ -133,42 +138,54 @@ class RuntimeUpdater:
                 shutil.rmtree(slot, ignore_errors=True)
                 raise
 
-    async def _command(self, *arguments: str, heartbeat=None) -> str:
+    async def _command(self, *arguments: str, heartbeat=None,
+                       timeout: int = COMMAND_TIMEOUT_SECONDS) -> str:
         proc = await asyncio.create_subprocess_exec(
             *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
         communication = asyncio.create_task(proc.communicate())
         elapsed = 0
+        timed_out = False
         try:
             while not communication.done():
                 done, _ = await asyncio.wait({communication}, timeout=1)
                 if done:
                     break
                 elapsed += 1
+                if elapsed >= timeout:
+                    timed_out = True
+                    raise asyncio.CancelledError
                 if heartbeat:
                     await heartbeat(elapsed)
             out, _ = await communication
         except asyncio.CancelledError:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-            communication.cancel()
-            await asyncio.gather(communication, return_exceptions=True)
+            await self._terminate(proc, communication)
+            if timed_out:
+                raise MLXBarError("UPDATE_TIMEOUT",
+                                  f"更新処理が{timeout}秒以内に完了しなかったため中止しました", 504, True)
             raise
         text = out.decode(errors="replace")
         if proc.returncode:
             raise MLXBarError("UPDATE_PROBE_FAILED", text[-4000:] or "更新コマンドに失敗しました", 409)
         return text
+
+    @staticmethod
+    async def _terminate(proc, communication: asyncio.Task) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            await proc.wait()
+        communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
 
     @staticmethod
     def _uv_executable() -> str:

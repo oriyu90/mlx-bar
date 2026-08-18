@@ -26,7 +26,7 @@ struct MenuBarView: View {
                 Spacer()
                 if model.loadingModelName == nil, model.loadedName != nil {
                     Button { model.copyLoadedModelName() } label: {
-                        Image(systemName: "doc.on.doc").accessibilityLabel("モデル名をコピー")
+                        Image(systemName: "doc.on.doc").accessibilityLabel(LS("モデル名をコピー"))
                     }.buttonStyle(.plain)
                 }
                 if model.busy { ProgressView().controlSize(.small) }
@@ -50,52 +50,55 @@ struct MenuBarView: View {
                     .font(.caption).foregroundStyle(.red).lineLimit(3)
             }
             Divider()
-            Button("モデルを選択…") { openWindow(id: "models"); dismiss() }.keyboardShortcut("m")
+            Button(LS("モデルを選択…")) { openWindow(id: "models"); dismiss() }.keyboardShortcut("m")
             if model.loadedName == nil {
-                Button("クイックチャット…") { openWindow(id: "chat"); dismiss() }.disabled(true)
+                Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.disabled(true)
             } else {
-                Button("クイックチャット…") { openWindow(id: "chat"); dismiss() }.keyboardShortcut("n")
-                Button("アンロード") { Task { await model.unload() } }
+                Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.keyboardShortcut("n")
+                Button(LS("アンロード")) { Task { await model.unload() } }
             }
             if model.currentRequestID != nil {
-                Button(model.cancellationInProgress ? "生成を停止処理中…" : "生成をキャンセル") {
+                Button(LS(model.cancellationInProgress ? "生成を停止処理中…" : "生成をキャンセル")) {
                     Task { await model.cancelGeneration() }
                 }.disabled(model.cancellationInProgress)
             } else if model.activeRequestCount > 0 || model.queuedRequestCount > 0 {
-                Button(model.cancellationInProgress ? "すべて停止処理中…" : "すべての生成を停止") {
+                Button(LS(model.cancellationInProgress ? "すべて停止処理中…" : "すべての生成を停止")) {
                     Task { await model.cancelAllGenerations() }
                 }.disabled(model.cancellationInProgress)
             }
             Divider()
             HStack {
-                Button("今すぐ再スキャン") { Task { await model.scan() } }
+                Button(LS("今すぐ再スキャン")) { Task { await model.scan() } }
                 Spacer()
-                Button("フォルダを選択…") { dismiss(); chooseFolder() }
+                Button(LS("フォルダを選択…")) { dismiss(); chooseFolder() }
                     .disabled(isSelectingFolder)
-                Menu("ライブラリ…") {
-                    Button("ユーザライブラリ（~/Library）") {
+                Menu(LS("ライブラリ…")) {
+                    Button(LS("ユーザライブラリ（~/Library）")) {
                         dismiss(); chooseFolder(startingAt: .user)
                     }
-                    Button("Macライブラリ（/Library）") {
+                    Button(LS("Macライブラリ（/Library）")) {
                         dismiss(); chooseFolder(startingAt: .system)
                     }
                 }
                 .disabled(isSelectingFolder)
             }
             HStack {
-                Text("APIサーバー").font(.caption).foregroundStyle(.secondary)
+                Text(LS("APIサーバー")).font(.caption).foregroundStyle(.secondary)
                 if model.lanEnabled {
-                    Label("LAN公開中", systemImage: "network")
+                    Label(LS("LAN公開中"), systemImage: "network")
                         .font(.caption).foregroundStyle(.orange)
                 }
                 Spacer()
-                Button(model.apiURL) { model.copyAPIURL() }.buttonStyle(.link)
+                Button(model.apiURL) { model.copyAPIURL() }
+                    .buttonStyle(.link)
+                    .accessibilityLabel(LS("接続URL"))
+                    .accessibilityHint(LS("クリップボードへコピーします"))
             }
             Divider()
             HStack {
-                Button("設定…") { openSettings(); dismiss() }
+                Button(LS("設定…")) { openSettings(); dismiss() }
                 Spacer()
-                Button("終了") { NSApplication.shared.terminate(nil) }
+                Button(LS("終了")) { NSApplication.shared.terminate(nil) }
             }
         }
         .padding(14)
@@ -112,8 +115,13 @@ struct MenuBarView: View {
         isSelectingFolder = true
         Task { @MainActor in
             defer { isSelectingFolder = false }
-            if let url = await FileSelectionService.shared.chooseFolder(startingAt: location?.url) {
-                await model.addModelFolder(url)
+            switch await FileSelectionService.shared.chooseFolder(startingAt: location?.url) {
+            case .chosen(let urls):
+                if let url = urls.first { await model.addModelFolder(url) }
+            case .busy:
+                model.errorMessage = LS("別のファイル選択画面が開いています。先にそちらを閉じてください。")
+            case .cancelled:
+                break
             }
         }
     }

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import logging
+import logging.handlers
 import os
 import signal
 import socket
@@ -113,6 +116,9 @@ class PublicListener:
         self.lock = asyncio.Lock()
         self.host: str | None = None
         self.port: int | None = None
+        # Retaining drain tasks keeps them from being garbage collected
+        # mid-shutdown and surfaces their failures instead of discarding them.
+        self.draining: set[asyncio.Task] = set()
 
     async def _launch(self, host: str, port: int) -> tuple[uvicorn.Server, asyncio.Task]:
         listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -169,7 +175,9 @@ class PublicListener:
             self.host, self.port = host, port
             if old_server and old_task:
                 old_server.should_exit = True
-                asyncio.create_task(self._drain(old_task))
+                drain = asyncio.create_task(self._drain(old_task))
+                self.draining.add(drain)
+                drain.add_done_callback(self.draining.discard)
 
     @staticmethod
     async def _drain(task: asyncio.Task, timeout: int = 60) -> None:
@@ -183,10 +191,35 @@ class PublicListener:
             self.server.should_exit = True
         if self.task:
             await asyncio.gather(self.task, return_exceptions=True)
+        if self.draining:
+            await asyncio.gather(*list(self.draining), return_exceptions=True)
+
+
+def configure_logging(root: Path) -> None:
+    """Send coordinator diagnostics to a private per-user log file.
+
+    launchd used to redirect stdout/stderr to a fixed path in world-writable
+    /tmp, which another local account could pre-create as a symlink. Writing
+    here keeps diagnostics inside the user's own Application Support directory.
+    """
+    directory = root / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "coordinator.log"
+    with contextlib.suppress(OSError):
+        if path.exists() and path.stat().st_size > 5_000_000:
+            path.replace(directory / "coordinator.log.1")
+    handler = logging.handlers.RotatingFileHandler(path, maxBytes=5_000_000, backupCount=1)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
 
 
 async def serve(root: Path | None = None) -> None:
     state = AppState(root)
+    configure_logging(state.root)
     control = state.root / "control"
     control.mkdir(parents=True, exist_ok=True)
     socket_path = control / "coordinator.sock"
@@ -202,6 +235,13 @@ async def serve(root: Path | None = None) -> None:
                                                 log_level="warning", access_log=False,
                                                 timeout_graceful_shutdown=10, lifespan="off"))
     management_task = asyncio.create_task(management.serve())
+    # launchd sends SIGTERM on logout, restart and `launchctl bootout`. Without
+    # a handler the process dies before `finally` runs, stranding the worker
+    # subprocess with its model still resident.
+    loop = asyncio.get_running_loop()
+    for signal_name in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, ValueError):
+            loop.add_signal_handler(signal_name, management.handle_exit, signal_name, None)
     for _ in range(50):
         if socket_path.exists():
             os.chmod(socket_path, 0o600)
@@ -218,7 +258,12 @@ async def serve(root: Path | None = None) -> None:
     try:
         await management_task
     finally:
-        await state.workers.unload()
+        with contextlib.suppress(Exception):
+            await state.workers.unload()
+        # `unload` only frees the model; the worker process itself must be
+        # stopped too or it survives this coordinator as an orphan.
+        with contextlib.suppress(Exception):
+            await state.workers.shutdown()
         await listener.stop()
         socket_path.unlink(missing_ok=True)
 

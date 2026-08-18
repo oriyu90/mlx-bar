@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -13,6 +17,10 @@ from pathlib import Path
 import httpx
 
 from ..errors import MLXBarError
+
+WORKER_MODULES = {"mlx-lm": "mlx_lm_worker.adapter", "mlx-vlm": "mlx_vlm_worker.adapter"}
+WORKER_LOG_MAX_BYTES = 1_048_576
+WORKER_STARTUP_DETAIL_BYTES = 4000
 
 
 @dataclass
@@ -44,27 +52,141 @@ class WorkerSupervisor:
         self.crashes: list[float] = []
         self.lock = asyncio.Lock()
         self.generation_lock = asyncio.Lock()
+        self.reap_orphan_worker()
+
+    @property
+    def socket_dir(self) -> Path:
+        # Scoped per coordinator root so one instance never sweeps away the
+        # sockets of another (parallel test runs, a second MLXBAR_HOME).
+        digest = hashlib.sha256(str(self.root).encode("utf-8")).hexdigest()[:8]
+        return Path(tempfile.gettempdir()) / f"mlxbar-{os.getuid()}-{digest}"
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.root / "control" / "worker.json"
+
+    def worker_log_path(self, engine: str) -> Path:
+        return self.root / "logs" / f"worker-{engine}.log"
+
+    def _write_manifest(self, engine: str, pid: int) -> None:
+        try:
+            self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            self.manifest_path.write_text(json.dumps(
+                {"pid": pid, "engine": engine, "socket": str(self.socket_path),
+                 "startedAt": time.time()}), encoding="utf-8")
+        except OSError:
+            # A missing manifest only costs orphan detection on the next start;
+            # it must never keep a healthy worker from coming up.
+            pass
+
+    def _clear_manifest(self) -> None:
+        with contextlib.suppress(OSError):
+            self.manifest_path.unlink(missing_ok=True)
+
+    def reap_orphan_worker(self) -> dict | None:
+        """Terminate a worker left behind by a coordinator that died abruptly.
+
+        Nothing kills our children when this process is SIGKILLed, so a worker
+        holding a multi-GB model can outlive the coordinator and keep its socket
+        bound. launchd then restarts us with no memory of it. The manifest
+        written at spawn time is what lets a fresh start find and clean it up.
+        """
+        result = None
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            pid = int(manifest["pid"])
+        except (OSError, ValueError, TypeError, KeyError):
+            manifest, pid = None, None
+        if pid and pid > 1 and self._is_our_worker(pid):
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(pid, sig)
+                for _ in range(20):
+                    if not self._process_alive(pid):
+                        break
+                    time.sleep(0.05)
+                if not self._process_alive(pid):
+                    break
+            result = {"pid": pid, "engine": manifest.get("engine") if manifest else None}
+        self._clear_manifest()
+        self._sweep_sockets()
+        return result
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _is_our_worker(pid: int) -> bool:
+        """Confirm the recorded pid is still one of our worker modules.
+
+        pids are recycled, so killing on the manifest alone could take out an
+        unrelated process that happened to inherit the number.
+        """
+        try:
+            output = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
+                                    capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return any(module in output for module in WORKER_MODULES.values())
+
+    def _sweep_sockets(self) -> None:
+        current = str(self.socket_path) if self.socket_path else None
+        try:
+            entries = list(self.socket_dir.glob("*.sock"))
+        except OSError:
+            return
+        for entry in entries:
+            if str(entry) != current:
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+
+    def _open_worker_log(self, engine: str):
+        path = self.worker_log_path(engine)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            if path.stat().st_size > WORKER_LOG_MAX_BYTES:
+                path.unlink()
+        handle = path.open("ab", buffering=0)
+        os.chmod(path, 0o600)
+        return handle
 
     async def _start_worker(self, engine: str) -> None:
         if self.process and self.process.returncode is None and self.engine == engine:
             return
         await self._stop_worker()
-        socket_dir = Path(tempfile.gettempdir()) / f"mlxbar-{os.getuid()}"
+        socket_dir = self.socket_dir
         socket_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(socket_dir, 0o700)
         self.socket_path = socket_dir / f"{engine}-{uuid.uuid4().hex[:8]}.sock"
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join([*self._worker_import_paths(), env.get("PYTHONPATH", "")])
-        module = "mlx_lm_worker.adapter" if engine == "mlx-lm" else "mlx_vlm_worker.adapter"
+        module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
-        self.process = await asyncio.create_subprocess_exec(
-            str(python), "-m", module, "--socket", str(self.socket_path), env=env,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-        )
+        # Worker diagnostics go to a log file rather than a pipe: nothing drains
+        # a pipe once the worker is serving, so a chatty runtime would fill the
+        # OS buffer and block the worker mid-generation with no crash signal.
+        log_path = self.worker_log_path(engine)
+        log = self._open_worker_log(engine)
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                str(python), "-m", module, "--socket", str(self.socket_path), env=env,
+                stdout=asyncio.subprocess.DEVNULL, stderr=log,
+            )
+        finally:
+            log.close()
         self.engine = engine
+        self._write_manifest(engine, self.process.pid)
         for _ in range(50):
             if self.process.returncode is not None:
-                detail = (await self.process.stderr.read()).decode(errors="replace")[-1000:]
+                detail = self._read_log_tail(log_path)
+                await self._stop_worker()
                 raise MLXBarError("WORKER_CRASHED", f"ワーカーを起動できません: {detail}", 503)
             if self.socket_path.exists():
                 try:
@@ -76,6 +198,16 @@ class WorkerSupervisor:
             await asyncio.sleep(0.1)
         await self._stop_worker()
         raise MLXBarError("WORKER_CRASHED", "ワーカーの起動がタイムアウトしました", 503)
+
+    @staticmethod
+    def _read_log_tail(path: Path, limit: int = WORKER_STARTUP_DETAIL_BYTES) -> str:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - limit))
+                return handle.read().decode(errors="replace").strip()
+        except OSError:
+            return "詳細を取得できませんでした"
 
     @staticmethod
     def _worker_import_paths() -> list[str]:
@@ -106,17 +238,20 @@ class WorkerSupervisor:
 
     async def _stop_worker(self) -> None:
         if self.process and self.process.returncode is None:
-            self.process.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                self.process.terminate()
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=3)
             except asyncio.TimeoutError:
-                self.process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    self.process.kill()
                 await self.process.wait()
         self.process = None
         if self.socket_path:
             self.socket_path.unlink(missing_ok=True)
         self.socket_path = None
         self.engine = None
+        self._clear_manifest()
 
     async def _call(self, method: str, params: dict, timeout: float | None = 30) -> dict:
         if not self.socket_path:
@@ -212,12 +347,13 @@ class WorkerSupervisor:
         self.loaded = None
         return {"state": "unloaded"}
 
-    async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None):
+    async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None,
+                       image_root: Path | None = None):
         if not self.loaded:
             raise MLXBarError("MODEL_NOT_LOADED", "モデルがロードされていません", 409)
         if self.loaded.get("engine") in self.maintenance_engines:
             raise MLXBarError("ENGINE_BUSY", "ランタイム切替中のため新しい生成を開始できません", 409, True)
-        prompt, images, options = self._validate_generation(prompt, images, options)
+        prompt, images, options = self._validate_generation(prompt, images, options, image_root)
         request_id = request_id or str(uuid.uuid4())
         generation_acquired = False
         queued: QueuedRequest | None = None
@@ -464,7 +600,7 @@ class WorkerSupervisor:
                 "message": (f"実行中{len(active_ids)}件、待機中{queued_count}件へ停止を要求しました"
                             if queued_count or active_ids else "停止対象の生成はありません")}
 
-    def _validate_generation(self, prompt, images, options):
+    def _validate_generation(self, prompt, images, options, image_root: Path | None = None):
         limits = self.settings.data["generation"]
         if not isinstance(prompt, (str, list)):
             raise MLXBarError("INVALID_REQUEST", "promptは文字列またはmessages配列で指定してください", 422)
@@ -476,9 +612,25 @@ class WorkerSupervisor:
             raise MLXBarError("INVALID_REQUEST", "imagesはパスまたはURLの配列で指定してください", 422)
         if len(images) > limits["maxImages"]:
             raise MLXBarError("INPUT_TOO_LARGE", f"画像は最大{limits['maxImages']}件です", 413)
+        resolved_root = image_root.resolve() if image_root else None
         for image in images:
-            path = Path(image)
-            if path.exists() and (not path.is_file() or path.stat().st_size > limits["maxImageBytes"]):
+            if resolved_root is not None:
+                # Callers that pass a root are relaying untrusted references
+                # (the public OpenAI API). Only files the coordinator itself
+                # materialised inside that root may reach a worker, so a URL or
+                # an arbitrary path can never be fetched or read on their behalf.
+                try:
+                    candidate = Path(image).resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise MLXBarError("INVALID_REQUEST", "画像を参照できません", 422) from exc
+                if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+                    raise MLXBarError("INVALID_REQUEST", "画像の参照先が許可されていません", 422)
+                path = candidate
+            else:
+                path = Path(image)
+                if not path.exists():
+                    continue
+            if not path.is_file() or path.stat().st_size > limits["maxImageBytes"]:
                 raise MLXBarError("INPUT_TOO_LARGE", f"画像は1件{limits['maxImageBytes'] // 1_048_576}MB以内にしてください", 413)
         defaults = limits
         try:
@@ -572,6 +724,12 @@ class WorkerSupervisor:
             # 古いランタイムがmemory RPCに未対応でも生成互換性を維持する。
             return
 
+    async def shutdown(self) -> None:
+        """Stop the worker process and clear the orphan manifest."""
+        await self._stop_worker()
+        self.loaded = None
+        self.loading = None
+
     async def probe_runtime(self, engine: str) -> dict:
         if self.loaded:
             raise MLXBarError("ENGINE_BUSY", "別のモデルがロード中です", 409, True)
@@ -596,7 +754,23 @@ class WorkerSupervisor:
     def end_maintenance(self, engine: str) -> None:
         self.maintenance_engines.discard(engine)
 
+    def _forget_dead_worker(self) -> None:
+        """Drop `loaded` when the worker process died with no request in flight.
+
+        A worker killed while idle (memory pressure, Activity Monitor) leaves
+        nothing to notice it until the next generate call, so status would keep
+        reporting a ready model that no longer exists.
+        """
+        if not self.loaded or self.loaded.get("engine") == "lm-studio":
+            return
+        if self.process is not None and self.process.returncode is None:
+            return
+        if self.active_requests or self.queued_requests or self.loading:
+            return
+        self.loaded = None
+
     def status(self) -> dict:
+        self._forget_dead_worker()
         loaded = None if not self.loaded else {
             **self.loaded,
             "effectiveMaxTokens": self.effective_max_tokens(),

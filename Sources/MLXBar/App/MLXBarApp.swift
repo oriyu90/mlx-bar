@@ -19,12 +19,14 @@ struct MLXBarApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("モデル", id: "models") {
+        // Window titles are read once when the scene is created, so they use
+        // the English name rather than tracking the language picker.
+        Window("Models", id: "models") {
             ModelCatalogView(model: model)
                 .frame(minWidth: 720, minHeight: 460)
                 .environment(\.locale, Locale(identifier: model.guiLanguage))
         }
-        Window("クイックチャット", id: "chat") {
+        Window("Quick Chat", id: "chat") {
             QuickChatView(model: model)
                 .frame(minWidth: 640, minHeight: 520)
                 .environment(\.locale, Locale(identifier: model.guiLanguage))

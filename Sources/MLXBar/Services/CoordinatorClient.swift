@@ -3,11 +3,13 @@ import ServiceManagement
 
 enum ClientError: LocalizedError {
     case unavailable
+    case timedOut
     case command(String)
 
     var errorDescription: String? {
         switch self {
         case .unavailable: "MLXBarサービスを起動できません"
+        case .timedOut: "MLXBarサービスが応答しません。しばらくしてからもう一度お試しください。"
         case .command(let message): message
         }
     }
@@ -26,44 +28,131 @@ final class CoordinatorClient: @unchecked Sendable {
             .appendingPathComponent("Library/Application Support/MLXBar/control/coordinator.sock").path
     }
 
-    func request(_ method: String, _ path: String, bodyJSON: String? = nil) async throws -> Data {
+    /// How long a management call may run before curl gives up.
+    ///
+    /// Without a ceiling, a wedged coordinator leaves the caller awaiting
+    /// forever, and the view model's `busy` flag never clears — every button in
+    /// the app stays disabled behind a spinner with no way back short of a
+    /// relaunch. Model loading and runtime work legitimately take minutes, so
+    /// those callers raise the limit rather than sharing the default.
+    enum Timeout {
+        static let standard = 30
+        static let modelLoad = 900
+        static let runtime = 3600
+    }
+
+    func request(_ method: String, _ path: String, bodyJSON: String? = nil,
+                 timeoutSeconds: Int = Timeout.standard) async throws -> Data {
         var arguments = ["--silent", "--show-error", "--fail-with-body", "--unix-socket", socketPath,
+                         "--connect-timeout", "5", "--max-time", String(timeoutSeconds),
                          "--request", method, "--header", "Content-Type: application/json"]
         if let bodyJSON {
             arguments += ["--data-binary", bodyJSON]
         }
         arguments.append("http://mlxbar\(path)")
         do {
-            return try await runProcess(URL(fileURLWithPath: "/usr/bin/curl"), arguments)
+            return try await runProcess(URL(fileURLWithPath: "/usr/bin/curl"), arguments,
+                                        timeoutStatuses: [28])
         } catch ClientError.command(let rawMessage) {
             // curl writes the HTTP body to stdout and its diagnostic to stderr.
-            // runProcess joins both, so parse each line and keep the structured
-            // API error instead of exposing JSON and curl internals in the UI.
-            for line in rawMessage.split(separator: "\n") {
-                guard let data = String(line).data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let detail = object["detail"] as? [String: Any] else { continue }
-                throw ClientError.command(detail["message"] as? String ?? detail["code"] as? String ?? "処理に失敗しました")
+            // runProcess joins both, so parse the body as a whole and keep the
+            // structured API error instead of exposing JSON and curl internals.
+            if let detail = Self.apiErrorDetail(in: rawMessage) {
+                throw ClientError.command(detail)
             }
             throw ClientError.command(rawMessage)
         }
     }
 
-    func stream(_ path: String, bodyJSON: String, onEvent: @Sendable (StreamEvent) -> Void) async throws {
+    /// Extracts the coordinator's error message from a mixed stdout/stderr blob.
+    ///
+    /// The body may be pretty-printed across several lines, so the whole text is
+    /// tried first and individual lines only as a fallback.
+    static func apiErrorDetail(in raw: String) -> String? {
+        for candidate in [raw] + raw.split(separator: "\n").map(String.init) {
+            guard let data = candidate.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let detail = (object["detail"] as? [String: Any]) ?? (object["error"] as? [String: Any])
+            guard let detail else { continue }
+            if let message = detail["message"] as? String, !message.isEmpty { return message }
+            if let code = detail["code"] as? String, !code.isEmpty { return code }
+        }
+        return nil
+    }
+
+    /// Streams server-sent events from the coordinator.
+    ///
+    /// stdout and stderr are both drained from readability handlers rather than
+    /// polled with `availableData`: the old loop blocked a cooperative thread
+    /// for the whole generation, and leaving stderr unread until exit could
+    /// deadlock curl once the OS pipe buffer filled.
+    func stream(_ path: String, bodyJSON: String, onEvent: @escaping @Sendable (StreamEvent) -> Void) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
         process.arguments = ["--silent", "--show-error", "--fail-with-body", "--no-buffer",
-                             "--max-time", "7210",
+                             "--connect-timeout", "5", "--max-time", "7210",
                              "--unix-socket", socketPath, "--request", "POST",
                              "--header", "Content-Type: application/json", "--data-binary", bodyJSON,
                              "http://mlxbar\(path)"]
         let output = Pipe(), error = Pipe()
         process.standardOutput = output; process.standardError = error
-        try process.run()
-        var pending = Data()
-        while true {
-            let chunk = output.fileHandleForReading.availableData
-            if chunk.isEmpty { break }
+
+        let buffer = StreamBuffer(onEvent: onEvent)
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { return }
+            buffer.append(chunk)
+        }
+        error.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { return }
+            buffer.appendDiagnostic(chunk)
+        }
+
+        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in
+                continuation.resume(returning: process.terminationStatus)
+            }
+            do { try process.run() } catch { continuation.resume(throwing: error) }
+        }
+        // Drain whatever the handlers had not yet been scheduled for.
+        buffer.append(output.fileHandleForReading.readDataToEndOfFile())
+        buffer.appendDiagnostic(error.fileHandleForReading.readDataToEndOfFile())
+        output.fileHandleForReading.readabilityHandler = nil
+        error.fileHandleForReading.readabilityHandler = nil
+
+        guard status == 0 else {
+            if status == 28 { throw ClientError.timedOut }
+            let raw = buffer.diagnosticText
+            throw ClientError.command(Self.apiErrorDetail(in: raw)
+                                      ?? (raw.isEmpty ? "生成に失敗しました" : raw))
+        }
+    }
+
+    /// Reassembles SSE lines arriving in arbitrary chunks off the reader queue.
+    private final class StreamBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending = Data()
+        private var diagnostic = Data()
+        private let onEvent: @Sendable (StreamEvent) -> Void
+
+        init(onEvent: @escaping @Sendable (StreamEvent) -> Void) { self.onEvent = onEvent }
+
+        var diagnosticText: String {
+            lock.lock(); defer { lock.unlock() }
+            return String(data: diagnostic, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+
+        func appendDiagnostic(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            lock.lock(); diagnostic.append(chunk); lock.unlock()
+        }
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            var events: [StreamEvent] = []
+            lock.lock()
             pending.append(chunk)
             while let newline = pending.firstIndex(of: 0x0A) {
                 let lineData = pending[..<newline]
@@ -73,16 +162,13 @@ final class CoordinatorClient: @unchecked Sendable {
                 guard line.hasPrefix("data: "),
                       let data = String(line.dropFirst(6)).data(using: .utf8),
                       let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-                onEvent(StreamEvent(type: event["type"] as? String ?? "unknown",
-                                    text: event["text"] as? String,
-                                    message: event["message"] as? String,
-                                    generationTPS: (event["generation_tps"] as? NSNumber)?.doubleValue))
+                events.append(StreamEvent(type: event["type"] as? String ?? "unknown",
+                                          text: event["text"] as? String,
+                                          message: event["message"] as? String,
+                                          generationTPS: (event["generation_tps"] as? NSNumber)?.doubleValue))
             }
-        }
-        process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            let message = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-            throw ClientError.command(message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "生成に失敗しました")
+            lock.unlock()
+            for event in events { onEvent(event) }
         }
     }
 
@@ -199,13 +285,11 @@ final class CoordinatorClient: @unchecked Sendable {
         try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
         let plistURL = launchAgents.appendingPathComponent("\(serviceLabel).plist")
         let bundleResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/MLXBar_MLXBar.bundle")
-        let logs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MLXBar")
-        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        // No StandardOutPath/StandardErrorPath: the coordinator writes its own
+        // log inside Application Support, which stays private to this user.
         let plist: [String: Any] = [
             "Label": serviceLabel, "ProgramArguments": [coordinator.path], "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false], "ProcessType": "Interactive", "ThrottleInterval": 10,
-            "StandardOutPath": logs.appendingPathComponent("coordinator.log").path,
-            "StandardErrorPath": logs.appendingPathComponent("coordinator.log").path,
             "EnvironmentVariables": ["PATH": "\(bundleResources.path):/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"]
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
@@ -225,7 +309,8 @@ final class CoordinatorClient: @unchecked Sendable {
         try await runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments)
     }
 
-    private func runProcess(_ executable: URL, _ arguments: [String]) async throws -> Data {
+    private func runProcess(_ executable: URL, _ arguments: [String],
+                            timeoutStatuses: Set<Int32> = []) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = executable; process.arguments = arguments
@@ -235,6 +320,8 @@ final class CoordinatorClient: @unchecked Sendable {
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 if process.terminationStatus == 0 {
                     continuation.resume(returning: data)
+                } else if timeoutStatuses.contains(process.terminationStatus) {
+                    continuation.resume(throwing: ClientError.timedOut)
                 } else {
                     let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                     let stdout = String(data: data, encoding: .utf8) ?? ""

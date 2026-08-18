@@ -3,12 +3,14 @@ import SwiftUI
 struct MLXBarSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var selection = "APIサーバー"
+    /// The Japanese titles double as localization keys, so the selection stays
+    /// valid when the interface language changes underneath it.
     private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "ランタイム", "詳細", "削除"]
 
     var body: some View {
         NavigationSplitView {
             List(pages, id: \.self, selection: $selection) { page in
-                Text(LocalizedStringKey(page))
+                Text(LS(page))
             }
         } detail: {
             switch selection {
@@ -32,17 +34,17 @@ struct DiagnosticsSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("最近のAPIログ").font(.headline)
+                Text(LS("最近のAPIログ")).font(.headline)
                 Spacer()
-                Button("更新") { Task { await model.refreshRecentLogs() } }
-                Button("コピー") { model.copyRecentLogs() }.disabled(model.recentLogs.isEmpty)
-                Button("消去…", role: .destructive) { confirmsClear = true }.disabled(model.recentLogs.isEmpty)
+                Button(LS("更新")) { Task { await model.refreshRecentLogs() } }
+                Button(LS("コピー")) { model.copyRecentLogs() }.disabled(model.recentLogs.isEmpty)
+                Button(LS("消去…"), role: .destructive) { confirmsClear = true }.disabled(model.recentLogs.isEmpty)
             }
-            Text("リクエスト本文、応答本文、APIキーは記録しません。最新2,000件だけを保存し、この画面には500件まで表示します。")
+            Text(LS("リクエスト本文、応答本文、APIキーは記録しません。最新2,000件だけを保存し、この画面には500件まで表示します。"))
                 .font(.caption).foregroundStyle(.secondary)
             if let status = model.logStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             if model.recentLogs.isEmpty {
-                ContentUnavailableView("ログはありません", systemImage: "doc.text.magnifyingglass")
+                ContentUnavailableView(LS("ログはありません"), systemImage: "doc.text.magnifyingglass")
             } else {
                 List(Array(model.recentLogs.enumerated()), id: \.offset) { entry in
                     Text(MenuBarViewModel.formatLog(entry.element))
@@ -53,10 +55,10 @@ struct DiagnosticsSettingsView: View {
         }
         .padding()
         .task { await model.refreshRecentLogs() }
-        .confirmationDialog("APIログを消去しますか？", isPresented: $confirmsClear) {
-            Button("ログを消去", role: .destructive) { Task { await model.clearRecentLogs() } }
-            Button("キャンセル", role: .cancel) {}
-        } message: { Text("この操作は取り消せません。モデルや設定には影響しません。") }
+        .confirmationDialog(LS("APIログを消去しますか？"), isPresented: $confirmsClear) {
+            Button(LS("ログを消去"), role: .destructive) { Task { await model.clearRecentLogs() } }
+            Button(LS("キャンセル"), role: .cancel) {}
+        } message: { Text(LS("この操作は取り消せません。モデルや設定には影響しません。")) }
     }
 }
 
@@ -66,35 +68,35 @@ struct DataRemovalSettingsView: View {
 
     var body: some View {
         Form {
-            Section("MLXBarのデータを削除") {
-                Text("設定、履歴、APIキー、MLXBarがダウンロードしたランタイム、ログをこのMacから削除します。")
-                Text("Hugging FaceやLM Studioなど、外部のモデルフォルダにあるモデル本体は削除しません。")
+            Section(LS("MLXBarのデータを削除")) {
+                Text(LS("設定、履歴、APIキー、MLXBarがダウンロードしたランタイム、ログをこのMacから削除します。"))
+                Text(LS("Hugging FaceやLM Studioなど、外部のモデルフォルダにあるモデル本体は削除しません。"))
                     .font(.caption).foregroundStyle(.secondary)
                 if model.isRemovingAllData {
                     HStack {
                         ProgressView().controlSize(.small)
-                        Text("サービスを停止してデータを削除中…")
+                        Text(LS("サービスを停止してデータを削除中…"))
                     }
                 }
-                Button("すべてのデータを削除して終了…", role: .destructive) {
+                Button(LS("すべてのデータを削除して終了…"), role: .destructive) {
                     confirmsRemoval = true
                 }
                 .disabled(model.isRemovingAllData)
-                .accessibilityLabel("MLXBarの設定とダウンロード済みランタイムをすべて削除")
+                .accessibilityLabel(LS("MLXBarの設定とダウンロード済みランタイムをすべて削除"))
             }
             Section {
-                Text("削除完了後にMLXBarは終了します。その後、MLXBar.appをゴミ箱へ移動してください。")
+                Text(LS("削除完了後にMLXBarは終了します。その後、MLXBar.appをゴミ箱へ移動してください。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .padding()
-        .confirmationDialog("MLXBarの全データを削除しますか？", isPresented: $confirmsRemoval) {
-            Button("全データを削除して終了", role: .destructive) {
+        .confirmationDialog(LS("MLXBarの全データを削除しますか？"), isPresented: $confirmsRemoval) {
+            Button(LS("全データを削除して終了"), role: .destructive) {
                 Task { await model.deleteAllAppDataAndQuit() }
             }
-            Button("キャンセル", role: .cancel) {}
+            Button(LS("キャンセル"), role: .cancel) {}
         } message: {
-            Text("設定、履歴、APIキー、ダウンロード済みランタイム、ログが削除されます。この操作は取り消せません。外部のモデル本体は残ります。")
+            Text(LS("設定、履歴、APIキー、ダウンロード済みランタイム、ログが削除されます。この操作は取り消せません。外部のモデル本体は残ります。"))
         }
     }
 }
@@ -111,17 +113,17 @@ struct GeneralSettingsView: View {
                 Text("English").tag("en")
                 Text("日本語").tag("ja")
             }
-            Text("English is used by default. You can change the interface language here at any time.")
+            Text(LS("English is used by default. You can change the interface language here at any time."))
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("GUI終了後もサービスを継続", isOn: Binding(
+            Toggle(LS("GUI終了後もサービスを継続"), isOn: Binding(
                 get: { general["continueAfterGUIExit"] as? Bool ?? true },
                 set: { value in Task { await model.setConfig("general.continueAfterGUIExit", value: value) } }
             ))
-            Toggle("ログイン時に起動", isOn: Binding(
+            Toggle(LS("ログイン時に起動"), isOn: Binding(
                 get: { general["launchAtLogin"] as? Bool ?? false },
                 set: { value in Task { await model.setLaunchAtLogin(value) } }
             ))
-            Text("バックグラウンド時は30秒間隔で状態を確認します。").foregroundStyle(.secondary)
+            Text(LS("バックグラウンド時は30秒間隔で状態を確認します。")).foregroundStyle(.secondary)
         }.padding()
     }
 }
@@ -140,52 +142,55 @@ struct ModelSourceSettingsView: View {
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
     var body: some View {
         Form {
-            Section("APIからのモデル利用") {
-                Toggle("API要求時に必要なモデルを自動ロード", isOn: Binding(
+            Section(LS("APIからのモデル利用")) {
+                Toggle(LS("API要求時に必要なモデルを自動ロード"), isOn: Binding(
                     get: { automaticallyLoadsForAPI },
                     set: { value in Task { await model.setConfig("models.autoLoadOnAPIRequest", value: value) } }
                 ))
-                Text("アプリやモデルWorkerを再起動した後も、OpenAI互換APIで指定されたモデルを自動的に復元します。手動でアンロードした場合は自動ロードしません。")
+                Text(LS("アプリやモデルWorkerを再起動した後も、OpenAI互換APIで指定されたモデルを自動的に復元します。手動でアンロードした場合は自動ロードしません。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Max token上限") {
+            Section(LS("Max token上限")) {
                 HStack {
-                    TextField("上限", value: $maxTokenLimit, format: .number)
+                    TextField(LS("上限"), value: $maxTokenLimit, format: .number)
                         .frame(width: 160)
                     Text("tokens")
-                    Button("適用") { Task { await model.setMaxTokenLimit(maxTokenLimit) } }
+                    Button(LS("適用")) { Task { await model.setMaxTokenLimit(maxTokenLimit) } }
                         .buttonStyle(.borderedProminent)
                 }
                 if let modelLimit = model.loadedModelMaxTokens {
-                    LabeledContent("ロード中モデルの上限",
+                    LabeledContent(LS("ロード中モデルの上限"),
                                    value: "\(MenuBarViewModel.tokenCount(modelLimit)) tokens")
                 } else {
-                    LabeledContent("ロード中モデルの上限", value: "モデル未ロード／取得できません")
+                    LabeledContent(LS("ロード中モデルの上限"), value: LS("モデル未ロード／取得できません"))
                 }
-                LabeledContent("現在のAPI有効上限",
+                LabeledContent(LS("現在のAPI有効上限"),
                                value: "\(MenuBarViewModel.tokenCount(model.effectiveMaxTokens)) tokens")
-                Text("API要求がこの値を超えた場合はエラーにせず、この上限へ自動調整します。有効上限は設定値とモデル上限の小さい方です。")
+                Text(LS("API要求がこの値を超えた場合はエラーにせず、この上限へ自動調整します。有効上限は設定値とモデル上限の小さい方です。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("既定の生成パラメータ") {
-                LabeledContent("温度") {
+            Section(LS("既定の生成パラメータ")) {
+                LabeledContent(LS("温度")) {
                     TextField("0〜2", value: $defaultTemperature, format: .number)
                         .frame(width: 110)
                 }
                 Slider(value: $defaultTemperature, in: 0...2, step: 0.05)
+                    .accessibilityLabel(LS("温度"))
                 LabeledContent("Top P") {
                     TextField("0〜1", value: $defaultTopP, format: .number)
                         .frame(width: 110)
                 }
                 Slider(value: $defaultTopP, in: 0...1, step: 0.05)
-                LabeledContent("繰り返しペナルティ") {
+                    .accessibilityLabel("Top P")
+                LabeledContent(LS("繰り返しペナルティ")) {
                     TextField("0.01〜2", value: $defaultRepetitionPenalty, format: .number)
                         .frame(width: 110)
                 }
                 Slider(value: $defaultRepetitionPenalty, in: 0.01...2, step: 0.05)
-                Stepper("ペナルティ対象範囲: \(repetitionContextSize) tokens",
+                    .accessibilityLabel(LS("繰り返しペナルティ"))
+                Stepper("\(LS("ペナルティ対象範囲")): \(repetitionContextSize) tokens",
                         value: $repetitionContextSize, in: 1...32768)
-                Button("生成パラメータを適用") {
+                Button(LS("生成パラメータを適用")) {
                     Task {
                         await model.setSamplingDefaults(
                             temperature: defaultTemperature, topP: defaultTopP,
@@ -193,43 +198,43 @@ struct ModelSourceSettingsView: View {
                             repetitionContextSize: repetitionContextSize)
                     }
                 }.buttonStyle(.borderedProminent)
-                Text("温度0は決定的な出力、Top Pを小さくすると候補を絞ります。繰り返しペナルティは1.0で無効、1より大きいほど繰り返しを抑えます。API要求が値を指定した場合はAPI側を優先します。")
+                Text(LS("温度0は決定的な出力、Top Pを小さくすると候補を絞ります。繰り返しペナルティは1.0で無効、1より大きいほど繰り返しを抑えます。API要求が値を指定した場合はAPI側を優先します。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("並列リクエスト") {
-                Stepper("生成待ち: 最大 \(maxQueuedRequests)件", value: $maxQueuedRequests, in: 1...64)
+            Section(LS("並列リクエスト")) {
+                Stepper("\(LS("生成待ち: 最大")) \(maxQueuedRequests)\(LS("件"))", value: $maxQueuedRequests, in: 1...64)
                 HStack {
-                    TextField("最大待ち時間", value: $queueTimeoutSeconds, format: .number)
+                    TextField(LS("最大待ち時間"), value: $queueTimeoutSeconds, format: .number)
                         .frame(width: 160)
-                    Text("秒")
-                    Button("適用") {
+                    Text(LS("秒"))
+                    Button(LS("適用")) {
                         Task { await model.setQueueLimits(maximum: maxQueuedRequests,
                                                           timeout: queueTimeoutSeconds) }
                     }.buttonStyle(.borderedProminent)
                 }
-                Text("ZCodeのsubagentなどから同時に届いた要求を到着順に処理します。待機中も接続を維持し、上限を超えた場合だけエラーを返します。")
+                Text(LS("ZCodeのsubagentなどから同時に届いた要求を到着順に処理します。待機中も接続を維持し、上限を超えた場合だけエラーを返します。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("追加フォルダ") {
+            Section(LS("追加フォルダ")) {
                 ForEach(roots, id: \.self) { path in
                     HStack {
                         Text(path).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        Button("削除") { Task { await model.removeModelFolder(path) } }
+                        Button(LS("削除")) { Task { await model.removeModelFolder(path) } }
                     }
                 }
                 HStack {
-                    Button("フォルダを追加…") { chooseFolder() }
-                    Menu("ライブラリから追加…") {
-                        Button("ユーザライブラリ（~/Library）") { chooseFolder(startingAt: .user) }
-                        Button("Macライブラリ（/Library）") { chooseFolder(startingAt: .system) }
+                    Button(LS("フォルダを追加…")) { chooseFolder() }
+                    Menu(LS("ライブラリから追加…")) {
+                        Button(LS("ユーザライブラリ（~/Library）")) { chooseFolder(startingAt: .user) }
+                        Button(LS("Macライブラリ（/Library）")) { chooseFolder(startingAt: .system) }
                     }
                 }
                 .disabled(isSelectingFolder)
-                Text("選択画面では隠しフォルダも表示されます。⌘⇧Gで任意のパスを直接入力できます。")
+                Text(LS("選択画面では隠しフォルダも表示されます。⌘⇧Gで任意のパスを直接入力できます。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Button("今すぐ再スキャン") { Task { await model.scan() } }
+            Button(LS("今すぐ再スキャン")) { Task { await model.scan() } }
         }
         .padding()
         .task {
@@ -250,8 +255,13 @@ struct ModelSourceSettingsView: View {
         isSelectingFolder = true
         Task { @MainActor in
             defer { isSelectingFolder = false }
-            if let url = await FileSelectionService.shared.chooseFolder(startingAt: location?.url) {
-                await model.addModelFolder(url)
+            switch await FileSelectionService.shared.chooseFolder(startingAt: location?.url) {
+            case .chosen(let urls):
+                if let url = urls.first { await model.addModelFolder(url) }
+            case .busy:
+                model.errorMessage = LS("別のファイル選択画面が開いています。先にそちらを閉じてください。")
+            case .cancelled:
+                break
             }
         }
     }
@@ -266,82 +276,91 @@ struct APISettingsView: View {
     private var api: [String: Any] { model.settings["api"] as? [String: Any] ?? [:] }
     private var security: [String: Any] { model.settings["security"] as? [String: Any] ?? [:] }
     private var allowsLAN: Bool { security["allowLan"] as? Bool ?? false }
+    private var allowsRemoteImages: Bool { security["allowRemoteImageUrls"] as? Bool ?? false }
     var body: some View {
         Form {
-            Section("APIサーバー") {
-                Toggle("ローカルネットワークへ公開", isOn: Binding(
+            Section(LS("APIサーバー")) {
+                Toggle(LS("ローカルネットワークへ公開"), isOn: Binding(
                     get: { allowsLAN },
                     set: { enabled in
                         if enabled { confirmsLANEnable = true }
                         else { Task { await model.setLANAccess(false) } }
                     }
                 ))
-                LabeledContent("Host", value: allowsLAN ? "0.0.0.0（LAN）" : "127.0.0.1（このMacのみ）")
+                LabeledContent("Host", value: allowsLAN ? LS("0.0.0.0（LAN）") : LS("127.0.0.1（このMacのみ）"))
                 TextField("Port", value: $port, format: .number).frame(width: 120)
-                LabeledContent("現在のURL", value: model.apiURL)
+                LabeledContent(LS("現在のURL"), value: model.apiURL)
                 HStack {
-                    Button("URLをコピー") { model.copyAPIURL() }
-                    Button("ポートを適用") { Task { await model.setPort(port) } }
+                    Button(LS("URLをコピー")) { model.copyAPIURL() }
+                    Button(LS("ポートを適用")) { Task { await model.setPort(port) } }
                 }
                 if allowsLAN {
-                    Label("LAN内の端末からAPIへ接続できます。信頼できるネットワークでのみ使用してください。",
+                    Label(LS("LAN内の端末からAPIへ接続できます。信頼できるネットワークでのみ使用してください。"),
                           systemImage: "network.badge.shield.half.filled")
                         .foregroundStyle(.orange)
                     if model.lanAPIURLs.isEmpty {
-                        Text("LAN用IPを取得できませんでした。Macのネットワーク接続を確認してください。")
+                        Text(LS("LAN用IPを取得できませんでした。Macのネットワーク接続を確認してください。"))
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
                         ForEach(model.lanAPIURLs, id: \.self) { url in
                             HStack {
                                 Text(url).textSelection(.enabled)
                                 Spacer()
-                                Button("コピー") { model.copyURL(url) }
+                                Button(LS("コピー")) { model.copyURL(url) }
                             }
                         }
                     }
                 }
             }
-            Section("APIキー") {
-                Toggle("APIキーを要求", isOn: Binding(
+            Section(LS("画像入力")) {
+                Toggle(LS("外部URLの画像取得を許可"), isOn: Binding(
+                    get: { allowsRemoteImages },
+                    set: { value in Task { await model.setConfig("security.allowRemoteImageUrls", value: value) } }
+                ))
+                Text(LS("既定ではAPIの画像はdata URI（base64）のみ受け付けます。有効にすると、MLXBarがhttp(s)の画像URLを代理取得します。プライベートアドレスへの取得は常に拒否します。"))
+                    .font(.caption).foregroundStyle(allowsRemoteImages ? .orange : .secondary)
+            }
+            Section(LS("APIキー")) {
+                Toggle(LS("APIキーを要求"), isOn: Binding(
                     get: { api["requireToken"] as? Bool ?? true },
                     set: { value in Task { await model.setConfig("api.requireToken", value: value) } }
                 )).disabled(allowsLAN)
                 HStack {
-                    if showsToken { TextField("APIキー", text: $model.apiToken).textFieldStyle(.roundedBorder) }
-                    else { SecureField("APIキー", text: $model.apiToken).textFieldStyle(.roundedBorder) }
+                    if showsToken { TextField(LS("APIキー"), text: $model.apiToken).textFieldStyle(.roundedBorder) }
+                    else { SecureField(LS("APIキー"), text: $model.apiToken).textFieldStyle(.roundedBorder) }
                     Button { showsToken.toggle() } label: {
                         Image(systemName: showsToken ? "eye.slash" : "eye")
-                            .accessibilityLabel(showsToken ? "APIキーを隠す" : "APIキーを表示")
+                            .accessibilityLabel(LS(showsToken ? "APIキーを隠す" : "APIキーを表示"))
                     }
                 }
                 HStack {
-                    Button("保存") { Task { await model.saveAPIToken(model.apiToken) } }.buttonStyle(.borderedProminent)
-                    Button("コピー") { model.copyAPIToken() }.disabled(model.apiToken.isEmpty)
-                    Button("再生成…", role: .destructive) { confirmsRegeneration = true }
+                    Button(LS("保存")) { Task { await model.saveAPIToken(model.apiToken) } }.buttonStyle(.borderedProminent)
+                    Button(LS("コピー")) { model.copyAPIToken() }.disabled(model.apiToken.isEmpty)
+                    Button(LS("再生成…"), role: .destructive) { confirmsRegeneration = true }
                 }
-                Text(allowsLAN
-                     ? "LAN公開中はAPIキーが必須です。別PCでは Authorization: Bearer <APIキー> を指定します。"
-                     : (api["requireToken"] as? Bool ?? true)
-                     ? "OpenAI互換APIでは Authorization: Bearer <APIキー> を指定します。"
-                     : "APIキーなしで利用できます。同じMac上の他のアプリからもアクセス可能になります。")
+                Text(LS(allowsLAN
+                        ? "LAN公開中はAPIキーが必須です。別PCでは Authorization: Bearer <APIキー> を指定します。"
+                        : (api["requireToken"] as? Bool ?? true)
+                        ? "OpenAI互換APIでは Authorization: Bearer <APIキー> を指定します。"
+                        : "APIキーなしで利用できます。同じMac上の他のアプリからもアクセス可能になります。"))
                     .font(.caption).foregroundStyle(.secondary)
                 if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             }
         }
         .padding()
         .onAppear { port = Int(URL(string: model.apiURL)?.port ?? 11435) }
-        .confirmationDialog("APIキーを再生成しますか？", isPresented: $confirmsRegeneration) {
-            Button("再生成", role: .destructive) { Task { await model.regenerateAPIToken() } }
+        .confirmationDialog(LS("APIキーを再生成しますか？"), isPresented: $confirmsRegeneration) {
+            Button(LS("再生成"), role: .destructive) { Task { await model.regenerateAPIToken() } }
         } message: {
-            Text("現在のAPIキーを使っているクライアントは、設定を更新するまで接続できなくなります。")
+            Text(LS("現在のAPIキーを使っているクライアントは、設定を更新するまで接続できなくなります。"))
         }
-        .confirmationDialog("ローカルネットワークへ公開しますか？", isPresented: $confirmsLANEnable) {
-            Button("APIキー必須で公開", role: .destructive) {
+        .confirmationDialog(LS("ローカルネットワークへ公開しますか？"), isPresented: $confirmsLANEnable) {
+            Button(LS("APIキー必須で公開"), role: .destructive) {
                 Task { await model.setLANAccess(true) }
             }
-            Button("キャンセル", role: .cancel) {}
+            Button(LS("キャンセル"), role: .cancel) {}
         } message: {
-            Text("同じネットワーク内の端末からMLXBarへ接続可能になります。信頼できるLANでのみ有効にしてください。")
+            Text(LS("同じネットワーク内の端末からMLXBarへ接続可能になります。信頼できるLANでのみ有効にしてください。"))
         }
     }
 }
@@ -355,28 +374,28 @@ struct LMStudioSettingsView: View {
         Form {
             TextField("Base URL", text: $baseURL)
             HStack {
-                if showsToken { TextField("APIキー（任意）", text: $model.lmStudioToken) }
-                else { SecureField("APIキー（任意）", text: $model.lmStudioToken) }
+                if showsToken { TextField(LS("APIキー（任意）"), text: $model.lmStudioToken) }
+                else { SecureField(LS("APIキー（任意）"), text: $model.lmStudioToken) }
                 Button { showsToken.toggle() } label: {
                     Image(systemName: showsToken ? "eye.slash" : "eye")
-                        .accessibilityLabel(showsToken ? "APIキーを隠す" : "APIキーを表示")
+                        .accessibilityLabel(LS(showsToken ? "APIキーを隠す" : "APIキーを表示"))
                 }
             }
-            Toggle("自動ロード", isOn: Binding(get: { lmStudio["autoLoad"] as? Bool ?? true }, set: { value in Task { await model.setConfig("models.lmStudio.autoLoad", value: value) } }))
+            Toggle(LS("自動ロード"), isOn: Binding(get: { lmStudio["autoLoad"] as? Bool ?? true }, set: { value in Task { await model.setConfig("models.lmStudio.autoLoad", value: value) } }))
             HStack {
-                Button("適用") {
+                Button(LS("適用")) {
                     Task {
                         await model.setConfig("models.lmStudio.baseUrl", value: baseURL)
                         await model.saveLMStudioToken(model.lmStudioToken)
                     }
                 }.buttonStyle(.borderedProminent)
-                Button("APIキーを削除") {
+                Button(LS("APIキーを削除")) {
                     model.lmStudioToken = ""
                     Task { await model.saveLMStudioToken("") }
                 }.disabled(model.lmStudioToken.isEmpty)
             }
             if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
-            Text("LM Studioが停止中でもMLXBarは動作を継続します。GGUFはLM Studio Providerのみに送られます。").foregroundStyle(.secondary)
+            Text(LS("LM Studioが停止中でもMLXBarは動作を継続します。GGUFはLM Studio Providerのみに送られます。")).foregroundStyle(.secondary)
         }.padding().onAppear { baseURL = lmStudio["baseUrl"] as? String ?? baseURL }
     }
 }

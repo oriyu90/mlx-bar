@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The SwiftUI app loads no third-party native code, so it keeps the hardened
+     runtime's library validation and needs no JIT. Only the bundled Python
+     runtimes, which load MLX's unsigned C extensions, require the relaxations
+     in entitlements.plist. -->
+<plist version="1.0"><dict>
+</dict></plist>

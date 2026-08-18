@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from .. import __version__
 from ..errors import MLXBarError
 
 
@@ -23,7 +24,7 @@ def state(request: Request):
 
 @router.get("/health")
 async def health(request: Request):
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": __version__}
 
 
 @router.get("/status")
@@ -310,7 +311,7 @@ async def job_events(job_id: str, request: Request):
 async def diagnostics(request: Request):
     app = state(request)
     masked_root = str(app.root).replace(str(Path.home()), "~")
-    return {"version": "1.0.0", "python": sys.version.split()[0], "platform": platform.platform(),
+    return {"version": __version__, "python": sys.version.split()[0], "platform": platform.platform(),
             "root": masked_root, "status": app.workers.status(), "settings": app.settings.public()}
 
 

@@ -8,7 +8,7 @@ APP_DIR="$DIST_DIR/MLXBar.app"
 CONTENTS="$APP_DIR/Contents"
 PYINSTALLER_DIR="$PROJECT_DIR/.release-python"
 DMG_STAGE="$PROJECT_DIR/.dmg-stage"
-VERSION=1.0.0
+VERSION=1.1.0
 
 export SWIFT_MODULE_CACHE_PATH="$PROJECT_DIR/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache"
@@ -60,12 +60,18 @@ if [ "$IDENTITY" = "-" ]; then
   codesign --force --sign - "$CONTENTS/MacOS/MLXBarCoordinator"
   codesign --force --deep --sign - "$APP_DIR"
 else
+  # Only the bundled Python runtimes load MLX's unsigned C extensions, so the
+  # library-validation and JIT relaxations stay scoped to them. Signing the app
+  # bundle last, without --deep, keeps those entitlements from being applied to
+  # the SwiftUI executable, which needs neither.
   codesign --force --options runtime --entitlements "$PROJECT_DIR/Packaging/entitlements.plist" \
     --sign "$IDENTITY" "$CONTENTS/Resources/coordinator/MLXBarCoordinator"
   codesign --force --options runtime --entitlements "$PROJECT_DIR/Packaging/entitlements.plist" \
     --sign "$IDENTITY" "$CONTENTS/Resources/cli/MLXBarCLI"
   codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/MLXBarCoordinator"
-  codesign --force --deep --options runtime --entitlements "$PROJECT_DIR/Packaging/entitlements.plist" \
+  codesign --force --options runtime --entitlements "$PROJECT_DIR/Packaging/entitlements-app.plist" \
+    --sign "$IDENTITY" "$CONTENTS/MacOS/MLXBar"
+  codesign --force --options runtime --entitlements "$PROJECT_DIR/Packaging/entitlements-app.plist" \
     --sign "$IDENTITY" "$APP_DIR"
 fi
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"

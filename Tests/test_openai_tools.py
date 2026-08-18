@@ -29,7 +29,7 @@ class ToolWorker:
     def __init__(self):
         self.received = None
 
-    async def generate(self, messages, images, options, request_id):
+    async def generate(self, messages, images, options, request_id, image_root=None):
         self.received = (messages, images, options, request_id)
         yield {"type": "tool_calls", "calls": [{"id": "call_test", "type": "function",
                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'}}]}
@@ -164,7 +164,7 @@ def test_api_log_is_bounded_and_does_not_store_request_bodies():
 
 def test_zcode_oversized_max_tokens_is_clamped_instead_of_rejected():
     class ClampingWorker(WorkerSupervisor):
-        async def generate(self, prompt, images, options, request_id=None):
+        async def generate(self, prompt, images, options, request_id=None, image_root=None):
             _, _, self.captured = self._validate_generation(prompt, images, options)
             yield {"type": "completed", "finish_reason": "stop"}
 
@@ -204,7 +204,7 @@ class AutoLoadWorker:
         self.loaded = {**model, "state": "loaded", "capabilities": {"modelMaxTokens": 32768}}
         return self.loaded
 
-    async def generate(self, messages, images, options, request_id):
+    async def generate(self, messages, images, options, request_id, image_root=None):
         self.received = (messages, images, options, request_id)
         yield {"type": "delta", "text": "ok"}
         yield {"type": "usage", "prompt_tokens": 12, "completion_tokens": 1}

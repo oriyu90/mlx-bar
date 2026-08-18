@@ -49,7 +49,8 @@ DEFAULTS: dict[str, Any] = {
         "cancelGraceSeconds": 5,
         "memoryLimitRatio": 0.90,
     },
-    "security": {"trustRemoteCodeDefault": False, "allowLan": False},
+    "security": {"trustRemoteCodeDefault": False, "allowLan": False,
+                 "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info", "language": "en"},
 }
 
@@ -119,6 +120,8 @@ class SettingsStore:
             raise ValueError("api.host and security.allowLan must be changed together")
         if allow_lan and not api.get("requireToken", True):
             raise ValueError("LAN公開中はAPIキーを無効にできません")
+        if not isinstance(data.get("security", {}).get("allowRemoteImageUrls", False), bool):
+            raise ValueError("security.allowRemoteImageUrls must be boolean")
         port = api.get("port")
         if not isinstance(port, int) or not 1024 <= port <= 65535:
             raise ValueError("port must be between 1024 and 65535")

@@ -7,8 +7,10 @@
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>/tmp/mlxbar-coordinator.log</string>
-  <key>StandardErrorPath</key><string>/tmp/mlxbar-coordinator.log</string>
+  <!-- Diagnostics are written by the coordinator itself into its private
+       Application Support directory. Redirecting here instead would mean a
+       fixed path under world-writable /tmp, which another local account can
+       pre-create as a symlink pointing anywhere this user can write. -->
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
   </dict>

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..errors import MLXBarError
+from .images import resolve_public_images
 
 
 router = APIRouter()
@@ -157,9 +158,20 @@ async def chat(request: Request, body: dict):
     for key in ("frequency_penalty", "presence_penalty", "seed", "stop"):
         if key in body:
             options[key] = body[key]
+    # Image references from this listener are untrusted: rewrite them into a
+    # private directory so a caller can never name a path or URL of its own.
+    # Done before the model is resolved so a rejected reference cannot trigger
+    # an expensive auto-load first.
+    try:
+        images, image_workspace = await resolve_public_images(images, app_state(request).settings)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    image_root = image_workspace.path if image_workspace else None
     try:
         loaded = await _ensure_requested_model(request, requested_model)
     except MLXBarError as exc:
+        if image_workspace:
+            image_workspace.cleanup()
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     response_model = loaded.get("name") or loaded.get("id") or requested_model
     try:
@@ -167,6 +179,8 @@ async def chat(request: Request, body: dict):
         if capacity_check:
             capacity_check()
     except MLXBarError as exc:
+        if image_workspace:
+            image_workspace.cleanup()
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     if body.get("stream", False):
         async def stream():
@@ -180,7 +194,8 @@ async def chat(request: Request, body: dict):
                            "model": response_model, "choices": [{"index": 0,
                            "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield "data: " + json.dumps(initial, ensure_ascii=False) + "\n\n"
-                async for event in app_state(request).workers.generate(normalized_messages, images, options, request_id):
+                async for event in app_state(request).workers.generate(
+                        normalized_messages, images, options, request_id, image_root=image_root):
                     if event.get("type") == "delta":
                         completion_text += event["text"]
                         usage = _usage(normalized_messages, completion_text)
@@ -231,6 +246,9 @@ async def chat(request: Request, body: dict):
                 request.state.api_log["error_code"] = "INTERNAL_ERROR"
                 yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
                                                          "retryable": False}}, ensure_ascii=False) + "\n\n"
+            finally:
+                if image_workspace:
+                    image_workspace.cleanup()
             if not failed and not completed:
                 chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                          "model": response_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
@@ -247,7 +265,8 @@ async def chat(request: Request, body: dict):
     finish_reason = "stop"
     usage = None
     try:
-        async for event in app_state(request).workers.generate(normalized_messages, images, options, request_id):
+        async for event in app_state(request).workers.generate(
+                normalized_messages, images, options, request_id, image_root=image_root):
             if event.get("type") == "delta":
                 text += event["text"]
             elif event.get("type") == "tool_calls":
@@ -265,6 +284,9 @@ async def chat(request: Request, body: dict):
                                   event.get("retryable", False))
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    finally:
+        if image_workspace:
+            image_workspace.cleanup()
     message = {"role": "assistant", "content": text or None if tool_calls else text}
     if tool_calls:
         message["tool_calls"] = tool_calls

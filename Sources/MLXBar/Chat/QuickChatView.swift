@@ -13,16 +13,18 @@ struct QuickChatView: View {
     var body: some View {
         VStack(spacing: 12) {
             HStack {
-                Label(model.loadedName ?? "モデル未選択", systemImage: "cpu")
+                Label(model.loadedName ?? LS("モデル未選択"), systemImage: "cpu")
                 Spacer()
                 Text("Temperature \(temperature, specifier: "%.1f")")
                 Slider(value: $temperature, in: 0...2, step: 0.1).frame(width: 120)
-                Stepper("最大 \(maxTokens)", value: $maxTokens,
+                    .accessibilityLabel("Temperature")
+                Stepper(LS("最大 ") + "\(maxTokens)", value: $maxTokens,
                         in: 1...max(1, model.effectiveMaxTokens), step: 128)
             }
             ScrollView {
-                Text(model.chatOutput.isEmpty ? "ここに生成結果が表示されます" : model.chatOutput)
+                Text(model.chatOutput.isEmpty ? LS("ここに生成結果が表示されます") : model.chatOutput)
                     .frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).padding()
+                    .foregroundStyle(model.chatOutput.isEmpty ? .secondary : .primary)
             }.background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
             if !images.isEmpty {
                 ScrollView(.horizontal) { HStack { ForEach(images, id: \.self) { url in Label(url.lastPathComponent, systemImage: "photo") } } }
@@ -37,22 +39,23 @@ struct QuickChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             TextEditor(text: $prompt).frame(height: 90).overlay(RoundedRectangle(cornerRadius: 6).stroke(dropTarget ? Color.accentColor : Color(nsColor: .separatorColor)))
+                .accessibilityLabel(LS("プロンプト"))
                 .onDrop(of: [UTType.image.identifier, UTType.fileURL.identifier], isTargeted: $dropTarget) { providers in
                     for provider in providers {
                         _ = provider.loadObject(ofClass: URL.self) { url, _ in if let url { Task { @MainActor in images.append(url) } } }
                     }; return true
                 }
             HStack {
-                Button("画像を追加") { chooseImages() }
+                Button(LS("画像を追加")) { chooseImages() }
                     .disabled(!model.loadedModalities.contains("image") || isSelectingImages)
-                Button("会話をクリア") { model.chatOutput = ""; prompt = ""; images = [] }
+                Button(LS("会話をクリア")) { model.chatOutput = ""; prompt = ""; images = [] }
                 Spacer()
                 if model.currentRequestID != nil {
-                    Button(model.cancellationInProgress ? "停止処理中…" : "停止") {
+                    Button(LS(model.cancellationInProgress ? "停止処理中…" : "停止")) {
                         Task { await model.cancelGeneration() }
                     }.tint(.red).disabled(model.cancellationInProgress)
                 }
-                Button(model.busy ? "生成中…" : "送信") {
+                Button(LS(model.busy ? "生成中…" : "送信")) {
                     Task { await model.generate(prompt: prompt, images: images, temperature: temperature, maxTokens: maxTokens) }
                 }.buttonStyle(.borderedProminent).disabled(model.busy || prompt.isEmpty || model.loadedName == nil)
             }
@@ -69,7 +72,14 @@ struct QuickChatView: View {
         isSelectingImages = true
         Task { @MainActor in
             defer { isSelectingImages = false }
-            images.append(contentsOf: await FileSelectionService.shared.chooseImages())
+            switch await FileSelectionService.shared.chooseImages() {
+            case .chosen(let urls):
+                images.append(contentsOf: urls)
+            case .busy:
+                model.errorMessage = LS("別のファイル選択画面が開いています。先にそちらを閉じてください。")
+            case .cancelled:
+                break
+            }
         }
     }
 }

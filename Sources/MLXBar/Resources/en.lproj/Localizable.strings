@@ -205,3 +205,30 @@
 "追加" = "Add";
 "選択したランタイム" = "Selected runtime";
 "隠しフォルダも表示しています。選択したフォルダは読み取り専用で走査されます。" = "Hidden folders are visible. Selected folders are scanned read-only.";
+
+/* v1.1.0 additions */
+"0.0.0.0（LAN）" = "0.0.0.0 (LAN)";
+"API有効上限" = "Effective API limit";
+"English is used by default. You can change the interface language here at any time." = "English is used by default. You can change the interface language here at any time.";
+"LM Studio" = "LM Studio";
+"をロード中" = "is loading";
+"を削除します。" = "will be removed.";
+"クリップボードへコピーします" = "Copies to the clipboard";
+"バージョン" = "Version";
+"プロンプト" = "Prompt";
+"ペナルティ対象範囲" = "Penalty context";
+"モデルが見つかりません" = "No Models Found";
+"モデルを読み込み中…" = "Loading models…";
+"モデルフォルダを追加してから再スキャンしてください。" = "Add a model folder, then scan again.";
+"モデル上限" = "Model limit";
+"ロード済み" = "Loaded";
+"件" = "";
+"別のファイル選択画面が開いています。先にそちらを閉じてください。" = "Another file picker is already open. Close it first.";
+"外部URLの画像取得を許可" = "Allow fetching images from external URLs";
+"接続URL" = "Connection URL";
+"既定ではAPIの画像はdata URI（base64）のみ受け付けます。有効にすると、MLXBarがhttp(s)の画像URLを代理取得します。プライベートアドレスへの取得は常に拒否します。" = "By default the API accepts images only as data URIs (base64). When enabled, MLXBar fetches http(s) image URLs on the caller's behalf. Requests to private addresses are always refused.";
+"最大 " = "Max ";
+"最終確認" = "Last checked";
+"生成待ち: 最大" = "Queue capacity:";
+"画像入力" = "Image Input";
+"秒経過" = "s elapsed";
