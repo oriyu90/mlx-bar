@@ -3,269 +3,284 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MLXBar — Apple Silicon MacのローカルAIをメニューバーから</title>
-<meta name="description" content="MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリです。OpenAI互換APIを備え、モデルもデータもこのMacの中だけで動きます。無料・オープンソース。">
-<meta name="author" content="Yuki_Orita">
+<title>MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから</title>
+<meta name="description" content="MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリです。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（おりたゆうき / Yuki_Orita）。無料・オープンソース、GitHubで公開中。">
+<meta name="keywords" content="MLXBar, エムエルエックスバー, MLXバー, 折田悠希, おりたゆうき, Yuki_Orita, github, MLX, Apple Silicon, ローカルLLM, macOS, メニューバー, OpenAI互換API">
+<meta name="author" content="折田悠希 (Yuki_Orita)">
 <meta name="robots" content="index, follow, max-image-preview:large">
-<link rel="canonical" href="https://oriyu90.github.io/mlx-bar/">
-<link rel="sitemap" type="application/xml" href="sitemap.xml">
+<link rel="canonical" href="https://mlx-bar.pages.dev/">
+<link rel="alternate" hreflang="ja" href="https://mlx-bar.pages.dev/">
+<link rel="sitemap" type="application/xml" href="/sitemap.xml">
 
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="MLXBar">
 <meta property="og:locale" content="ja_JP">
-<meta property="og:title" content="MLXBar — Apple Silicon MacのローカルAIをメニューバーから">
-<meta property="og:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、モデルもデータもこのMacの中だけで動きます。">
-<meta property="og:url" content="https://oriyu90.github.io/mlx-bar/">
+<meta property="og:title" content="MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから">
+<meta property="og:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（Yuki_Orita）。">
+<meta property="og:url" content="https://mlx-bar.pages.dev/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@InovateofRIZI">
+<meta name="twitter:creator" content="@InovateofRIZI">
 <meta name="twitter:title" content="MLXBar — Apple Silicon MacのローカルAIをメニューバーから">
-<meta name="twitter:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、モデルもデータもこのMacの中だけで動きます。">
+<meta name="twitter:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。推論はすべてこのMacの中で完結します。">
 
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b3d91'/%3E%3Ctext x='16' y='23' font-size='18' font-family='system-ui,sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
 
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "MLXBar",
-  "applicationCategory": "DeveloperApplication",
-  "operatingSystem": "macOS 14.0 or later, Apple Silicon",
-  "softwareVersion": "1.1.0",
-  "url": "https://oriyu90.github.io/mlx-bar/",
-  "downloadUrl": "https://github.com/oriyu90/mlx-bar/releases",
-  "license": "https://github.com/oriyu90/mlx-bar/blob/main/licence.md",
-  "description": "Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリ。OpenAI互換APIを備え、推論はすべてローカルで実行されます。",
-  "inLanguage": ["ja", "en"],
-  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "JPY" },
-  "author": {
-    "@type": "Person",
-    "name": "Yuki_Orita",
-    "url": "https://oriyu90.github.io/official/"
-  }
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "MLXBar",
+      "alternateName": ["エムエルエックスバー", "MLXバー"],
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS 14.0 or later, Apple Silicon",
+      "softwareVersion": "1.1.0",
+      "url": "https://mlx-bar.pages.dev/",
+      "downloadUrl": "https://github.com/oriyu90/mlx-bar/releases",
+      "codeRepository": "https://github.com/oriyu90/mlx-bar",
+      "license": "https://github.com/oriyu90/mlx-bar/blob/main/licence.md",
+      "description": "Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリ。OpenAI互換APIを備え、推論はすべてローカルで実行されます。",
+      "inLanguage": ["ja", "en"],
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "JPY" },
+      "author": { "@id": "https://oriyu90.github.io/official/#person" }
+    },
+    {
+      "@type": "Person",
+      "@id": "https://oriyu90.github.io/official/#person",
+      "name": "折田悠希",
+      "alternateName": ["おりたゆうき", "Yuki_Orita"],
+      "url": "https://oriyu90.github.io/official/",
+      "sameAs": [
+        "https://github.com/oriyu90",
+        "https://x.com/InovateofRIZI"
+      ]
+    }
+  ]
 }
 </script>
 
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #ffffff;
-  --bg-soft: #f6f8fb;
-  --bg-card: #ffffff;
-  --fg: #16202c;
-  --fg-muted: #5b6b7d;
-  --fg-faint: #8a9aab;
-  --line: #e2e8f0;
-  --accent: #1f7ae0;
-  --accent-soft: #eaf3fd;
-  --accent-fg: #ffffff;
-  --warn: #b4690e;
-  --radius: 14px;
-  --maxw: 940px;
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --ink: #14181d;
+  --ink-2: #4d5866;
+  --ink-3: #808c9b;
+  --rule: #e4e6e3;
+  --accent: #0b3d91;
+  --accent-ink: #ffffff;
+  --tint: #eef2f9;
+  --warn-rule: #c08a2e;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f151c;
-    --bg-soft: #141c25;
-    --bg-card: #17202a;
-    --fg: #e8eef5;
-    --fg-muted: #9fb0c2;
-    --fg-faint: #74869a;
-    --line: #26323f;
-    --accent: #55a4f5;
-    --accent-soft: #16283c;
-    --accent-fg: #08121c;
-    --warn: #e8b45c;
+    --bg: #101215;
+    --panel: #171a1f;
+    --ink: #e9ecef;
+    --ink-2: #a3adb9;
+    --ink-3: #78838f;
+    --rule: #262a30;
+    --accent: #7fb0ff;
+    --accent-ink: #0d1116;
+    --tint: #182130;
+    --warn-rule: #d5a353;
   }
 }
 
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--fg);
+  margin: 0; background: var(--bg); color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP",
                "Yu Gothic UI", "Segoe UI", Roboto, sans-serif;
-  font-size: 16px;
-  line-height: 1.85;
-  -webkit-font-smoothing: antialiased;
+  font-size: 16px; line-height: 1.9; -webkit-font-smoothing: antialiased;
+  font-feature-settings: "palt" 1;
 }
 img { max-width: 100%; height: auto; display: block; }
-a { color: var(--accent); }
-.wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+a { color: var(--accent); text-underline-offset: 3px; }
+code { font-family: var(--mono); font-size: .9em; }
+.wrap { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
 
-/* Header */
-.site-header {
-  position: sticky; top: 0; z-index: 20;
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
-  backdrop-filter: saturate(180%) blur(14px);
-  border-bottom: 1px solid var(--line);
+/* ---- masthead ---- */
+.masthead { border-bottom: 1px solid var(--rule); background: var(--bg); }
+.masthead .wrap { display: flex; align-items: center; min-height: 60px; gap: 26px; }
+.wordmark {
+  display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink);
+  font-weight: 700; font-size: 17px; letter-spacing: -.01em;
 }
-.site-header .wrap {
-  display: flex; align-items: center; gap: 18px;
-  min-height: 58px;
+.wordmark span.sq {
+  width: 24px; height: 24px; border-radius: 6px; background: var(--accent);
+  color: var(--accent-ink); display: grid; place-items: center;
+  font-size: 13px; font-weight: 800;
 }
-.brand {
-  display: flex; align-items: center; gap: 9px;
-  font-weight: 700; letter-spacing: .01em;
-  color: var(--fg); text-decoration: none; font-size: 17px;
-}
-.brand .mark {
-  width: 26px; height: 26px; border-radius: 7px;
-  background: linear-gradient(150deg, var(--accent), #7a4fe0);
-  display: grid; place-items: center;
-  color: #fff; font-size: 14px; font-weight: 800;
-}
-.site-nav { margin-left: auto; display: flex; gap: 20px; align-items: center; }
-.site-nav a {
-  color: var(--fg-muted); text-decoration: none; font-size: 14px;
-}
-.site-nav a:hover { color: var(--fg); }
-@media (max-width: 640px) { .site-nav .hide-sm { display: none; } }
+.masthead nav { margin-left: auto; display: flex; gap: 22px; }
+.masthead nav a { color: var(--ink-2); text-decoration: none; font-size: 14px; }
+.masthead nav a:hover { color: var(--ink); text-decoration: underline; }
+@media (max-width: 700px) { .masthead nav a.opt { display: none; } }
 
-/* Hero */
-.hero { padding: 74px 0 58px; text-align: center; }
-.hero .eyebrow {
-  display: inline-block;
-  font-size: 12.5px; letter-spacing: .09em; font-weight: 600;
-  color: var(--accent); background: var(--accent-soft);
-  border-radius: 999px; padding: 5px 14px; margin-bottom: 22px;
+/* ---- hero ---- */
+.hero { padding: 66px 0 60px; border-bottom: 1px solid var(--rule); }
+.hero .wrap {
+  display: grid; grid-template-columns: 1.05fr .95fr; gap: 54px; align-items: center;
+}
+@media (max-width: 860px) {
+  .hero { padding: 46px 0 44px; }
+  .hero .wrap { grid-template-columns: 1fr; gap: 38px; }
 }
 .hero h1 {
-  font-size: clamp(30px, 5.6vw, 48px);
-  line-height: 1.34; margin: 0 0 20px; letter-spacing: -.01em;
-  font-weight: 800;
+  font-size: clamp(28px, 4.6vw, 42px); line-height: 1.4; font-weight: 800;
+  margin: 0 0 18px; letter-spacing: -.015em;
 }
-.hero h1 .grad {
-  background: linear-gradient(120deg, var(--accent), #7a4fe0);
-  -webkit-background-clip: text; background-clip: text; color: transparent;
+.hero .kicker {
+  font-size: 12px; letter-spacing: .12em; font-weight: 700; color: var(--ink-3);
+  text-transform: uppercase; margin: 0 0 14px;
 }
-.hero p.lead {
-  font-size: clamp(15px, 2.1vw, 18px);
-  color: var(--fg-muted); margin: 0 auto 32px; max-width: 640px;
-}
-.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.hero p { color: var(--ink-2); margin: 0 0 26px; font-size: 16px; }
+.actions { display: flex; gap: 11px; flex-wrap: wrap; align-items: center; }
 .btn {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 12px 24px; border-radius: 11px;
-  font-weight: 600; font-size: 15px; text-decoration: none;
-  border: 1px solid transparent; transition: transform .12s ease, opacity .12s ease;
+  display: inline-flex; align-items: center; padding: 11px 22px; border-radius: 8px;
+  font-weight: 600; font-size: 15px; text-decoration: none; border: 1px solid var(--rule);
 }
-.btn:hover { transform: translateY(-1px); }
-.btn-primary { background: var(--accent); color: var(--accent-fg); }
-.btn-ghost { background: transparent; color: var(--fg); border-color: var(--line); }
-.hero .meta {
-  margin-top: 20px; font-size: 13px; color: var(--fg-faint);
-}
+.btn.solid { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn.solid:hover { opacity: .9; }
+.btn.line { background: var(--panel); color: var(--ink); }
+.btn.line:hover { border-color: var(--accent); color: var(--accent); }
+.fineprint { margin: 18px 0 0; font-size: 13px; color: var(--ink-3); line-height: 1.7; }
 
-/* Sections */
-section { padding: 62px 0; }
-section.soft { background: var(--bg-soft); border-block: 1px solid var(--line); }
+/* ---- menu bar mock ---- */
+.mock {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 12px;
+  box-shadow: 0 14px 34px -22px rgba(0,0,0,.45); overflow: hidden;
+  font-size: 13px;
+}
+.mock .bar {
+  display: flex; align-items: center; gap: 14px; padding: 6px 13px;
+  border-bottom: 1px solid var(--rule); background: var(--tint);
+  color: var(--ink-2); font-size: 11.5px;
+}
+.mock .bar .spacer { margin-left: auto; }
+.mock .bar .active { color: var(--accent); font-weight: 700; }
+.mock .body { padding: 15px 16px 17px; }
+.mock .row { display: flex; align-items: baseline; gap: 9px; }
+.mock .title { font-weight: 700; color: var(--ink); font-size: 13.5px; }
+.mock .sub { color: var(--ink-3); font-size: 11.5px; }
+.mock .status {
+  margin: 9px 0 0; color: #2e7d43; font-size: 11.5px; font-weight: 600;
+}
+@media (prefers-color-scheme: dark) { .mock .status { color: #6cc287; } }
+.mock hr { border: 0; border-top: 1px solid var(--rule); margin: 13px 0; }
+.mock .item {
+  display: flex; justify-content: space-between; padding: 4px 0; color: var(--ink-2);
+}
+.mock .item.on { color: var(--ink); font-weight: 600; }
+.mock .item .key { color: var(--ink-3); font-size: 11px; font-family: var(--mono); }
+.mock .url { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+
+/* ---- sections ---- */
+section { padding: 58px 0; border-bottom: 1px solid var(--rule); }
 h2 {
-  font-size: clamp(21px, 3.4vw, 28px); font-weight: 700;
-  margin: 0 0 12px; letter-spacing: -.005em;
+  font-size: clamp(20px, 3vw, 26px); font-weight: 700; margin: 0 0 10px;
+  letter-spacing: -.01em;
 }
-.section-lead { color: var(--fg-muted); margin: 0 0 34px; max-width: 660px; }
+.lede { color: var(--ink-2); margin: 0 0 32px; max-width: 62ch; }
 
-/* Cards */
-.grid { display: grid; gap: 18px; }
-.grid-3 { grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
-.grid-2 { grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }
-.card {
-  background: var(--bg-card); border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 24px;
+/* points */
+.points { display: grid; gap: 30px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.points h3 {
+  font-size: 15.5px; margin: 0 0 7px; font-weight: 700;
+  padding-top: 13px; border-top: 2px solid var(--accent);
 }
-.card h3 {
-  font-size: 16.5px; margin: 0 0 8px; font-weight: 700;
-  display: flex; align-items: center; gap: 9px;
-}
-.card p { margin: 0; color: var(--fg-muted); font-size: 14.5px; line-height: 1.8; }
-.ico {
-  width: 30px; height: 30px; flex: 0 0 30px; border-radius: 9px;
-  background: var(--accent-soft); color: var(--accent);
-  display: grid; place-items: center; font-size: 15px;
-}
+.points p { margin: 0; color: var(--ink-2); font-size: 14.5px; line-height: 1.85; }
 
-/* Steps */
-ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+/* feature list */
+.features { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 42px; }
+.features dl { margin: 0; }
+.features dt {
+  font-weight: 700; font-size: 15px; padding: 16px 0 5px;
+  border-top: 1px solid var(--rule);
+}
+.features dl:first-child dt:first-of-type,
+.features dl:last-child dt:first-of-type { border-top: 0; padding-top: 0; }
+.features dd { margin: 0 0 16px; color: var(--ink-2); font-size: 14.5px; }
+
+/* steps */
+ol.steps { list-style: none; counter-reset: n; margin: 0; padding: 0; }
 ol.steps li {
-  counter-increment: s; position: relative; padding-left: 48px;
-  color: var(--fg-muted); font-size: 14.5px;
+  counter-increment: n; display: grid; grid-template-columns: 34px 1fr; gap: 14px;
+  padding: 15px 0; border-top: 1px solid var(--rule); color: var(--ink-2); font-size: 14.5px;
 }
+ol.steps li:first-child { border-top: 0; padding-top: 0; }
 ol.steps li::before {
-  content: counter(s); position: absolute; left: 0; top: 3px;
-  width: 30px; height: 30px; border-radius: 50%;
-  background: var(--accent); color: var(--accent-fg);
-  display: grid; place-items: center; font-size: 14px; font-weight: 700;
+  content: counter(n, decimal-leading-zero);
+  font-family: var(--mono); font-size: 13px; color: var(--accent); font-weight: 700;
+  padding-top: 2px;
 }
-ol.steps li b { color: var(--fg); font-weight: 600; }
+ol.steps b { color: var(--ink); font-weight: 700; }
 
-/* Code */
-.code {
-  background: var(--bg-card); border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 18px 20px;
-  overflow-x: auto; font-size: 13px; line-height: 1.75;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  color: var(--fg); margin: 0;
+/* code */
+pre.code {
+  margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 18px 20px; overflow-x: auto; font-family: var(--mono);
+  font-size: 12.5px; line-height: 1.8; color: var(--ink);
 }
-.code .c { color: var(--fg-faint); }
+pre.code .c { color: var(--ink-3); }
 
-/* Spec list */
-dl.spec { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 10px 26px; }
-dl.spec dt { color: var(--fg-faint); font-size: 13.5px; }
-dl.spec dd { margin: 0; font-size: 14.5px; }
-@media (max-width: 560px) {
-  dl.spec { grid-template-columns: 1fr; gap: 2px 0; }
-  dl.spec dd { margin-bottom: 12px; }
+/* spec */
+table.spec { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+table.spec th, table.spec td {
+  text-align: left; padding: 11px 0; border-top: 1px solid var(--rule); vertical-align: top;
 }
-
-/* Creator */
-.creator { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
-.creator .avatar {
-  width: 62px; height: 62px; border-radius: 50%; flex: 0 0 62px;
-  background: linear-gradient(150deg, var(--accent), #7a4fe0);
-  display: grid; place-items: center; color: #fff; font-size: 23px; font-weight: 700;
-}
-.creator .body { flex: 1 1 300px; }
-.creator .body h3 { margin: 0 0 4px; font-size: 18px; }
-.creator .body .role { color: var(--fg-faint); font-size: 13.5px; margin: 0 0 14px; }
-.links { display: flex; gap: 10px; flex-wrap: wrap; }
-.links a {
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 8px 15px; border-radius: 9px; font-size: 14px;
-  border: 1px solid var(--line); background: var(--bg-card);
-  color: var(--fg); text-decoration: none;
-}
-.links a:hover { border-color: var(--accent); color: var(--accent); }
-
-/* Notice */
-.notice {
-  border-left: 3px solid var(--warn); background: var(--bg-card);
-  border-radius: 0 10px 10px 0; padding: 14px 18px;
-  font-size: 14px; color: var(--fg-muted); margin-top: 26px;
+table.spec tr:first-child th, table.spec tr:first-child td { border-top: 0; }
+table.spec th { font-weight: 600; color: var(--ink-3); width: 34%; font-size: 13.5px; }
+@media (max-width: 520px) {
+  table.spec th { width: 42%; }
 }
 
-/* Footer */
-footer {
-  border-top: 1px solid var(--line); padding: 34px 0 46px;
-  color: var(--fg-faint); font-size: 13.5px;
+.note {
+  border-left: 3px solid var(--warn-rule); padding: 4px 0 4px 16px;
+  color: var(--ink-2); font-size: 14px; margin: 28px 0 0;
 }
-footer .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
-footer a { color: var(--fg-muted); text-decoration: none; }
-footer a:hover { color: var(--accent); }
-footer .copy { margin-left: auto; }
-@media (max-width: 640px) { footer .copy { margin-left: 0; width: 100%; } }
+
+/* creator */
+.creator { display: grid; grid-template-columns: auto 1fr; gap: 22px; align-items: start; }
+@media (max-width: 560px) { .creator { grid-template-columns: 1fr; } }
+.creator .badge {
+  width: 58px; height: 58px; border-radius: 10px; background: var(--accent);
+  color: var(--accent-ink); display: grid; place-items: center;
+  font-size: 21px; font-weight: 800;
+}
+.creator h3 { margin: 0 0 2px; font-size: 18px; }
+.creator .romaji { margin: 0 0 14px; color: var(--ink-3); font-size: 13.5px; }
+.creator p { color: var(--ink-2); font-size: 14.5px; margin: 0 0 18px; max-width: 58ch; }
+.chips { display: flex; gap: 9px; flex-wrap: wrap; }
+.chips a {
+  padding: 7px 14px; border: 1px solid var(--rule); border-radius: 7px;
+  font-size: 14px; text-decoration: none; color: var(--ink); background: var(--panel);
+}
+.chips a:hover { border-color: var(--accent); color: var(--accent); }
+
+/* footer */
+footer { padding: 30px 0 44px; color: var(--ink-3); font-size: 13.5px; }
+footer .links { display: flex; gap: 17px; flex-wrap: wrap; margin-bottom: 14px; }
+footer a { color: var(--ink-2); text-decoration: none; }
+footer a:hover { color: var(--accent); text-decoration: underline; }
+footer .legal { margin: 0; line-height: 1.8; }
 </style>
 </head>
 <body>
 
-<header class="site-header">
+<header class="masthead">
   <div class="wrap">
-    <a class="brand" href="#top"><span class="mark" aria-hidden="true">M</span>MLXBar</a>
-    <nav class="site-nav">
-      <a href="#features">特長</a>
-      <a href="#start" class="hide-sm">使い方</a>
-      <a href="#api" class="hide-sm">API</a>
+    <a class="wordmark" href="#top"><span class="sq" aria-hidden="true">M</span>MLXBar</a>
+    <nav>
+      <a href="#why">特長</a>
+      <a href="#features" class="opt">機能</a>
+      <a href="#start" class="opt">使い方</a>
+      <a href="#api" class="opt">API</a>
       <a href="#creator">開発者</a>
       <a href="https://github.com/oriyu90/mlx-bar">GitHub</a>
     </nav>
@@ -274,42 +289,70 @@ footer .copy { margin-left: auto; }
 
 <main id="top">
 
-  <section class="hero">
+  <div class="hero">
     <div class="wrap">
-      <span class="eyebrow">macOS · Apple Silicon · v1.1.0</span>
-      <h1>MacのローカルAIを、<br><span class="grad">メニューバーから</span>。</h1>
-      <p class="lead">
-        MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルを
-        ひとつのメニューから扱うためのアプリです。モデルの読み込みも、チャットも、
-        OpenAI互換APIの提供も、すべてこのMacの中だけで完結します。
-      </p>
-      <div class="cta">
-        <a class="btn btn-primary" href="https://github.com/oriyu90/mlx-bar/releases">ダウンロード（無料）</a>
-        <a class="btn btn-ghost" href="https://github.com/oriyu90/mlx-bar">ソースコードを見る</a>
+      <div>
+        <p class="kicker">macOS 14+ / Apple Silicon / v1.1.0</p>
+        <h1>MacのローカルAIを、メニューバーから。</h1>
+        <p>
+          MLXBar（エムエルエックスバー）は、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルを
+          ひとつのメニューから扱うためのアプリです。モデルの読み込みも、チャットも、
+          OpenAI互換APIの提供も、すべてこのMacの中だけで完結します。
+        </p>
+        <div class="actions">
+          <a class="btn solid" href="https://github.com/oriyu90/mlx-bar/releases">ダウンロード</a>
+          <a class="btn line" href="https://github.com/oriyu90/mlx-bar">GitHubで見る</a>
+        </div>
+        <p class="fineprint">
+          無料・オープンソース（MIT） / アカウント登録不要 / 日本語・English対応
+        </p>
       </div>
-      <p class="meta">macOS 14以降 / Apple Silicon専用 · オープンソース · アカウント登録不要</p>
-    </div>
-  </section>
 
-  <section class="soft" id="about">
+      <div class="mock" role="img"
+           aria-label="MLXBarのメニューバー表示。モデルを読み込み済みで、API接続先とメニュー項目が並んでいる様子。">
+        <div class="bar">
+          <span>Finder</span><span>File</span><span>Edit</span>
+          <span class="spacer"></span>
+          <span class="active">◧ MLXBar</span><span>100%</span><span>14:32</span>
+        </div>
+        <div class="body">
+          <div class="row">
+            <span class="title">Loaded · mlx-lm</span>
+          </div>
+          <div class="sub">Laguna-S-2.1 · Max token 8,192</div>
+          <div class="url">http://127.0.0.1:11435</div>
+          <p class="status">✓ 待機中</p>
+          <hr>
+          <div class="item on"><span>モデルを選択…</span><span class="key">⌘M</span></div>
+          <div class="item on"><span>クイックチャット…</span><span class="key">⌘N</span></div>
+          <div class="item"><span>アンロード</span><span></span></div>
+          <hr>
+          <div class="item"><span>今すぐ再スキャン</span><span></span></div>
+          <div class="item"><span>設定…</span><span class="key">⌘,</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <section id="why">
     <div class="wrap">
       <h2>クラウドに送らない、という選択</h2>
-      <p class="section-lead">
+      <p class="lede">
         推論はすべてMac上のMLXランタイムで実行されます。プロンプトも画像もモデルも外部へ送信されません。
-        APIは既定でこのMacからのみ接続でき、ローカルネットワークへの公開は明示的に有効にしたときだけ、
+        APIは既定でこのMacからのみ接続でき、ローカルネットワークへの公開は、明示的に有効にしたときだけ、
         APIキー必須で行われます。
       </p>
-      <div class="grid grid-3">
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">◍</span>ひとつのカタログ</h3>
-          <p>Hugging Faceキャッシュ、LM Studio、任意の追加フォルダを走査し、MLX LM・MLX VLM・GGUFを同じ一覧で扱います。形式やエンジンの判別も自動です。</p>
+      <div class="points">
+        <div>
+          <h3>ひとつのカタログ</h3>
+          <p>Hugging Faceキャッシュ、LM Studio、任意の追加フォルダを走査し、MLX LM・MLX VLM・GGUFを同じ一覧で扱います。形式とエンジンの判別は自動です。</p>
         </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">↯</span>すぐ動く</h3>
-          <p>初回起動時に<code>mlx-lm</code>と<code>mlx-vlm</code>を分離した環境へ自動インストール。更新・検証・切り替え・旧版への復元も設定画面から行えます。</p>
+        <div>
+          <h3>用意は自動で</h3>
+          <p>初回起動時に <code>mlx-lm</code> と <code>mlx-vlm</code> を分離した環境へインストールします。更新・検証・切り替え・旧版への復元も設定画面から行えます。</p>
         </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">◎</span>状態が見える</h3>
+        <div>
+          <h3>状態が見える</h3>
           <p>読み込み中の段階と経過秒数、応答中か待機中か、並列要求の待ち件数まで、メニューバーの表示だけで把握できます。</p>
         </div>
       </div>
@@ -318,60 +361,50 @@ footer .copy { margin-left: auto; }
 
   <section id="features">
     <div class="wrap">
-      <h2>できること</h2>
-      <p class="section-lead">日常的に使う機能はメニューバーに、細かい設定は設定画面にまとめています。</p>
-      <div class="grid grid-2">
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">✎</span>クイックチャット</h3>
-          <p>読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。</p>
-        </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">⇄</span>OpenAI互換API</h3>
-          <p>Chat Completions、モデル一覧、tool calling、ストリーミングに対応。Open Interpreter、LibreChat、ZCodeなどからそのまま利用できます。</p>
-        </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">⚙</span>生成パラメータ</h3>
-          <p>Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。</p>
-        </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">⧉</span>並列リクエスト</h3>
-          <p>同時に届いた生成要求を到着順に処理します。待機中も接続を維持し、上限を超えたときだけエラーを返します。</p>
-        </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">▤</span>APIログ</h3>
-          <p>直近のAPIアクセスを最大2,000件記録します。リクエスト本文・応答本文・APIキーは保存しません。</p>
-        </div>
-        <div class="card">
-          <h3><span class="ico" aria-hidden="true">⌘</span>CLIと日英UI</h3>
-          <p>GUIと同じ管理APIを使う<code>mlxbarctl</code>を同梱。インターフェースはEnglishと日本語を設定から切り替えられます。</p>
-        </div>
+      <h2>機能</h2>
+      <p class="lede">日常的に使う操作はメニューバーに、細かい設定は設定画面にまとめています。</p>
+      <div class="features">
+        <dl>
+          <dt>クイックチャット</dt>
+          <dd>読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。</dd>
+          <dt>OpenAI互換API</dt>
+          <dd>Chat Completions、モデル一覧、tool calling、ストリーミングに対応。Open Interpreter、LibreChat、ZCodeなどからそのまま利用できます。</dd>
+          <dt>生成パラメータ</dt>
+          <dd>Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。</dd>
+        </dl>
+        <dl>
+          <dt>並列リクエスト</dt>
+          <dd>同時に届いた生成要求を到着順に処理します。待機中も接続を維持し、上限を超えたときだけエラーを返します。</dd>
+          <dt>APIログ</dt>
+          <dd>直近のAPIアクセスを最大2,000件記録します。リクエスト本文・応答本文・APIキーは保存しません。</dd>
+          <dt>CLIと日英インターフェース</dt>
+          <dd>GUIと同じ管理APIを使う <code>mlxbarctl</code> を同梱。表示言語はEnglishと日本語を設定から切り替えられます。</dd>
+        </dl>
       </div>
     </div>
   </section>
 
-  <section class="soft" id="start">
+  <section id="start">
     <div class="wrap">
       <h2>使いはじめる</h2>
-      <p class="section-lead">アカウント登録も、APIキーの取得も要りません。</p>
+      <p class="lede">アカウント登録も、APIキーの取得も要りません。</p>
       <ol class="steps">
-        <li><b>ダウンロードして開く。</b> GitHub Releasesから<code>MLXBar-1.1.0.dmg</code>を取得し、<code>MLXBar.app</code>を「アプリケーション」へコピーします。</li>
-        <li><b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code>と<code>mlx-vlm</code>が未導入の場合は、バックグラウンドで自動的に用意されます。</li>
-        <li><b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。</li>
-        <li><b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。</li>
+        <li><span><b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.1.0.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。</span></li>
+        <li><span><b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。</span></li>
+        <li><span><b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。</span></li>
+        <li><span><b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。</span></li>
       </ol>
-      <div class="notice">
-        ビルドがApple公証済みでない場合、初回起動時に「システム設定」→「プライバシーとセキュリティ」からの許可が必要になることがあります。
-      </div>
+      <p class="note">
+        Apple公証済みでないビルドの場合、初回起動時に「システム設定」→「プライバシーとセキュリティ」からの許可が必要になることがあります。
+      </p>
     </div>
   </section>
 
   <section id="api">
     <div class="wrap">
       <h2>既存のツールから、そのまま</h2>
-      <p class="section-lead">
-        OpenAI互換のクライアントであれば、ベースURLとAPIキーを差し替えるだけで接続できます。
-      </p>
-      <pre class="code"><span class="c"># APIキーは設定画面の「APIサーバー」からコピーできます</span>
+      <p class="lede">OpenAI互換のクライアントであれば、ベースURLとAPIキーを差し替えるだけで接続できます。</p>
+<pre class="code"><span class="c"># APIキーは設定画面の「APIサーバー」からコピーできます</span>
 curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Authorization: Bearer $MLXBAR_API_KEY" \
   -H "Content-Type: application/json" \
@@ -383,38 +416,36 @@ curl http://127.0.0.1:11435/v1/chat/completions \
     </div>
   </section>
 
-  <section class="soft">
+  <section id="spec">
     <div class="wrap">
       <h2>動作環境</h2>
-      <div class="card">
-        <dl class="spec">
-          <dt>対応Mac</dt><dd>Apple Silicon（M1以降）</dd>
-          <dt>macOS</dt><dd>14以降（15以降を推奨）</dd>
-          <dt>最新版</dt><dd>v1.1.0</dd>
-          <dt>価格</dt><dd>無料・オープンソース</dd>
-          <dt>言語</dt><dd>English / 日本語</dd>
-          <dt>任意</dt><dd>GGUFモデルを使う場合はLM Studioと<code>lms</code> CLI</dd>
-          <dt>保存先</dt><dd><code>~/Library/Application Support/MLXBar/</code></dd>
-        </dl>
-      </div>
+      <table class="spec">
+        <tr><th scope="row">対応Mac</th><td>Apple Silicon（M1以降）</td></tr>
+        <tr><th scope="row">macOS</th><td>14以降（15以降を推奨）</td></tr>
+        <tr><th scope="row">最新版</th><td>v1.1.0</td></tr>
+        <tr><th scope="row">価格</th><td>無料（MITライセンスのオープンソース）</td></tr>
+        <tr><th scope="row">表示言語</th><td>English / 日本語</td></tr>
+        <tr><th scope="row">任意</th><td>GGUFモデルを使う場合はLM Studioと <code>lms</code> CLI</td></tr>
+        <tr><th scope="row">保存先</th><td><code>~/Library/Application Support/MLXBar/</code></td></tr>
+      </table>
     </div>
   </section>
 
   <section id="creator">
     <div class="wrap">
       <h2>開発者</h2>
-      <div class="card creator">
-        <div class="avatar" aria-hidden="true">Y</div>
-        <div class="body">
-          <h3>Yuki_Orita</h3>
-          <p class="role">MLXBar 作者</p>
-          <p style="color:var(--fg-muted); font-size:14.5px; margin:0 0 16px;">
-            不具合の報告や新機能の要望、リリースのお知らせはDiscordコミュニティでお受けしています。
-            お気軽に参加してください。
+      <div class="creator">
+        <div class="badge" aria-hidden="true">折</div>
+        <div>
+          <h3>折田悠希（おりたゆうき）</h3>
+          <p class="romaji">Yuki_Orita — MLXBar 作者</p>
+          <p>
+            不具合の報告、新機能の要望、リリースのお知らせはDiscordコミュニティでお受けしています。
+            ソースコードはGitHubで公開しており、Issueやプルリクエストも歓迎します。
           </p>
-          <div class="links">
+          <div class="chips">
             <a href="https://discord.gg/KbTAMnkvQz" rel="noopener">Discord コミュニティ</a>
-            <a href="https://x.com/InovateofRIZI" rel="noopener me">X (@InovateofRIZI)</a>
+            <a href="https://x.com/InovateofRIZI" rel="noopener me">X（@InovateofRIZI）</a>
             <a href="https://oriyu90.github.io/official/" rel="noopener me">公式サイト</a>
             <a href="https://github.com/oriyu90/mlx-bar" rel="noopener">GitHub</a>
           </div>
@@ -426,15 +457,20 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 </main>
 
 <footer>
-  <div class="wrap row">
-    <a href="https://github.com/oriyu90/mlx-bar">GitHub</a>
-    <a href="https://github.com/oriyu90/mlx-bar/releases">リリース</a>
-    <a href="https://discord.gg/KbTAMnkvQz">Discord</a>
-    <a href="https://x.com/InovateofRIZI">X</a>
-    <a href="https://oriyu90.github.io/official/">開発者公式サイト</a>
-    <a href="https://github.com/oriyu90/mlx-bar/blob/main/SECURITY.md">セキュリティ</a>
-    <a href="https://github.com/oriyu90/mlx-bar/blob/main/licence.md">ライセンス</a>
-    <span class="copy">© 2026 Yuki_Orita</span>
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/oriyu90/mlx-bar">GitHub</a>
+      <a href="https://github.com/oriyu90/mlx-bar/releases">リリース</a>
+      <a href="https://discord.gg/KbTAMnkvQz">Discord</a>
+      <a href="https://x.com/InovateofRIZI">X</a>
+      <a href="https://oriyu90.github.io/official/">開発者公式サイト</a>
+      <a href="https://github.com/oriyu90/mlx-bar/blob/main/SECURITY.md">セキュリティ</a>
+      <a href="https://github.com/oriyu90/mlx-bar/blob/main/licence.md">ライセンス（MIT）</a>
+    </div>
+    <p class="legal">
+      © 2026 折田悠希（Yuki_Orita）. MLXBar はMITライセンスで公開しています。<br>
+      Apple、Mac、macOS、Apple Silicon は Apple Inc. の商標です。本サイトはAppleとは関係ありません。
+    </p>
   </div>
 </footer>
 
