@@ -23,7 +23,9 @@ struct MLXBarSettingsView: View {
             case "削除": DataRemovalSettingsView(model: model)
             default: EmptyView()
             }
-        }.task { await model.refreshSettings(); await model.refreshSecrets() }
+        }
+        .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
+        .task { await model.refreshSettings(); await model.refreshSecrets() }
     }
 }
 

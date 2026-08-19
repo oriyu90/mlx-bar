@@ -95,6 +95,7 @@ struct ModelCatalogView: View {
             }.padding()
         }
         .navigationTitle(LS("モデル"))
+        .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         .task {
             await model.refreshModels()
             hasLoadedCatalog = true

@@ -51,11 +51,11 @@ struct MenuBarView: View {
                         .font(.caption).foregroundStyle(.red).lineLimit(3)
                 }
                 Divider()
-                Button(LS("モデルを選択…")) { openWindow(id: "models"); dismiss() }.keyboardShortcut("m")
+                Button(LS("モデルを選択…")) { open("models") }.keyboardShortcut("m")
                 if model.loadedName == nil {
-                    Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.disabled(true)
+                    Button(LS("クイックチャット…")) { open("chat") }.disabled(true)
                 } else {
-                    Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.keyboardShortcut("n")
+                    Button(LS("クイックチャット…")) { open("chat") }.keyboardShortcut("n")
                     Button(LS("アンロード")) { Task { await model.unload() } }
                 }
                 if model.currentRequestID != nil {
@@ -97,7 +97,11 @@ struct MenuBarView: View {
                 }
                 Divider()
                 HStack {
-                    Button(LS("設定…")) { openSettings(); dismiss() }
+                    Button(LS("設定…")) {
+                        openSettings()
+                        dismiss()
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    }
                     Spacer()
                     Button(LS("終了")) { NSApplication.shared.terminate(nil) }
                 }
@@ -112,6 +116,16 @@ struct MenuBarView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    // MLXBar has no Dock icon (LSUIElement), so opening a secondary window from
+    // the menu bar extra's popover does not by itself make the app (or that
+    // window) the key window — without this, the window appears but keystrokes
+    // keep going to whichever app was frontmost before.
+    private func open(_ id: String) {
+        openWindow(id: id)
+        dismiss()
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     private func chooseFolder(startingAt location: FileSelectionService.LibraryLocation? = nil) {

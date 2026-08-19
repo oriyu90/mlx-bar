@@ -40,19 +40,22 @@ class MLXVLMAdapter(BaseAdapter):
         images = params.get("images") or []
         if images and "image" not in self.modalities:
             raise ValueError("このモデルは画像入力に対応していません")
+        from mlx_vlm.prompt_utils import apply_chat_template
+        config = getattr(self.model, "config", None)
+        template_kwargs = {}
+        if params.get("tools"):
+            template_kwargs["tools"] = params["tools"]
+        if params.get("tool_choice") is not None:
+            template_kwargs["tool_choice"] = params["tool_choice"]
         try:
-            from mlx_vlm.prompt_utils import apply_chat_template
-            config = getattr(self.model, "config", None)
-            template_kwargs = {}
-            if params.get("tools"):
-                template_kwargs["tools"] = params["tools"]
-            if params.get("tool_choice") is not None:
-                template_kwargs["tool_choice"] = params["tool_choice"]
             prompt = apply_chat_template(
                 self.processor, config, prompt, num_images=len(images), **template_kwargs
             )
-        except Exception:
-            pass
+        except TypeError:
+            template_kwargs.pop("tool_choice", None)
+            prompt = apply_chat_template(
+                self.processor, config, prompt, num_images=len(images), **template_kwargs
+            )
         kwargs = {"model": self.model, "processor": self.processor, "prompt": prompt,
                   "max_tokens": int(params.get("max_tokens", 512)),
                   "temperature": float(params.get("temperature", 0.7)),

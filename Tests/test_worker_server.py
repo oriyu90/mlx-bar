@@ -141,6 +141,60 @@ def test_mlx_lm_sampling_parameters_reach_sampler_and_logits_processors():
     assert captured["generate"]["logits_processors"] == ["processor"]
 
 
+def test_mlx_vlm_retries_without_tool_choice_when_template_rejects_it():
+    captured = {}
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**kwargs):
+        captured.update(kwargs)
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(_processor, _config, _prompt, **kwargs):
+        if "tool_choice" in kwargs:
+            raise TypeError("apply_chat_template() got an unexpected keyword argument 'tool_choice'")
+        return "templated prompt"
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = apply_chat_template
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {
+            "messages": [{"role": "user", "content": "hello"}], "tool_choice": "auto",
+        }))
+    assert events == [{"type": "delta", "text": "ok"}]
+    assert captured["prompt"] == "templated prompt"
+
+
+def test_mlx_vlm_template_failure_is_not_silently_swallowed():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**_kwargs):
+        raise AssertionError("stream_generate must not run with an unresolved prompt")
+        yield  # pragma: no cover
+
+    def apply_chat_template(*_args, **_kwargs):
+        raise RuntimeError("laguna template is incompatible with this mlx-vlm version")
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = apply_chat_template
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        try:
+            list(adapter.stream("request", {"messages": [{"role": "user", "content": "hello"}]}))
+        except RuntimeError as exc:
+            assert "incompatible" in str(exc)
+        else:
+            raise AssertionError("expected the template failure to propagate")
+
+
 def test_mlx_vlm_sampling_parameters_reach_stream_generate():
     captured = {}
     mlx_vlm = ModuleType("mlx_vlm")

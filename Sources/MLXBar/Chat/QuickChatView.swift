@@ -63,6 +63,7 @@ struct QuickChatView: View {
             }
         }
         .padding()
+        .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         .task {
             await model.refreshSettings()
             temperature = model.configuredTemperature
