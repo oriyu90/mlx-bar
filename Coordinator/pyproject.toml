@@ -1,6 +1,6 @@
 [project]
 name = "mlxbar"
-version = "1.2.2"
+version = "1.2.3"
 description = "Local coordinator for MLXBar"
 requires-python = ">=3.12"
 dependencies = [

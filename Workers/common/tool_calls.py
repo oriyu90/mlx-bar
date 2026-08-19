@@ -5,6 +5,28 @@ import re
 import uuid
 
 
+def tool_template_kwargs_attempts(params: dict) -> list[dict]:
+    """Ordered fallback kwargs for rendering a chat template that may not support tools.
+
+    Some chat templates reject `tool_choice` outright, others reject `tools`
+    entirely -- often deep inside Jinja2 rendering (an UndefinedError or
+    TemplateError, not a clean TypeError) rather than at the Python call
+    boundary. Try the most capable combination first, then progressively
+    drop tool-calling kwargs so a template that simply doesn't support tools
+    doesn't take the whole generation down with it.
+    """
+    tools = params.get("tools")
+    if not tools:
+        return [{}]
+    attempts = []
+    tool_choice = params.get("tool_choice")
+    if tool_choice is not None:
+        attempts.append({"tools": tools, "tool_choice": tool_choice})
+    attempts.append({"tools": tools})
+    attempts.append({})
+    return attempts
+
+
 def _argument(value: str):
     value = value.strip()
     try:

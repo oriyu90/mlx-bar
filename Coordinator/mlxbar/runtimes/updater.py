@@ -91,10 +91,14 @@ class RuntimeUpdater:
             slot_id = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1000:03d}"
             slot = self.store.engine_root(engine) / "slots" / slot_id
             slot.mkdir(parents=True)
+            # Keep uv's package cache inside our own data directory rather than the
+            # user's shared ~/.cache/uv, so "delete all data" fully removes every
+            # downloaded mlx-lm/mlx-vlm artifact without touching unrelated projects.
+            uv_env = dict(os.environ, UV_CACHE_DIR=str(self.store.root.parent / "uv-cache"))
             try:
                 await update(0.08, "新しいPython環境を作成中")
                 uv = self._uv_executable()
-                await self._command(uv, "venv", "--python", "3.12", str(slot / ".venv"))
+                await self._command(uv, "venv", "--python", "3.12", str(slot / ".venv"), env=uv_env)
                 spec = package
                 source = "stable"
                 if version:
@@ -112,10 +116,10 @@ class RuntimeUpdater:
                 await self._command(uv, "pip", "install", "--python", str(python), spec,
                                     "fastapi>=0.115,<1", "uvicorn>=0.30,<1",
                                     heartbeat=download_heartbeat,
-                                    timeout=INSTALL_TIMEOUT_SECONDS)
+                                    timeout=INSTALL_TIMEOUT_SECONDS, env=uv_env)
                 await update(0.65, "依存関係を検証中")
-                await self._command(uv, "pip", "check", "--python", str(python))
-                frozen = await self._command(uv, "pip", "freeze", "--python", str(python))
+                await self._command(uv, "pip", "check", "--python", str(python), env=uv_env)
+                frozen = await self._command(uv, "pip", "freeze", "--python", str(python), env=uv_env)
                 (slot / "requirements.lock").write_text(frozen)
                 await update(0.78, "アダプター互換性を検証中")
                 module = "mlx_lm" if engine == "mlx-lm" else "mlx_vlm"
@@ -139,10 +143,11 @@ class RuntimeUpdater:
                 raise
 
     async def _command(self, *arguments: str, heartbeat=None,
-                       timeout: int = COMMAND_TIMEOUT_SECONDS) -> str:
+                       timeout: int = COMMAND_TIMEOUT_SECONDS,
+                       env: dict[str, str] | None = None) -> str:
         proc = await asyncio.create_subprocess_exec(
             *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
+            start_new_session=True, env=env,
         )
         communication = asyncio.create_task(proc.communicate())
         elapsed = 0

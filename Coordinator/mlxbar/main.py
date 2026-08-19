@@ -258,6 +258,12 @@ async def serve(root: Path | None = None) -> None:
     try:
         await management_task
     finally:
+        # A runtime install (e.g. the automatic first-launch install above)
+        # spawns `uv` in its own session so it can be killed by process
+        # group; left alone, it survives this coordinator as an orphan still
+        # writing into our data directory instead of being torn down with it.
+        with contextlib.suppress(Exception):
+            await state.jobs.cancel_all()
         with contextlib.suppress(Exception):
             await state.workers.unload()
         # `unload` only frees the model; the worker process itself must be

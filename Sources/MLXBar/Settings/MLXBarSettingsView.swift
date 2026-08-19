@@ -143,6 +143,12 @@ struct ModelSourceSettingsView: View {
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
     var body: some View {
+        // A plain `Form` doesn't reliably scroll on macOS when embedded in a
+        // `NavigationSplitView` detail column, so this section's content (the
+        // longest on this screen) could get clipped at the bottom of the
+        // window with no way to reach it. Wrapping it explicitly guarantees
+        // scrolling regardless of window height.
+        ScrollView {
         Form {
             Section(LS("APIからのモデル利用")) {
                 Toggle(LS("API要求時に必要なモデルを自動ロード"), isOn: Binding(
@@ -151,6 +157,7 @@ struct ModelSourceSettingsView: View {
                 ))
                 Text(LS("アプリやモデルWorkerを再起動した後も、OpenAI互換APIで指定されたモデルを自動的に復元します。手動でアンロードした場合は自動ロードしません。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("Max token上限")) {
                 HStack {
@@ -161,35 +168,22 @@ struct ModelSourceSettingsView: View {
                         .buttonStyle(.borderedProminent)
                 }
                 if let modelLimit = model.loadedModelMaxTokens {
-                    LabeledContent(LS("ロード中モデルの上限"),
-                                   value: "\(MenuBarViewModel.tokenCount(modelLimit)) tokens")
+                    tokenLimitRow(LS("ロード中モデルの上限"), "\(MenuBarViewModel.tokenCount(modelLimit)) tokens")
                 } else {
-                    LabeledContent(LS("ロード中モデルの上限"), value: LS("モデル未ロード／取得できません"))
+                    tokenLimitRow(LS("ロード中モデルの上限"), LS("モデル未ロード／取得できません"))
                 }
-                LabeledContent(LS("現在のAPI有効上限"),
-                               value: "\(MenuBarViewModel.tokenCount(model.effectiveMaxTokens)) tokens")
+                tokenLimitRow(LS("現在のAPI有効上限"), "\(MenuBarViewModel.tokenCount(model.effectiveMaxTokens)) tokens")
                 Text(LS("API要求がこの値を超えた場合はエラーにせず、この上限へ自動調整します。有効上限は設定値とモデル上限の小さい方です。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("既定の生成パラメータ")) {
-                LabeledContent(LS("温度")) {
-                    TextField("0〜2", value: $defaultTemperature, format: .number)
-                        .frame(width: 110)
-                }
-                Slider(value: $defaultTemperature, in: 0...2, step: 0.05)
-                    .accessibilityLabel(LS("温度"))
-                LabeledContent("Top P") {
-                    TextField("0〜1", value: $defaultTopP, format: .number)
-                        .frame(width: 110)
-                }
-                Slider(value: $defaultTopP, in: 0...1, step: 0.05)
-                    .accessibilityLabel("Top P")
-                LabeledContent(LS("繰り返しペナルティ")) {
-                    TextField("0.01〜2", value: $defaultRepetitionPenalty, format: .number)
-                        .frame(width: 110)
-                }
-                Slider(value: $defaultRepetitionPenalty, in: 0.01...2, step: 0.05)
-                    .accessibilityLabel(LS("繰り返しペナルティ"))
+                parameterRow(LS("温度"), placeholder: "0〜2", value: $defaultTemperature,
+                             range: 0...2, step: 0.05, accessibilityLabel: LS("温度"))
+                parameterRow("Top P", placeholder: "0〜1", value: $defaultTopP,
+                             range: 0...1, step: 0.05, accessibilityLabel: "Top P")
+                parameterRow(LS("繰り返しペナルティ"), placeholder: "0.01〜2", value: $defaultRepetitionPenalty,
+                             range: 0.01...2, step: 0.05, accessibilityLabel: LS("繰り返しペナルティ"))
                 Stepper("\(LS("ペナルティ対象範囲")): \(repetitionContextSize) tokens",
                         value: $repetitionContextSize, in: 1...32768)
                 Button(LS("生成パラメータを適用")) {
@@ -202,6 +196,7 @@ struct ModelSourceSettingsView: View {
                 }.buttonStyle(.borderedProminent)
                 Text(LS("温度0は決定的な出力、Top Pを小さくすると候補を絞ります。繰り返しペナルティは1.0で無効、1より大きいほど繰り返しを抑えます。API要求が値を指定した場合はAPI側を優先します。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("並列リクエスト")) {
                 Stepper("\(LS("生成待ち: 最大")) \(maxQueuedRequests)\(LS("件"))", value: $maxQueuedRequests, in: 1...64)
@@ -216,12 +211,13 @@ struct ModelSourceSettingsView: View {
                 }
                 Text(LS("ZCodeのsubagentなどから同時に届いた要求を到着順に処理します。待機中も接続を維持し、上限を超えた場合だけエラーを返します。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("追加フォルダ")) {
                 ForEach(roots, id: \.self) { path in
                     HStack {
                         Text(path).lineLimit(1).truncationMode(.middle)
-                        Spacer()
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         Button(LS("削除")) { Task { await model.removeModelFolder(path) } }
                     }
                 }
@@ -235,6 +231,7 @@ struct ModelSourceSettingsView: View {
                 .disabled(isSelectingFolder)
                 Text(LS("選択画面では隠しフォルダも表示されます。⌘⇧Gで任意のパスを直接入力できます。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Button(LS("今すぐ再スキャン")) { Task { await model.scan() } }
         }
@@ -251,6 +248,38 @@ struct ModelSourceSettingsView: View {
             maxQueuedRequests = (generation["maxQueuedRequests"] as? NSNumber)?.intValue ?? 16
             queueTimeoutSeconds = (generation["queueTimeoutSeconds"] as? NSNumber)?.intValue ?? 3600
         }
+        }
+    }
+
+    /// Label above value, instead of one row with a `Spacer` between them or
+    /// `LabeledContent`'s shared alignment column: either can force the label
+    /// and value to compete for space on one line and push each other off the
+    /// visible edge of the window when the label is long (especially in
+    /// English) or the window is narrower than their combined width.
+    @ViewBuilder
+    private func tokenLimitRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.subheadline)
+            Text(value).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Label, text field, and slider stacked on separate lines and width-capped
+    /// so this row can't force the whole Form (and window) wider than intended.
+    @ViewBuilder
+    private func parameterRow(_ label: String, placeholder: String, value: Binding<Double>,
+                               range: ClosedRange<Double>, step: Double,
+                               accessibilityLabel: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.subheadline)
+            HStack {
+                TextField(placeholder, value: value, format: .number)
+                    .frame(width: 90)
+                Slider(value: value, in: range, step: step)
+                    .accessibilityLabel(accessibilityLabel)
+            }
+        }
+        .frame(maxWidth: 480)
     }
 
     private func chooseFolder(startingAt location: FileSelectionService.LibraryLocation? = nil) {

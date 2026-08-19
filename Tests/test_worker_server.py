@@ -169,6 +169,38 @@ def test_mlx_vlm_retries_without_tool_choice_when_template_rejects_it():
     assert captured["prompt"] == "templated prompt"
 
 
+def test_mlx_vlm_retries_without_tools_when_template_rejects_them_entirely():
+    """A template with no tool-calling support at all can fail deep inside Jinja2
+    rendering (e.g. UndefinedError), not with a clean TypeError. That must still
+    fall back to a plain template instead of failing the whole generation."""
+    captured = {}
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**kwargs):
+        captured.update(kwargs)
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(_processor, _config, _prompt, **kwargs):
+        if "tools" in kwargs:
+            raise Exception("jinja2.exceptions.UndefinedError: 'tools' is undefined")
+        return "templated prompt"
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = apply_chat_template
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }))
+    assert events == [{"type": "delta", "text": "ok"}]
+    assert captured["prompt"] == "templated prompt"
+
+
 def test_mlx_vlm_template_failure_is_not_silently_swallowed():
     mlx_vlm = ModuleType("mlx_vlm")
     prompt_utils = ModuleType("mlx_vlm.prompt_utils")

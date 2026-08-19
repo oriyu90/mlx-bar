@@ -4,7 +4,7 @@ import json
 import uuid
 
 from common.server import BaseAdapter, run
-from common.tool_calls import parse_tool_markup
+from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
 
 
 class MLXLMAdapter(BaseAdapter):
@@ -26,16 +26,18 @@ class MLXLMAdapter(BaseAdapter):
         from mlx_lm import stream_generate
         prompt = params.get("messages", params.get("prompt", ""))
         if isinstance(prompt, list):
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-            if params.get("tools"):
-                template_kwargs["tools"] = params["tools"]
-            if params.get("tool_choice") is not None:
-                template_kwargs["tool_choice"] = params["tool_choice"]
-            try:
-                prompt = self.processor.apply_chat_template(prompt, **template_kwargs)
-            except TypeError:
-                template_kwargs.pop("tool_choice", None)
-                prompt = self.processor.apply_chat_template(prompt, **template_kwargs)
+            last_error: Exception | None = None
+            for extra_kwargs in tool_template_kwargs_attempts(params):
+                try:
+                    prompt = self.processor.apply_chat_template(
+                        prompt, tokenize=False, add_generation_prompt=True, **extra_kwargs
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
         kwargs = {"prompt": prompt,
                   "max_tokens": int(params.get("max_tokens", 512))}
         temperature = float(params.get("temperature", 0.7))

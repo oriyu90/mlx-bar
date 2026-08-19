@@ -44,6 +44,15 @@ class JobManager:
                                            "error": job.get("error")})
         self.tasks.pop(job["id"], None)
 
+    async def cancel_all(self) -> None:
+        """Cancel every still-running job (e.g. an in-flight runtime install)
+        so its subprocess tree is killed via `RuntimeUpdater._terminate`
+        instead of being orphaned when the coordinator process exits. Runs
+        concurrently so N jobs each needing up to ~5s to kill their process
+        group don't add up to N * 5s against the caller's shutdown budget."""
+        await asyncio.gather(*(self.cancel(job_id) for job_id in list(self.tasks)),
+                             return_exceptions=True)
+
     async def cancel(self, job_id: str) -> dict | None:
         job = self.database.get_job(job_id)
         if not job:

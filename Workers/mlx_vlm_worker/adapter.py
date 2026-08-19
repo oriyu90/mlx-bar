@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 
 from common.server import BaseAdapter, run
-from common.tool_calls import parse_tool_markup
+from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
 
 
 class MLXVLMAdapter(BaseAdapter):
@@ -42,20 +42,18 @@ class MLXVLMAdapter(BaseAdapter):
             raise ValueError("このモデルは画像入力に対応していません")
         from mlx_vlm.prompt_utils import apply_chat_template
         config = getattr(self.model, "config", None)
-        template_kwargs = {}
-        if params.get("tools"):
-            template_kwargs["tools"] = params["tools"]
-        if params.get("tool_choice") is not None:
-            template_kwargs["tool_choice"] = params["tool_choice"]
-        try:
-            prompt = apply_chat_template(
-                self.processor, config, prompt, num_images=len(images), **template_kwargs
-            )
-        except TypeError:
-            template_kwargs.pop("tool_choice", None)
-            prompt = apply_chat_template(
-                self.processor, config, prompt, num_images=len(images), **template_kwargs
-            )
+        last_error: Exception | None = None
+        for extra_kwargs in tool_template_kwargs_attempts(params):
+            try:
+                prompt = apply_chat_template(
+                    self.processor, config, prompt, num_images=len(images), **extra_kwargs
+                )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
         kwargs = {"model": self.model, "processor": self.processor, "prompt": prompt,
                   "max_tokens": int(params.get("max_tokens", 512)),
                   "temperature": float(params.get("temperature", 0.7)),
