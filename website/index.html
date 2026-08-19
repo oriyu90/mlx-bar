@@ -3,26 +3,33 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから</title>
-<meta name="description" content="MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリです。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（おりたゆうき / Yuki_Orita）。無料・オープンソース、GitHubで公開中。">
-<meta name="keywords" content="MLXBar, エムエルエックスバー, MLXバー, 折田悠希, おりたゆうき, Yuki_Orita, github, MLX, Apple Silicon, ローカルLLM, macOS, メニューバー, OpenAI互換API">
+<title data-i18n="meta.title">MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから</title>
+<meta name="description" data-i18n="meta.description" data-i18n-attr="content" content="MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリです。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（おりたゆうき / Yuki_Orita）。無料・オープンソース、GitHubで公開中。">
+<meta name="keywords" content="MLXBar, エムエルエックスバー, MLXバー, 折田悠希, おりたゆうき, Yuki_Orita, github, MLX, Apple Silicon, ローカルLLM, macOS, メニューバー, OpenAI互換API, local LLM, menu bar app, 本地大语言模型, IA local">
 <meta name="author" content="折田悠希 (Yuki_Orita)">
 <meta name="robots" content="index, follow, max-image-preview:large">
 <link rel="canonical" href="https://mlx-bar.pages.dev/">
 <link rel="alternate" hreflang="ja" href="https://mlx-bar.pages.dev/">
+<link rel="alternate" hreflang="en" href="https://mlx-bar.pages.dev/">
+<link rel="alternate" hreflang="zh" href="https://mlx-bar.pages.dev/">
+<link rel="alternate" hreflang="pt" href="https://mlx-bar.pages.dev/">
+<link rel="alternate" hreflang="x-default" href="https://mlx-bar.pages.dev/">
 <link rel="sitemap" type="application/xml" href="/sitemap.xml">
 
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="MLXBar">
 <meta property="og:locale" content="ja_JP">
-<meta property="og:title" content="MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから">
-<meta property="og:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（Yuki_Orita）。">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:locale:alternate" content="zh_CN">
+<meta property="og:locale:alternate" content="pt_BR">
+<meta property="og:title" data-i18n="meta.ogTitle" data-i18n-attr="content" content="MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから">
+<meta property="og:description" data-i18n="meta.ogDescription" data-i18n-attr="content" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（Yuki_Orita）。">
 <meta property="og:url" content="https://mlx-bar.pages.dev/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@InovateofRIZI">
 <meta name="twitter:creator" content="@InovateofRIZI">
-<meta name="twitter:title" content="MLXBar — Apple Silicon MacのローカルAIをメニューバーから">
-<meta name="twitter:description" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。推論はすべてこのMacの中で完結します。">
+<meta name="twitter:title" data-i18n="meta.twitterTitle" data-i18n-attr="content" content="MLXBar — Apple Silicon MacのローカルAIをメニューバーから">
+<meta name="twitter:description" data-i18n="meta.twitterDescription" data-i18n-attr="content" content="MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。推論はすべてこのMacの中で完結します。">
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b3d91'/%3E%3Ctext x='16' y='23' font-size='18' font-family='system-ui,sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
 
@@ -42,16 +49,16 @@
       "codeRepository": "https://github.com/oriyu90/mlx-bar",
       "license": "https://github.com/oriyu90/mlx-bar/blob/main/licence.md",
       "description": "Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリ。OpenAI互換APIを備え、推論はすべてローカルで実行されます。",
-      "inLanguage": ["ja", "en"],
+      "inLanguage": ["ja", "en", "zh", "pt"],
       "offers": { "@type": "Offer", "price": "0", "priceCurrency": "JPY" },
-      "author": { "@id": "https://oriyu90.github.io/official/#person" }
+      "author": { "@id": "https://rizi-jp.pages.dev/#person" }
     },
     {
       "@type": "Person",
-      "@id": "https://oriyu90.github.io/official/#person",
+      "@id": "https://rizi-jp.pages.dev/#person",
       "name": "折田悠希",
       "alternateName": ["おりたゆうき", "Yuki_Orita"],
-      "url": "https://oriyu90.github.io/official/",
+      "url": "https://rizi-jp.pages.dev/",
       "sameAs": [
         "https://github.com/oriyu90",
         "https://x.com/InovateofRIZI"
@@ -96,7 +103,7 @@ html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP",
-               "Yu Gothic UI", "Segoe UI", Roboto, sans-serif;
+               "Noto Sans SC", "Yu Gothic UI", "Segoe UI", Roboto, sans-serif;
   font-size: 16px; line-height: 1.9; -webkit-font-smoothing: antialiased;
   font-feature-settings: "palt" 1;
 }
@@ -107,7 +114,7 @@ code { font-family: var(--mono); font-size: .9em; }
 
 /* ---- masthead ---- */
 .masthead { border-bottom: 1px solid var(--rule); background: var(--bg); }
-.masthead .wrap { display: flex; align-items: center; min-height: 60px; gap: 26px; }
+.masthead .wrap { display: flex; align-items: center; min-height: 60px; gap: 18px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; }
 .wordmark {
   display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--ink);
   font-weight: 700; font-size: 17px; letter-spacing: -.01em;
@@ -117,10 +124,19 @@ code { font-family: var(--mono); font-size: .9em; }
   color: var(--accent-ink); display: grid; place-items: center;
   font-size: 13px; font-weight: 800;
 }
-.masthead nav { margin-left: auto; display: flex; gap: 22px; }
+.masthead nav { margin-left: auto; display: flex; gap: 22px; align-items: center; }
 .masthead nav a { color: var(--ink-2); text-decoration: none; font-size: 14px; }
 .masthead nav a:hover { color: var(--ink); text-decoration: underline; }
 @media (max-width: 700px) { .masthead nav a.opt { display: none; } }
+
+.lang-switch { display: flex; gap: 4px; padding: 3px; border: 1px solid var(--rule); border-radius: 8px; }
+.lang-switch button {
+  appearance: none; border: 0; background: transparent; color: var(--ink-3);
+  font-size: 12.5px; font-weight: 600; padding: 5px 9px; border-radius: 6px;
+  cursor: pointer; font-family: inherit;
+}
+.lang-switch button:hover { color: var(--ink); }
+.lang-switch button[aria-current="true"] { background: var(--accent); color: var(--accent-ink); }
 
 /* ---- hero ---- */
 .hero { padding: 66px 0 60px; border-bottom: 1px solid var(--rule); }
@@ -226,6 +242,7 @@ pre.code {
   margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
   padding: 18px 20px; overflow-x: auto; font-family: var(--mono);
   font-size: 12.5px; line-height: 1.8; color: var(--ink);
+  white-space: pre-wrap; word-break: break-word;
 }
 pre.code .c { color: var(--ink-3); }
 
@@ -277,13 +294,19 @@ footer .legal { margin: 0; line-height: 1.8; }
   <div class="wrap">
     <a class="wordmark" href="#top"><span class="sq" aria-hidden="true">M</span>MLXBar</a>
     <nav>
-      <a href="#why">特長</a>
-      <a href="#features" class="opt">機能</a>
-      <a href="#start" class="opt">使い方</a>
+      <a href="#why" data-i18n="nav.why">特長</a>
+      <a href="#features" class="opt" data-i18n="nav.features">機能</a>
+      <a href="#start" class="opt" data-i18n="nav.start">使い方</a>
       <a href="#api" class="opt">API</a>
-      <a href="#creator">開発者</a>
+      <a href="#creator" data-i18n="nav.creator">開発者</a>
       <a href="https://github.com/oriyu90/mlx-bar">GitHub</a>
     </nav>
+    <div class="lang-switch" role="group" aria-label="Language / 言語 / 语言 / Idioma">
+      <button type="button" data-lang-button="ja" onclick="MLXBarI18n.set('ja')">日本語</button>
+      <button type="button" data-lang-button="en" onclick="MLXBarI18n.set('en')">EN</button>
+      <button type="button" data-lang-button="zh" onclick="MLXBarI18n.set('zh')">中文</button>
+      <button type="button" data-lang-button="pt" onclick="MLXBarI18n.set('pt')">PT</button>
+    </div>
   </div>
 </header>
 
@@ -293,18 +316,18 @@ footer .legal { margin: 0; line-height: 1.8; }
     <div class="wrap">
       <div>
         <p class="kicker">macOS 14+ / Apple Silicon / v1.2.2</p>
-        <h1>MacのローカルAIを、メニューバーから。</h1>
-        <p>
+        <h1 data-i18n="hero.h1">MacのローカルAIを、メニューバーから。</h1>
+        <p data-i18n="hero.p">
           MLXBar（エムエルエックスバー）は、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルを
           ひとつのメニューから扱うためのアプリです。モデルの読み込みも、チャットも、
           OpenAI互換APIの提供も、すべてこのMacの中だけで完結します。
         </p>
         <div class="actions">
-          <a class="btn solid" href="https://github.com/oriyu90/mlx-bar/releases">ダウンロード</a>
-          <a class="btn line" href="https://github.com/oriyu90/mlx-bar">GitHubで見る</a>
+          <a class="btn solid" href="https://github.com/oriyu90/mlx-bar/releases" data-i18n="hero.download">ダウンロード</a>
+          <a class="btn line" href="https://github.com/oriyu90/mlx-bar" data-i18n="hero.viewGithub">GitHubで見る</a>
         </div>
-        <p class="fineprint">
-          無料・オープンソース（MIT） / アカウント登録不要 / 日本語・English対応
+        <p class="fineprint" data-i18n="hero.fineprint">
+          無料・オープンソース（MIT） / アカウント登録不要 / アプリの表示言語は日本語・Englishに対応
         </p>
       </div>
 
@@ -321,14 +344,14 @@ footer .legal { margin: 0; line-height: 1.8; }
           </div>
           <div class="sub">Laguna-S-2.1 · Max token 8,192</div>
           <div class="url">http://127.0.0.1:11435</div>
-          <p class="status">✓ 待機中</p>
+          <p class="status">✓ <span data-i18n="hero.mockWaiting">待機中</span></p>
           <hr>
-          <div class="item on"><span>モデルを選択…</span><span class="key">⌘M</span></div>
-          <div class="item on"><span>クイックチャット…</span><span class="key">⌘N</span></div>
-          <div class="item"><span>アンロード</span><span></span></div>
+          <div class="item on"><span data-i18n="hero.mockSelectModel">モデルを選択…</span><span class="key">⌘M</span></div>
+          <div class="item on"><span data-i18n="hero.mockQuickChat">クイックチャット…</span><span class="key">⌘N</span></div>
+          <div class="item"><span data-i18n="hero.mockUnload">アンロード</span><span></span></div>
           <hr>
-          <div class="item"><span>今すぐ再スキャン</span><span></span></div>
-          <div class="item"><span>設定…</span><span class="key">⌘,</span></div>
+          <div class="item"><span data-i18n="hero.mockRescan">今すぐ再スキャン</span><span></span></div>
+          <div class="item"><span data-i18n="hero.mockSettings">設定…</span><span class="key">⌘,</span></div>
         </div>
       </div>
     </div>
@@ -336,24 +359,24 @@ footer .legal { margin: 0; line-height: 1.8; }
 
   <section id="why">
     <div class="wrap">
-      <h2>クラウドに送らない、という選択</h2>
-      <p class="lede">
+      <h2 data-i18n="why.h2">クラウドに送らない、という選択</h2>
+      <p class="lede" data-i18n="why.lede">
         推論はすべてMac上のMLXランタイムで実行されます。プロンプトも画像もモデルも外部へ送信されません。
         APIは既定でこのMacからのみ接続でき、ローカルネットワークへの公開は、明示的に有効にしたときだけ、
         APIキー必須で行われます。
       </p>
       <div class="points">
         <div>
-          <h3>ひとつのカタログ</h3>
-          <p>Hugging Faceキャッシュ、LM Studio、任意の追加フォルダを走査し、MLX LM・MLX VLM・GGUFを同じ一覧で扱います。形式とエンジンの判別は自動です。</p>
+          <h3 data-i18n="why.p1h">ひとつのカタログ</h3>
+          <p data-i18n="why.p1p">Hugging Faceキャッシュ、LM Studio、任意の追加フォルダを走査し、MLX LM・MLX VLM・GGUFを同じ一覧で扱います。形式とエンジンの判別は自動です。</p>
         </div>
         <div>
-          <h3>用意は自動で</h3>
-          <p>初回起動時に <code>mlx-lm</code> と <code>mlx-vlm</code> を分離した環境へインストールします。更新・検証・切り替え・旧版への復元も設定画面から行えます。</p>
+          <h3 data-i18n="why.p2h">用意は自動で</h3>
+          <p data-i18n="why.p2p" data-i18n-html="true">初回起動時に <code>mlx-lm</code> と <code>mlx-vlm</code> を分離した環境へインストールします。更新・検証・切り替え・旧版への復元も設定画面から行えます。</p>
         </div>
         <div>
-          <h3>状態が見える</h3>
-          <p>読み込み中の段階と経過秒数、応答中か待機中か、並列要求の待ち件数まで、メニューバーの表示だけで把握できます。</p>
+          <h3 data-i18n="why.p3h">状態が見える</h3>
+          <p data-i18n="why.p3p">読み込み中の段階と経過秒数、応答中か待機中か、並列要求の待ち件数まで、メニューバーの表示だけで把握できます。</p>
         </div>
       </div>
     </div>
@@ -361,24 +384,24 @@ footer .legal { margin: 0; line-height: 1.8; }
 
   <section id="features">
     <div class="wrap">
-      <h2>機能</h2>
-      <p class="lede">日常的に使う操作はメニューバーに、細かい設定は設定画面にまとめています。</p>
+      <h2 data-i18n="features.h2">機能</h2>
+      <p class="lede" data-i18n="features.lede">日常的に使う操作はメニューバーに、細かい設定は設定画面にまとめています。</p>
       <div class="features">
         <dl>
-          <dt>クイックチャット</dt>
-          <dd>読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。</dd>
-          <dt>OpenAI互換API</dt>
-          <dd>Chat Completions、モデル一覧、tool calling、ストリーミングに対応。Open Interpreter、LibreChat、ZCodeなどからそのまま利用できます。</dd>
-          <dt>生成パラメータ</dt>
-          <dd>Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。</dd>
+          <dt data-i18n="features.f1t">クイックチャット</dt>
+          <dd data-i18n="features.f1d">読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。</dd>
+          <dt data-i18n="features.f2t">OpenAI互換API</dt>
+          <dd data-i18n="features.f2d">Chat Completions、モデル一覧、tool calling、ストリーミングに対応。Open Interpreter、LibreChat、ZCodeなどからそのまま利用できます。</dd>
+          <dt data-i18n="features.f3t">生成パラメータ</dt>
+          <dd data-i18n="features.f3d">Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。</dd>
         </dl>
         <dl>
-          <dt>並列リクエスト</dt>
-          <dd>同時に届いた生成要求を到着順に処理します。待機中も接続を維持し、上限を超えたときだけエラーを返します。</dd>
-          <dt>APIログ</dt>
-          <dd>直近のAPIアクセスを最大2,000件記録します。リクエスト本文・応答本文・APIキーは保存しません。</dd>
-          <dt>CLIと日英インターフェース</dt>
-          <dd>GUIと同じ管理APIを使う <code>mlxbarctl</code> を同梱。表示言語はEnglishと日本語を設定から切り替えられます。</dd>
+          <dt data-i18n="features.f4t">並列リクエスト</dt>
+          <dd data-i18n="features.f4d">同時に届いた生成要求を到着順に処理します。待機中も接続を維持し、上限を超えたときだけエラーを返します。</dd>
+          <dt data-i18n="features.f5t">APIログ</dt>
+          <dd data-i18n="features.f5d">直近のAPIアクセスを最大2,000件記録します。リクエスト本文・応答本文・APIキーは保存しません。</dd>
+          <dt data-i18n="features.f6t">CLIと日英インターフェース</dt>
+          <dd data-i18n="features.f6d" data-i18n-html="true">GUIと同じ管理APIを使う <code>mlxbarctl</code> を同梱。表示言語はEnglishと日本語を設定から切り替えられます。</dd>
         </dl>
       </div>
     </div>
@@ -386,15 +409,15 @@ footer .legal { margin: 0; line-height: 1.8; }
 
   <section id="start">
     <div class="wrap">
-      <h2>使いはじめる</h2>
-      <p class="lede">アカウント登録も、APIキーの取得も要りません。</p>
+      <h2 data-i18n="start.h2">使いはじめる</h2>
+      <p class="lede" data-i18n="start.lede">アカウント登録も、APIキーの取得も要りません。</p>
       <ol class="steps">
-        <li><span><b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.2.2.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。</span></li>
-        <li><span><b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。</span></li>
-        <li><span><b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。</span></li>
-        <li><span><b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。</span></li>
+        <li><span data-i18n="start.s1" data-i18n-html="true"><b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.2.2.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。</span></li>
+        <li><span data-i18n="start.s2" data-i18n-html="true"><b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。</span></li>
+        <li><span data-i18n="start.s3" data-i18n-html="true"><b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。</span></li>
+        <li><span data-i18n="start.s4" data-i18n-html="true"><b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。</span></li>
       </ol>
-      <p class="note">
+      <p class="note" data-i18n="start.note">
         Apple公証済みでないビルドの場合、初回起動時に「システム設定」→「プライバシーとセキュリティ」からの許可が必要になることがあります。
       </p>
     </div>
@@ -402,15 +425,15 @@ footer .legal { margin: 0; line-height: 1.8; }
 
   <section id="api">
     <div class="wrap">
-      <h2>既存のツールから、そのまま</h2>
-      <p class="lede">OpenAI互換のクライアントであれば、ベースURLとAPIキーを差し替えるだけで接続できます。</p>
-<pre class="code"><span class="c"># APIキーは設定画面の「APIサーバー」からコピーできます</span>
+      <h2 data-i18n="api.h2">既存のツールから、そのまま</h2>
+      <p class="lede" data-i18n="api.lede">OpenAI互換のクライアントであれば、ベースURLとAPIキーを差し替えるだけで接続できます。</p>
+<pre class="code"><span class="c" data-i18n="api.comment"># APIキーは設定画面の「APIサーバー」からコピーできます</span>
 curl http://127.0.0.1:11435/v1/chat/completions \
   -H "Authorization: Bearer $MLXBAR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "loaded",
-    "messages": [{"role": "user", "content": "こんにちは"}],
+    "messages": [{"role": "user", "content": "<span data-i18n="api.message">こんにちは</span>"}],
     "stream": true
   }'</pre>
     </div>
@@ -418,35 +441,35 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
   <section id="spec">
     <div class="wrap">
-      <h2>動作環境</h2>
+      <h2 data-i18n="spec.h2">動作環境</h2>
       <table class="spec">
-        <tr><th scope="row">対応Mac</th><td>Apple Silicon（M1以降）</td></tr>
-        <tr><th scope="row">macOS</th><td>14以降（15以降を推奨）</td></tr>
-        <tr><th scope="row">最新版</th><td>v1.2.2</td></tr>
-        <tr><th scope="row">価格</th><td>無料（MITライセンスのオープンソース）</td></tr>
-        <tr><th scope="row">表示言語</th><td>English / 日本語</td></tr>
-        <tr><th scope="row">任意</th><td>GGUFモデルを使う場合はLM Studioと <code>lms</code> CLI</td></tr>
-        <tr><th scope="row">保存先</th><td><code>~/Library/Application Support/MLXBar/</code></td></tr>
+        <tr><th scope="row" data-i18n="spec.mac">対応Mac</th><td>Apple Silicon（M1以降）</td></tr>
+        <tr><th scope="row" data-i18n="spec.macos">macOS</th><td data-i18n="spec.macosValue">14以降（15以降を推奨）</td></tr>
+        <tr><th scope="row" data-i18n="spec.latest">最新版</th><td>v1.2.2</td></tr>
+        <tr><th scope="row" data-i18n="spec.price">価格</th><td data-i18n="spec.priceValue">無料（MITライセンスのオープンソース）</td></tr>
+        <tr><th scope="row" data-i18n="spec.lang">表示言語</th><td>English / 日本語</td></tr>
+        <tr><th scope="row" data-i18n="spec.optional">任意</th><td data-i18n="spec.optionalValue" data-i18n-html="true">GGUFモデルを使う場合はLM Studioと <code>lms</code> CLI</td></tr>
+        <tr><th scope="row" data-i18n="spec.storage">保存先</th><td><code>~/Library/Application Support/MLXBar/</code></td></tr>
       </table>
     </div>
   </section>
 
   <section id="creator">
     <div class="wrap">
-      <h2>開発者</h2>
+      <h2 data-i18n="creator.h2">開発者</h2>
       <div class="creator">
         <div class="badge" aria-hidden="true">折</div>
         <div>
           <h3>折田悠希（おりたゆうき）</h3>
-          <p class="romaji">Yuki_Orita — MLXBar 作者</p>
-          <p>
+          <p class="romaji" data-i18n="creator.romaji">Yuki_Orita — MLXBar 作者</p>
+          <p data-i18n="creator.p">
             不具合の報告、新機能の要望、リリースのお知らせはDiscordコミュニティでお受けしています。
             ソースコードはGitHubで公開しており、Issueやプルリクエストも歓迎します。
           </p>
           <div class="chips">
-            <a href="https://discord.gg/KbTAMnkvQz" rel="noopener">Discord コミュニティ</a>
+            <a href="https://discord.gg/x7KXhNTD8M" rel="noopener" data-i18n="creator.discord">Discord コミュニティ</a>
             <a href="https://x.com/InovateofRIZI" rel="noopener me">X（@InovateofRIZI）</a>
-            <a href="https://oriyu90.github.io/official/" rel="noopener me">公式サイト</a>
+            <a href="https://rizi-jp.pages.dev/" rel="noopener me" data-i18n="creator.official">公式サイト</a>
             <a href="https://github.com/oriyu90/mlx-bar" rel="noopener">GitHub</a>
           </div>
         </div>
@@ -460,19 +483,390 @@ curl http://127.0.0.1:11435/v1/chat/completions \
   <div class="wrap">
     <div class="links">
       <a href="https://github.com/oriyu90/mlx-bar">GitHub</a>
-      <a href="https://github.com/oriyu90/mlx-bar/releases">リリース</a>
-      <a href="https://discord.gg/KbTAMnkvQz">Discord</a>
+      <a href="https://github.com/oriyu90/mlx-bar/releases" data-i18n="footer.releases">リリース</a>
+      <a href="https://discord.gg/x7KXhNTD8M">Discord</a>
       <a href="https://x.com/InovateofRIZI">X</a>
-      <a href="https://oriyu90.github.io/official/">開発者公式サイト</a>
-      <a href="https://github.com/oriyu90/mlx-bar/blob/main/SECURITY.md">セキュリティ</a>
-      <a href="https://github.com/oriyu90/mlx-bar/blob/main/licence.md">ライセンス（MIT）</a>
+      <a href="https://rizi-jp.pages.dev/" data-i18n="footer.official">開発者公式サイト</a>
+      <a href="https://github.com/oriyu90/mlx-bar/blob/main/SECURITY.md" data-i18n="footer.security">セキュリティ</a>
+      <a href="https://github.com/oriyu90/mlx-bar/blob/main/licence.md" data-i18n="footer.license">ライセンス（MIT）</a>
     </div>
-    <p class="legal">
+    <p class="legal" data-i18n="footer.legal" data-i18n-html="true">
       © 2026 折田悠希（Yuki_Orita）. MLXBar はMITライセンスで公開しています。<br>
       Apple、Mac、macOS、Apple Silicon は Apple Inc. の商標です。本サイトはAppleとは関係ありません。
     </p>
   </div>
 </footer>
+
+<script>
+(function () {
+  "use strict";
+  var SUPPORTED = ["ja", "en", "zh", "pt"];
+  var STORAGE_KEY = "mlxbar-lang";
+
+  var I18N = {
+    ja: {
+      "meta.title": "MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから",
+      "nav.why": "特長",
+      "nav.features": "機能",
+      "nav.start": "使い方",
+      "nav.creator": "開発者",
+      "hero.h1": "MacのローカルAIを、メニューバーから。",
+      "hero.p": "MLXBar（エムエルエックスバー）は、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルを ひとつのメニューから扱うためのアプリです。モデルの読み込みも、チャットも、 OpenAI互換APIの提供も、すべてこのMacの中だけで完結します。",
+      "hero.download": "ダウンロード",
+      "hero.viewGithub": "GitHubで見る",
+      "hero.fineprint": "無料・オープンソース（MIT） / アカウント登録不要 / アプリの表示言語は日本語・Englishに対応",
+      "hero.mockWaiting": "待機中",
+      "hero.mockSelectModel": "モデルを選択…",
+      "hero.mockQuickChat": "クイックチャット…",
+      "hero.mockUnload": "アンロード",
+      "hero.mockRescan": "今すぐ再スキャン",
+      "hero.mockSettings": "設定…",
+      "why.h2": "クラウドに送らない、という選択",
+      "why.lede": "推論はすべてMac上のMLXランタイムで実行されます。プロンプトも画像もモデルも外部へ送信されません。 APIは既定でこのMacからのみ接続でき、ローカルネットワークへの公開は、明示的に有効にしたときだけ、 APIキー必須で行われます。",
+      "why.p1h": "ひとつのカタログ",
+      "why.p1p": "Hugging Faceキャッシュ、LM Studio、任意の追加フォルダを走査し、MLX LM・MLX VLM・GGUFを同じ一覧で扱います。形式とエンジンの判別は自動です。",
+      "why.p2h": "用意は自動で",
+      "why.p2p": "初回起動時に <code>mlx-lm</code> と <code>mlx-vlm</code> を分離した環境へインストールします。更新・検証・切り替え・旧版への復元も設定画面から行えます。",
+      "why.p3h": "状態が見える",
+      "why.p3p": "読み込み中の段階と経過秒数、応答中か待機中か、並列要求の待ち件数まで、メニューバーの表示だけで把握できます。",
+      "features.h2": "機能",
+      "features.lede": "日常的に使う操作はメニューバーに、細かい設定は設定画面にまとめています。",
+      "features.f1t": "クイックチャット",
+      "features.f1d": "読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。",
+      "features.f2t": "OpenAI互換API",
+      "features.f2d": "Chat Completions、モデル一覧、tool calling、ストリーミングに対応。Open Interpreter、LibreChat、ZCodeなどからそのまま利用できます。",
+      "features.f3t": "生成パラメータ",
+      "features.f3d": "Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。",
+      "features.f4t": "並列リクエスト",
+      "features.f4d": "同時に届いた生成要求を到着順に処理します。待機中も接続を維持し、上限を超えたときだけエラーを返します。",
+      "features.f5t": "APIログ",
+      "features.f5d": "直近のAPIアクセスを最大2,000件記録します。リクエスト本文・応答本文・APIキーは保存しません。",
+      "features.f6t": "CLIと日英インターフェース",
+      "features.f6d": "GUIと同じ管理APIを使う <code>mlxbarctl</code> を同梱。表示言語はEnglishと日本語を設定から切り替えられます。",
+      "start.h2": "使いはじめる",
+      "start.lede": "アカウント登録も、APIキーの取得も要りません。",
+      "start.s1": "<b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.2.2.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。",
+      "start.s2": "<b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。",
+      "start.s3": "<b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。",
+      "start.s4": "<b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。",
+      "start.note": "Apple公証済みでないビルドの場合、初回起動時に「システム設定」→「プライバシーとセキュリティ」からの許可が必要になることがあります。",
+      "api.h2": "既存のツールから、そのまま",
+      "api.lede": "OpenAI互換のクライアントであれば、ベースURLとAPIキーを差し替えるだけで接続できます。",
+      "api.comment": "# APIキーは設定画面の「APIサーバー」からコピーできます",
+      "api.message": "こんにちは",
+      "spec.h2": "動作環境",
+      "spec.mac": "対応Mac",
+      "spec.macos": "macOS",
+      "spec.macosValue": "14以降（15以降を推奨）",
+      "spec.latest": "最新版",
+      "spec.price": "価格",
+      "spec.priceValue": "無料（MITライセンスのオープンソース）",
+      "spec.lang": "表示言語",
+      "spec.optional": "任意",
+      "spec.optionalValue": "GGUFモデルを使う場合はLM Studioと <code>lms</code> CLI",
+      "spec.storage": "保存先",
+      "creator.h2": "開発者",
+      "creator.romaji": "Yuki_Orita — MLXBar 作者",
+      "creator.p": "不具合の報告、新機能の要望、リリースのお知らせはDiscordコミュニティでお受けしています。 ソースコードはGitHubで公開しており、Issueやプルリクエストも歓迎します。",
+      "creator.discord": "Discord コミュニティ",
+      "creator.official": "公式サイト",
+      "footer.releases": "リリース",
+      "footer.official": "開発者公式サイト",
+      "footer.security": "セキュリティ",
+      "footer.license": "ライセンス（MIT）",
+      "footer.legal": "© 2026 折田悠希（Yuki_Orita）. MLXBar はMITライセンスで公開しています。<br>\n Apple、Mac、macOS、Apple Silicon は Apple Inc. の商標です。本サイトはAppleとは関係ありません。",
+      "meta.description": "MLXBarは、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルをメニューバーから管理するmacOSアプリです。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（おりたゆうき / Yuki_Orita）。無料・オープンソース、GitHubで公開中。",
+      "meta.ogTitle": "MLXBar（エムエルエックスバー）— Apple Silicon MacのローカルAIをメニューバーから",
+      "meta.ogDescription": "MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。OpenAI互換APIを備え、プロンプトもモデルもこのMacの中だけで動きます。開発者は折田悠希（Yuki_Orita）。",
+      "meta.twitterTitle": "MLXBar — Apple Silicon MacのローカルAIをメニューバーから",
+      "meta.twitterDescription": "MLX LM・MLX VLM・LM Studioモデルをメニューバーから管理。推論はすべてこのMacの中で完結します。",
+    },
+    en: {
+      "meta.title": "MLXBar — Local AI on your Apple Silicon Mac, from the menu bar",
+      "meta.description": "MLXBar is a macOS app that manages MLX LM, MLX VLM, and LM Studio models from your menu bar on Apple Silicon. It ships an OpenAI-compatible API, and both prompts and models stay on this Mac. Built by Yuki_Orita. Free and open source, on GitHub.",
+      "meta.ogTitle": "MLXBar — Local AI on your Apple Silicon Mac, from the menu bar",
+      "meta.ogDescription": "Manage MLX LM, MLX VLM, and LM Studio models from your menu bar. Ships an OpenAI-compatible API — prompts and models never leave this Mac. Built by Yuki_Orita.",
+      "meta.twitterTitle": "MLXBar — Local AI on your Apple Silicon Mac, from the menu bar",
+      "meta.twitterDescription": "Manage MLX LM, MLX VLM, and LM Studio models from your menu bar. Inference runs entirely on this Mac.",
+      "nav.why": "Highlights",
+      "nav.features": "Features",
+      "nav.start": "Get Started",
+      "nav.creator": "Developer",
+      "hero.h1": "Local AI on your Mac, from the menu bar.",
+      "hero.p": "MLXBar is an app for handling MLX LM, MLX VLM, and LM Studio models on your Apple Silicon Mac from a single menu. Loading models, chatting, and serving an OpenAI-compatible API all happen entirely on this Mac.",
+      "hero.download": "Download",
+      "hero.viewGithub": "View on GitHub",
+      "hero.fineprint": "Free and open source (MIT) / No account required / App interface available in English and Japanese",
+      "hero.mockWaiting": "Ready",
+      "hero.mockSelectModel": "Select Model…",
+      "hero.mockQuickChat": "Quick Chat…",
+      "hero.mockUnload": "Unload",
+      "hero.mockRescan": "Rescan Now",
+      "hero.mockSettings": "Settings…",
+      "why.h2": "The choice not to send it to the cloud",
+      "why.lede": "All inference runs on the MLX runtime on your Mac. Prompts, images, and models are never sent anywhere else. The API is reachable only from this Mac by default; exposing it to your local network requires explicitly enabling it, and always requires an API key.",
+      "why.p1h": "One catalog",
+      "why.p1p": "Scans your Hugging Face cache, LM Studio, and any folders you add, listing MLX LM, MLX VLM, and GGUF models together. Format and engine are detected automatically.",
+      "why.p2h": "Set up automatically",
+      "why.p2p": "Installs <code>mlx-lm</code> and <code>mlx-vlm</code> into isolated environments on first launch. Updating, verifying, switching, and rolling back are all handled from Settings.",
+      "why.p3h": "Status you can see",
+      "why.p3p": "The menu bar alone shows the current loading stage and elapsed time, whether it's responding or idle, and how many requests are queued.",
+      "features.h2": "Features",
+      "features.lede": "Everyday actions live in the menu bar; finer controls live in Settings.",
+      "features.f1t": "Quick Chat",
+      "features.f1d": "Chat directly with the loaded model. Supports streaming generation, mid-generation cancellation, and image input when a VLM is selected.",
+      "features.f2t": "OpenAI-compatible API",
+      "features.f2d": "Supports Chat Completions, model listing, tool calling, and streaming. Works out of the box with Open Interpreter, LibreChat, ZCode, and similar tools.",
+      "features.f3t": "Generation parameters",
+      "features.f3d": "Saves default max tokens, temperature, Top P, and repetition penalty. Detects each model's context length and automatically adjusts requests that exceed it.",
+      "features.f4t": "Parallel requests",
+      "features.f4d": "Processes concurrent generation requests in arrival order. Connections stay open while queued; errors are only returned once the limit is exceeded.",
+      "features.f5t": "API logs",
+      "features.f5d": "Keeps up to 2,000 recent API accesses. Request bodies, response bodies, and API keys are never stored.",
+      "features.f6t": "CLI and bilingual interface",
+      "features.f6d": "Ships <code>mlxbarctl</code>, which uses the same management API as the GUI. Interface language can be switched between English and Japanese in Settings.",
+      "start.h2": "Get started",
+      "start.lede": "No account, no API key to obtain.",
+      "start.s1": "<b>Download and open it.</b> Get <code>MLXBar-1.2.2.dmg</code> from GitHub Releases and copy <code>MLXBar.app</code> to Applications.",
+      "start.s2": "<b>Launch it.</b> An icon appears in the menu bar. If <code>mlx-lm</code> and <code>mlx-vlm</code> aren't installed yet, they're set up automatically in the background.",
+      "start.s3": "<b>Choose a model.</b> Use “Select Model…” to search for and load a model already on your Mac.",
+      "start.s4": "<b>Use it.</b> Chat via “Quick Chat…”, or connect to the OpenAI-compatible API at <code>http://127.0.0.1:11435</code>.",
+      "start.note": "For builds that aren't Apple-notarized, you may need to grant permission on first launch via System Settings → Privacy & Security.",
+      "api.h2": "Works with the tools you already use",
+      "api.lede": "Any OpenAI-compatible client can connect just by swapping in the base URL and API key.",
+      "api.comment": "# Copy your API key from Settings → API Server",
+      "api.message": "Hello",
+      "spec.h2": "System requirements",
+      "spec.mac": "Supported Macs",
+      "spec.macos": "macOS",
+      "spec.macosValue": "14 or later (15 or later recommended)",
+      "spec.latest": "Latest version",
+      "spec.price": "Price",
+      "spec.priceValue": "Free (open source, MIT license)",
+      "spec.lang": "Interface language",
+      "spec.optional": "Optional",
+      "spec.optionalValue": "LM Studio and the <code>lms</code> CLI, if you use GGUF models",
+      "spec.storage": "Data location",
+      "creator.h2": "Developer",
+      "creator.romaji": "Yuki_Orita — creator of MLXBar",
+      "creator.p": "Bug reports, feature requests, and release announcements are handled in the Discord community. Source code is on GitHub — issues and pull requests are welcome.",
+      "creator.discord": "Discord community",
+      "creator.official": "Official site",
+      "footer.releases": "Releases",
+      "footer.official": "Developer's official site",
+      "footer.security": "Security",
+      "footer.license": "License (MIT)",
+      "footer.legal": "© 2026 Yuki_Orita (折田悠希). MLXBar is released under the MIT license.<br>Apple, Mac, macOS, and Apple Silicon are trademarks of Apple Inc. This site is not affiliated with Apple."
+    },
+    zh: {
+      "meta.title": "MLXBar — 在菜单栏管理你 Apple Silicon Mac 上的本地 AI",
+      "meta.description": "MLXBar 是一款 macOS 应用，可在菜单栏中统一管理 Apple Silicon Mac 上的 MLX LM、MLX VLM 和 LM Studio 模型。内置 OpenAI 兼容 API，提示词与模型均只在本机运行。开发者：折田悠希（Yuki_Orita）。免费开源，托管于 GitHub。",
+      "meta.ogTitle": "MLXBar — 在菜单栏管理你 Apple Silicon Mac 上的本地 AI",
+      "meta.ogDescription": "在菜单栏管理 MLX LM、MLX VLM 与 LM Studio 模型。内置 OpenAI 兼容 API，提示词与模型均只在本机运行。开发者：折田悠希（Yuki_Orita）。",
+      "meta.twitterTitle": "MLXBar — 在菜单栏管理你 Apple Silicon Mac 上的本地 AI",
+      "meta.twitterDescription": "在菜单栏管理 MLX LM、MLX VLM 与 LM Studio 模型，推理完全在本机完成。",
+      "nav.why": "特色",
+      "nav.features": "功能",
+      "nav.start": "使用方法",
+      "nav.creator": "开发者",
+      "hero.h1": "Mac 上的本地 AI，尽在菜单栏。",
+      "hero.p": "MLXBar 是一款应用，可在一个菜单中统一处理 Apple Silicon Mac 上的 MLX LM、MLX VLM 与 LM Studio 模型。加载模型、对话、提供 OpenAI 兼容 API，全部只在这台 Mac 上完成。",
+      "hero.download": "下载",
+      "hero.viewGithub": "在 GitHub 查看",
+      "hero.fineprint": "免费、开源（MIT）／无需注册账号／应用界面支持日语与英语",
+      "hero.mockWaiting": "待机中",
+      "hero.mockSelectModel": "选择模型…",
+      "hero.mockQuickChat": "快速对话…",
+      "hero.mockUnload": "卸载",
+      "hero.mockRescan": "立即重新扫描",
+      "hero.mockSettings": "设置…",
+      "why.h2": "选择不将数据发送到云端",
+      "why.lede": "所有推理均在 Mac 上的 MLX 运行时中执行。提示词、图像和模型都不会发送到外部。默认情况下 API 仅可从本机连接；仅在你明确启用时才会开放到本地网络，且始终需要 API 密钥。",
+      "why.p1h": "统一目录",
+      "why.p1p": "扫描 Hugging Face 缓存、LM Studio 以及你添加的任意文件夹，将 MLX LM、MLX VLM 与 GGUF 模型汇总到同一列表中。格式与引擎自动识别。",
+      "why.p2h": "自动准备环境",
+      "why.p2p": "首次启动时会将 <code>mlx-lm</code> 与 <code>mlx-vlm</code> 安装到各自独立的环境中。更新、校验、切换、回退旧版本均可在设置中完成。",
+      "why.p3h": "状态一目了然",
+      "why.p3p": "仅通过菜单栏即可掌握当前加载阶段与耗时、是否正在响应或处于待机，以及排队请求的数量。",
+      "features.h2": "功能",
+      "features.lede": "日常操作集中在菜单栏，细节设置集中在设置页面。",
+      "features.f1t": "快速对话",
+      "features.f1d": "可直接与已加载的模型对话。支持流式生成、中途取消，以及选择 VLM 时的图像输入。",
+      "features.f2t": "OpenAI 兼容 API",
+      "features.f2d": "支持 Chat Completions、模型列表、工具调用（tool calling）与流式输出。可直接对接 Open Interpreter、LibreChat、ZCode 等工具。",
+      "features.f3t": "生成参数",
+      "features.f3d": "保存最大 Token 数、温度、Top P、重复惩罚等默认值。自动检测各模型的上下文长度，并对超出限制的请求自动调整。",
+      "features.f4t": "并行请求",
+      "features.f4d": "按到达顺序处理并发的生成请求。排队期间保持连接，仅当超出上限时才返回错误。",
+      "features.f5t": "API 日志",
+      "features.f5d": "最多记录 2,000 条最近的 API 访问记录。不保存请求正文、响应正文和 API 密钥。",
+      "features.f6t": "CLI 与中日英界面",
+      "features.f6d": "内置与 GUI 共用同一管理 API 的 <code>mlxbarctl</code>。界面语言可在设置中切换为英语或日语。",
+      "start.h2": "开始使用",
+      "start.lede": "无需注册账号，也无需获取 API 密钥。",
+      "start.s1": "<b>下载并打开。</b> 从 GitHub Releases 获取 <code>MLXBar-1.2.2.dmg</code>，将 <code>MLXBar.app</code> 复制到「应用程序」中。",
+      "start.s2": "<b>启动应用。</b> 菜单栏中会出现图标。如果尚未安装 <code>mlx-lm</code> 与 <code>mlx-vlm</code>，会在后台自动安装。",
+      "start.s3": "<b>选择模型。</b> 通过「选择模型…」搜索并加载 Mac 上已有的模型。",
+      "start.s4": "<b>开始使用。</b> 通过「快速对话…」进行对话，或连接到 <code>http://127.0.0.1:11435</code> 的 OpenAI 兼容 API。",
+      "start.note": "对于未经 Apple 公证的构建版本，首次启动时可能需要在「系统设置」→「隐私与安全性」中授权允许运行。",
+      "api.h2": "无缝对接你现有的工具",
+      "api.lede": "任何 OpenAI 兼容客户端，只需替换 Base URL 与 API 密钥即可连接。",
+      "api.comment": "# 可在设置页面的「API 服务器」中复制 API 密钥",
+      "api.message": "你好",
+      "spec.h2": "系统要求",
+      "spec.mac": "支持的 Mac",
+      "spec.macos": "macOS",
+      "spec.macosValue": "14 或更高版本（推荐 15 或更高）",
+      "spec.latest": "最新版本",
+      "spec.price": "价格",
+      "spec.priceValue": "免费（MIT 许可证开源）",
+      "spec.lang": "界面语言",
+      "spec.optional": "可选",
+      "spec.optionalValue": "如需使用 GGUF 模型，需要 LM Studio 与 <code>lms</code> CLI",
+      "spec.storage": "数据存储位置",
+      "creator.h2": "开发者",
+      "creator.romaji": "Yuki_Orita — MLXBar 作者",
+      "creator.p": "欢迎在 Discord 社区提交问题反馈、功能请求，我们也会在那里发布更新公告。源代码托管于 GitHub，欢迎提交 Issue 与 Pull Request。",
+      "creator.discord": "Discord 社区",
+      "creator.official": "官方网站",
+      "footer.releases": "发布版本",
+      "footer.official": "开发者官方网站",
+      "footer.security": "安全性",
+      "footer.license": "许可证（MIT）",
+      "footer.legal": "© 2026 折田悠希（Yuki_Orita）. MLXBar 以 MIT 许可证发布。<br>Apple、Mac、macOS、Apple Silicon 是 Apple Inc. 的商标。本网站与 Apple 无关。"
+    },
+    pt: {
+      "meta.title": "MLXBar — IA local no seu Mac com Apple Silicon, direto da barra de menus",
+      "meta.description": "MLXBar é um app para macOS que gerencia modelos MLX LM, MLX VLM e LM Studio pela barra de menus em Macs com Apple Silicon. Inclui uma API compatível com OpenAI, e tanto os prompts quanto os modelos permanecem neste Mac. Criado por Yuki_Orita. Gratuito e open source, no GitHub.",
+      "meta.ogTitle": "MLXBar — IA local no seu Mac com Apple Silicon, direto da barra de menus",
+      "meta.ogDescription": "Gerencie modelos MLX LM, MLX VLM e LM Studio pela barra de menus. Inclui API compatível com OpenAI — prompts e modelos nunca saem deste Mac. Criado por Yuki_Orita.",
+      "meta.twitterTitle": "MLXBar — IA local no seu Mac com Apple Silicon, direto da barra de menus",
+      "meta.twitterDescription": "Gerencie modelos MLX LM, MLX VLM e LM Studio pela barra de menus. A inferência roda inteiramente neste Mac.",
+      "nav.why": "Destaques",
+      "nav.features": "Recursos",
+      "nav.start": "Como usar",
+      "nav.creator": "Desenvolvedor",
+      "hero.h1": "IA local no seu Mac, direto da barra de menus.",
+      "hero.p": "MLXBar é um app para lidar com modelos MLX LM, MLX VLM e LM Studio no seu Mac com Apple Silicon a partir de um único menu. Carregar modelos, conversar e disponibilizar uma API compatível com OpenAI — tudo acontece inteiramente neste Mac.",
+      "hero.download": "Baixar",
+      "hero.viewGithub": "Ver no GitHub",
+      "hero.fineprint": "Gratuito e open source (MIT) / Sem necessidade de conta / Interface do app disponível em inglês e japonês",
+      "hero.mockWaiting": "Pronto",
+      "hero.mockSelectModel": "Selecionar modelo…",
+      "hero.mockQuickChat": "Chat rápido…",
+      "hero.mockUnload": "Descarregar",
+      "hero.mockRescan": "Reescanear agora",
+      "hero.mockSettings": "Ajustes…",
+      "why.h2": "A opção de não enviar nada para a nuvem",
+      "why.lede": "Toda a inferência roda no runtime MLX deste Mac. Prompts, imagens e modelos nunca são enviados para fora. Por padrão, a API só pode ser acessada a partir deste Mac; expô-la à rede local exige ativação explícita e sempre requer uma chave de API.",
+      "why.p1h": "Um único catálogo",
+      "why.p1p": "Varre o cache do Hugging Face, o LM Studio e quaisquer pastas adicionadas, listando modelos MLX LM, MLX VLM e GGUF juntos. Formato e mecanismo são detectados automaticamente.",
+      "why.p2h": "Preparado automaticamente",
+      "why.p2p": "Instala <code>mlx-lm</code> e <code>mlx-vlm</code> em ambientes isolados na primeira execução. Atualizar, verificar, alternar e reverter versões — tudo pelos Ajustes.",
+      "why.p3h": "Status visível",
+      "why.p3p": "A barra de menus por si só mostra o estágio de carregamento e o tempo decorrido, se está respondendo ou ocioso, e quantas requisições estão na fila.",
+      "features.h2": "Recursos",
+      "features.lede": "As ações do dia a dia ficam na barra de menus; os ajustes finos ficam em Ajustes.",
+      "features.f1t": "Chat rápido",
+      "features.f1d": "Converse diretamente com o modelo carregado. Suporta geração em streaming, cancelamento no meio da geração e entrada de imagens ao selecionar um VLM.",
+      "features.f2t": "API compatível com OpenAI",
+      "features.f2d": "Suporta Chat Completions, listagem de modelos, tool calling e streaming. Funciona imediatamente com Open Interpreter, LibreChat, ZCode e ferramentas similares.",
+      "features.f3t": "Parâmetros de geração",
+      "features.f3d": "Salva valores padrão de tokens máximos, temperatura, Top P e penalidade de repetição. Detecta o tamanho de contexto de cada modelo e ajusta automaticamente requisições que o excedam.",
+      "features.f4t": "Requisições paralelas",
+      "features.f4d": "Processa requisições de geração simultâneas na ordem de chegada. As conexões permanecem abertas enquanto na fila; erros só são retornados ao exceder o limite.",
+      "features.f5t": "Logs de API",
+      "features.f5d": "Mantém até 2.000 acessos recentes à API. Corpos de requisição, corpos de resposta e chaves de API nunca são armazenados.",
+      "features.f6t": "CLI e interface bilíngue",
+      "features.f6d": "Inclui o <code>mlxbarctl</code>, que usa a mesma API de gerenciamento do app gráfico. O idioma da interface pode ser alternado entre inglês e japonês nos Ajustes.",
+      "start.h2": "Como começar",
+      "start.lede": "Sem conta, sem precisar obter uma chave de API.",
+      "start.s1": "<b>Baixe e abra.</b> Obtenha <code>MLXBar-1.2.2.dmg</code> nos GitHub Releases e copie <code>MLXBar.app</code> para Aplicativos.",
+      "start.s2": "<b>Inicie o app.</b> Um ícone aparece na barra de menus. Se <code>mlx-lm</code> e <code>mlx-vlm</code> ainda não estiverem instalados, eles são preparados automaticamente em segundo plano.",
+      "start.s3": "<b>Escolha um modelo.</b> Use “Selecionar modelo…” para buscar e carregar um modelo já presente no seu Mac.",
+      "start.s4": "<b>Use.</b> Converse pelo “Chat rápido…” ou conecte-se à API compatível com OpenAI em <code>http://127.0.0.1:11435</code>.",
+      "start.note": "Para builds sem notarização da Apple, pode ser necessário conceder permissão na primeira execução em Ajustes do Sistema → Privacidade e Segurança.",
+      "api.h2": "Funciona com as ferramentas que você já usa",
+      "api.lede": "Qualquer cliente compatível com OpenAI pode se conectar apenas trocando a URL base e a chave de API.",
+      "api.comment": "# Copie sua chave de API em Ajustes → Servidor de API",
+      "api.message": "Olá",
+      "spec.h2": "Requisitos do sistema",
+      "spec.mac": "Macs compatíveis",
+      "spec.macos": "macOS",
+      "spec.macosValue": "14 ou mais recente (recomendado 15 ou mais recente)",
+      "spec.latest": "Versão mais recente",
+      "spec.price": "Preço",
+      "spec.priceValue": "Gratuito (open source, licença MIT)",
+      "spec.lang": "Idioma da interface",
+      "spec.optional": "Opcional",
+      "spec.optionalValue": "LM Studio e a CLI <code>lms</code>, se você usar modelos GGUF",
+      "spec.storage": "Local de armazenamento",
+      "creator.h2": "Desenvolvedor",
+      "creator.romaji": "Yuki_Orita — criador do MLXBar",
+      "creator.p": "Relatos de bugs, pedidos de recursos e anúncios de lançamento são tratados na comunidade do Discord. O código-fonte está no GitHub — issues e pull requests são bem-vindos.",
+      "creator.discord": "Comunidade no Discord",
+      "creator.official": "Site oficial",
+      "footer.releases": "Lançamentos",
+      "footer.official": "Site oficial do desenvolvedor",
+      "footer.security": "Segurança",
+      "footer.license": "Licença (MIT)",
+      "footer.legal": "© 2026 Yuki_Orita (折田悠希). MLXBar é distribuído sob a licença MIT.<br>Apple, Mac, macOS e Apple Silicon são marcas registradas da Apple Inc. Este site não possui afiliação com a Apple."
+    }
+  };
+
+  function detect() {
+    var raw = (navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || "ja"]);
+    for (var i = 0; i < raw.length; i++) {
+      var l = String(raw[i]).toLowerCase();
+      if (l.indexOf("zh") === 0) return "zh";
+      if (l.indexOf("pt") === 0) return "pt";
+      if (l.indexOf("en") === 0) return "en";
+      if (l.indexOf("ja") === 0) return "ja";
+    }
+    return "ja";
+  }
+
+  function set(lang) {
+    if (SUPPORTED.indexOf(lang) === -1) lang = "ja";
+    document.documentElement.lang = lang;
+    var dict = I18N[lang];
+    if (dict) {
+      var nodes = document.querySelectorAll("[data-i18n]");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var key = el.getAttribute("data-i18n");
+        var value = dict[key];
+        if (value == null) continue;
+        if (el.hasAttribute("data-i18n-attr")) {
+          el.setAttribute(el.getAttribute("data-i18n-attr"), value);
+        } else if (el.hasAttribute("data-i18n-html")) {
+          el.innerHTML = value;
+        } else {
+          el.textContent = value;
+        }
+      }
+    }
+    var buttons = document.querySelectorAll("[data-lang-button]");
+    for (var j = 0; j < buttons.length; j++) {
+      buttons[j].setAttribute("aria-current", buttons[j].getAttribute("data-lang-button") === lang ? "true" : "false");
+    }
+    try { localStorage.setItem(STORAGE_KEY, lang); } catch (e) { /* ignore */ }
+  }
+
+  function init() {
+    var saved = null;
+    try { saved = localStorage.getItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+    set(saved && SUPPORTED.indexOf(saved) !== -1 ? saved : detect());
+  }
+
+  window.MLXBarI18n = { set: set, detect: detect };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
 
 </body>
 </html>
