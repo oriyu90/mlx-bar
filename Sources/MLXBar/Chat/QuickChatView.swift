@@ -12,14 +12,16 @@ struct QuickChatView: View {
 
     var body: some View {
         VStack(spacing: 12) {
+            Label(model.loadedName ?? LS("モデル未選択"), systemImage: "cpu")
+                .lineLimit(1).truncationMode(.middle)
             HStack {
-                Label(model.loadedName ?? LS("モデル未選択"), systemImage: "cpu")
-                Spacer()
                 Text("Temperature \(temperature, specifier: "%.1f")")
-                Slider(value: $temperature, in: 0...2, step: 0.1).frame(width: 120)
+                Slider(value: $temperature, in: 0...2, step: 0.1).frame(minWidth: 100, idealWidth: 120)
                     .accessibilityLabel("Temperature")
+                Spacer(minLength: 12)
                 Stepper(LS("最大 ") + "\(maxTokens)", value: $maxTokens,
                         in: 1...max(1, model.effectiveMaxTokens), step: 128)
+                    .fixedSize()
             }
             ScrollView {
                 Text(model.chatOutput.isEmpty ? LS("ここに生成結果が表示されます") : model.chatOutput)

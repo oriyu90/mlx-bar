@@ -146,6 +146,15 @@ def test_laguna_tool_markup_is_parsed():
     assert result["tool_calls"][0]["function"]["name"] == "read_file"
     assert json.loads(result["tool_calls"][0]["function"]["arguments"]) == {"path": "README.md"}
     assert "tool_call" not in result["text"]
+    assert "checking" not in result["text"]
+
+
+def test_reasoning_markup_is_stripped_even_without_a_tool_call():
+    result = parse_tool_markup(
+        "<assistant><think>the user just wants a greeting</think>Hello there!</assistant>"
+    )
+    assert result["tool_calls"] == []
+    assert result["text"] == "Hello there!"
 
 
 def test_api_log_is_bounded_and_does_not_store_request_bodies():

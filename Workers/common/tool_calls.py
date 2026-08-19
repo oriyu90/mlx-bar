@@ -57,9 +57,7 @@ def parse_tool_markup(text: str) -> dict:
             )}
             calls.append(_call(name, arguments))
 
-    if not calls:
-        return {"text": text, "tool_calls": []}
-    remaining = pattern.sub(" ", text)
-    remaining = re.sub(r"</?(?:assistant|think)>|<think>.*?</think>", "", remaining,
+    remaining = pattern.sub(" ", text) if calls else text
+    remaining = re.sub(r"<think>.*?</think>|</?(?:assistant|think)>", "", remaining,
                        flags=re.DOTALL).strip()
     return {"text": remaining, "tool_calls": calls}

@@ -8,101 +8,104 @@ struct MenuBarView: View {
     @State private var isSelectingFolder = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: model.icon).font(.title2)
-                VStack(alignment: .leading) {
-                    Text(model.loadingModelName.map { model.guiLanguage == "ja" ? "ロード中 · \(model.loadingEngine ?? "") · \($0)" : "Loading · \(model.loadingEngine ?? "") · \($0)" }
-                         ?? model.loadedName.map { "Loaded · \(model.loadedEngine ?? "") · \($0)" }
-                         ?? model.serviceStatus)
-                        .font(.headline).lineLimit(1)
-                    if let phase = model.loadingPhase { Text(phase).font(.caption).foregroundStyle(.secondary) }
-                    if model.loadedName != nil {
-                        Text("Max token \(MenuBarViewModel.tokenCount(model.effectiveMaxTokens))")
-                            .font(.caption).foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: model.icon).font(.title2)
+                    VStack(alignment: .leading) {
+                        Text(model.loadingModelName.map { model.guiLanguage == "ja" ? "ロード中 · \(model.loadingEngine ?? "") · \($0)" : "Loading · \(model.loadingEngine ?? "") · \($0)" }
+                             ?? model.loadedName.map { "Loaded · \(model.loadedEngine ?? "") · \($0)" }
+                             ?? model.serviceStatus)
+                            .font(.headline).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        if let phase = model.loadingPhase { Text(phase).font(.caption).foregroundStyle(.secondary) }
+                        if model.loadedName != nil {
+                            Text("Max token \(MenuBarViewModel.tokenCount(model.effectiveMaxTokens))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text(model.apiURL).font(.caption).foregroundStyle(.secondary)
                     }
-                    Text(model.apiURL).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if model.loadingModelName == nil, model.loadedName != nil {
+                        Button { model.copyLoadedModelName() } label: {
+                            Image(systemName: "doc.on.doc").accessibilityLabel(LS("モデル名をコピー"))
+                        }.buttonStyle(.plain)
+                    }
+                    if model.busy { ProgressView().controlSize(.small) }
                 }
-                Spacer()
-                if model.loadingModelName == nil, model.loadedName != nil {
-                    Button { model.copyLoadedModelName() } label: {
-                        Image(systemName: "doc.on.doc").accessibilityLabel(LS("モデル名をコピー"))
-                    }.buttonStyle(.plain)
+
+                if let status = model.modelCopyStatus {
+                    Text(status).font(.caption).foregroundStyle(.secondary)
                 }
-                if model.busy { ProgressView().controlSize(.small) }
-            }
 
-            if let status = model.modelCopyStatus {
-                Text(status).font(.caption).foregroundStyle(.secondary)
-            }
+                if model.loadedName != nil || model.loadingModelName != nil {
+                    Label(model.modelActivityText,
+                          systemImage: model.activeRequestCount > 0 || model.queuedRequestCount > 0 ? "waveform.circle.fill" :
+                            model.loadingModelName != nil ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(model.activeRequestCount > 0 || model.queuedRequestCount > 0 ? .orange :
+                                         model.loadingModelName != nil ? .secondary : .green)
+                }
 
-            if model.loadedName != nil || model.loadingModelName != nil {
-                Label(model.modelActivityText,
-                      systemImage: model.activeRequestCount > 0 || model.queuedRequestCount > 0 ? "waveform.circle.fill" :
-                        model.loadingModelName != nil ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(model.activeRequestCount > 0 || model.queuedRequestCount > 0 ? .orange :
-                                     model.loadingModelName != nil ? .secondary : .green)
-            }
-
-            if let error = model.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.red).lineLimit(3)
-            }
-            Divider()
-            Button(LS("モデルを選択…")) { openWindow(id: "models"); dismiss() }.keyboardShortcut("m")
-            if model.loadedName == nil {
-                Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.disabled(true)
-            } else {
-                Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.keyboardShortcut("n")
-                Button(LS("アンロード")) { Task { await model.unload() } }
-            }
-            if model.currentRequestID != nil {
-                Button(LS(model.cancellationInProgress ? "生成を停止処理中…" : "生成をキャンセル")) {
-                    Task { await model.cancelGeneration() }
-                }.disabled(model.cancellationInProgress)
-            } else if model.activeRequestCount > 0 || model.queuedRequestCount > 0 {
-                Button(LS(model.cancellationInProgress ? "すべて停止処理中…" : "すべての生成を停止")) {
-                    Task { await model.cancelAllGenerations() }
-                }.disabled(model.cancellationInProgress)
-            }
-            Divider()
-            HStack {
-                Button(LS("今すぐ再スキャン")) { Task { await model.scan() } }
-                Spacer()
-                Button(LS("フォルダを選択…")) { dismiss(); chooseFolder() }
+                if let error = model.errorMessage {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.red).lineLimit(3)
+                }
+                Divider()
+                Button(LS("モデルを選択…")) { openWindow(id: "models"); dismiss() }.keyboardShortcut("m")
+                if model.loadedName == nil {
+                    Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.disabled(true)
+                } else {
+                    Button(LS("クイックチャット…")) { openWindow(id: "chat"); dismiss() }.keyboardShortcut("n")
+                    Button(LS("アンロード")) { Task { await model.unload() } }
+                }
+                if model.currentRequestID != nil {
+                    Button(LS(model.cancellationInProgress ? "生成を停止処理中…" : "生成をキャンセル")) {
+                        Task { await model.cancelGeneration() }
+                    }.disabled(model.cancellationInProgress)
+                } else if model.activeRequestCount > 0 || model.queuedRequestCount > 0 {
+                    Button(LS(model.cancellationInProgress ? "すべて停止処理中…" : "すべての生成を停止")) {
+                        Task { await model.cancelAllGenerations() }
+                    }.disabled(model.cancellationInProgress)
+                }
+                Divider()
+                HStack {
+                    Button(LS("今すぐ再スキャン")) { Task { await model.scan() } }
+                    Spacer()
+                    Button(LS("フォルダを選択…")) { dismiss(); chooseFolder() }
+                        .disabled(isSelectingFolder)
+                    Menu(LS("ライブラリ…")) {
+                        Button(LS("ユーザライブラリ（~/Library）")) {
+                            dismiss(); chooseFolder(startingAt: .user)
+                        }
+                        Button(LS("Macライブラリ（/Library）")) {
+                            dismiss(); chooseFolder(startingAt: .system)
+                        }
+                    }
                     .disabled(isSelectingFolder)
-                Menu(LS("ライブラリ…")) {
-                    Button(LS("ユーザライブラリ（~/Library）")) {
-                        dismiss(); chooseFolder(startingAt: .user)
-                    }
-                    Button(LS("Macライブラリ（/Library）")) {
-                        dismiss(); chooseFolder(startingAt: .system)
-                    }
                 }
-                .disabled(isSelectingFolder)
-            }
-            HStack {
-                Text(LS("APIサーバー")).font(.caption).foregroundStyle(.secondary)
-                if model.lanEnabled {
-                    Label(LS("LAN公開中"), systemImage: "network")
-                        .font(.caption).foregroundStyle(.orange)
+                HStack {
+                    Text(LS("APIサーバー")).font(.caption).foregroundStyle(.secondary)
+                    if model.lanEnabled {
+                        Label(LS("LAN公開中"), systemImage: "network")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    Button(model.apiURL) { model.copyAPIURL() }
+                        .buttonStyle(.link)
+                        .accessibilityLabel(LS("接続URL"))
+                        .accessibilityHint(LS("クリップボードへコピーします"))
                 }
-                Spacer()
-                Button(model.apiURL) { model.copyAPIURL() }
-                    .buttonStyle(.link)
-                    .accessibilityLabel(LS("接続URL"))
-                    .accessibilityHint(LS("クリップボードへコピーします"))
+                Divider()
+                HStack {
+                    Button(LS("設定…")) { openSettings(); dismiss() }
+                    Spacer()
+                    Button(LS("終了")) { NSApplication.shared.terminate(nil) }
+                }
             }
-            Divider()
-            HStack {
-                Button(LS("設定…")) { openSettings(); dismiss() }
-                Spacer()
-                Button(LS("終了")) { NSApplication.shared.terminate(nil) }
-            }
+            .padding(14)
         }
-        .padding(14)
-        .frame(width: 390)
+        .frame(width: 420)
+        .frame(maxHeight: 640)
         .task {
             while !Task.isCancelled {
                 await model.refreshStatus()
