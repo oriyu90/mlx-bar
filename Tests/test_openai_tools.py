@@ -138,6 +138,37 @@ def test_malformed_tool_is_rejected_without_internal_error():
         assert response.json()["error"]["code"] == "INVALID_REQUEST"
 
 
+def test_zcode_extra_body_chat_template_kwargs_reach_worker():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        body = request_body()
+        body["extra_body"] = {"chat_template_kwargs": {
+            "enable_thinking": False, "reasoning_effort": "high",
+        }}
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert worker.received[2]["chat_template_kwargs"] == {
+            "enable_thinking": False, "reasoning_effort": "high",
+        }
+
+
+def test_invalid_or_unsafe_extra_body_is_rejected_before_generation():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        invalid_values = (
+            ([], 422),
+            ({"chat_template_kwargs": False}, 422),
+            ({"unknown": True}, 400),
+            ({"chat_template_kwargs": {"tools": []}}, 400),
+        )
+        for extra_body, expected_status in invalid_values:
+            body = request_body()
+            body["extra_body"] = extra_body
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == expected_status
+        assert worker.received is None
+
+
 def test_laguna_tool_markup_is_parsed():
     result = parse_tool_markup(
         '<assistant><think>checking</think><tool_call>read_file'

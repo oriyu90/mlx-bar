@@ -15,15 +15,16 @@ def tool_template_kwargs_attempts(params: dict) -> list[dict]:
     drop tool-calling kwargs so a template that simply doesn't support tools
     doesn't take the whole generation down with it.
     """
+    template_kwargs = dict(params.get("chat_template_kwargs") or {})
     tools = params.get("tools")
     if not tools:
-        return [{}]
+        return [template_kwargs]
     attempts = []
     tool_choice = params.get("tool_choice")
     if tool_choice is not None:
-        attempts.append({"tools": tools, "tool_choice": tool_choice})
-    attempts.append({"tools": tools})
-    attempts.append({})
+        attempts.append({**template_kwargs, "tools": tools, "tool_choice": tool_choice})
+    attempts.append({**template_kwargs, "tools": tools})
+    attempts.append(template_kwargs)
     return attempts
 
 

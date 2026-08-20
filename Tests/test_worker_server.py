@@ -141,6 +141,35 @@ def test_mlx_lm_sampling_parameters_reach_sampler_and_logits_processors():
     assert captured["generate"]["logits_processors"] == ["processor"]
 
 
+def test_mlx_lm_chat_template_kwargs_are_preserved_with_tools():
+    captured = []
+    mlx_lm = ModuleType("mlx_lm")
+
+    def stream_generate(_model, _processor, **_kwargs):
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(*_args, **kwargs):
+        captured.append(kwargs)
+        if "tool_choice" in kwargs:
+            raise TypeError("tool_choice unsupported")
+        return "prompt"
+
+    mlx_lm.stream_generate = stream_generate
+    adapter = MLXLMAdapter()
+    adapter.model = object()
+    adapter.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
+    with patch.dict(sys.modules, {"mlx_lm": mlx_lm}):
+        events = list(adapter.stream("request", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "read"}}],
+            "tool_choice": "auto",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }))
+    assert events == [{"type": "delta", "text": "ok"}]
+    assert captured[-1]["enable_thinking"] is False
+    assert "tool_choice" not in captured[-1]
+
+
 def test_mlx_vlm_retries_without_tool_choice_when_template_rejects_it():
     captured = {}
     mlx_vlm = ModuleType("mlx_vlm")
@@ -167,6 +196,34 @@ def test_mlx_vlm_retries_without_tool_choice_when_template_rejects_it():
         }))
     assert events == [{"type": "delta", "text": "ok"}]
     assert captured["prompt"] == "templated prompt"
+
+
+def test_mlx_vlm_chat_template_kwargs_reach_template():
+    captured = {}
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**_kwargs):
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(_processor, _config, _prompt, **kwargs):
+        captured.update(kwargs)
+        return "templated prompt"
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = apply_chat_template
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": "max"},
+        }))
+    assert events == [{"type": "delta", "text": "ok"}]
+    assert captured["enable_thinking"] is False
+    assert captured["reasoning_effort"] == "max"
 
 
 def test_mlx_vlm_retries_without_tools_when_template_rejects_them_entirely():

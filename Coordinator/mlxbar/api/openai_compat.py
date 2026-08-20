@@ -15,6 +15,9 @@ from .images import resolve_public_images
 
 router = APIRouter()
 SUPPORTED_ROLES = {"system", "developer", "user", "assistant", "tool"}
+RESERVED_CHAT_TEMPLATE_KWARGS = {
+    "add_generation_prompt", "num_images", "tokenize", "tool_choice", "tools",
+}
 
 
 def app_state(request: Request):
@@ -64,12 +67,13 @@ async def chat(request: Request, body: dict):
                "top_p", "frequency_penalty", "presence_penalty", "seed", "n", "user", "logprobs",
                "repetition_penalty", "repetition_context_size",
                "top_logprobs", "response_format", "logit_bias", "modalities", "prediction", "audio",
-               "reasoning_effort", "service_tier", "metadata", "store"}
+               "reasoning_effort", "service_tier", "metadata", "store", "extra_body"}
     unsupported = set(body) - allowed
     if unsupported:
         raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER", "parameters": sorted(unsupported)})
     if not isinstance(body.get("stream", False), bool):
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "stream must be a boolean", "param": "stream"})
+    chat_template_kwargs = _normalize_extra_body(body.get("extra_body"))
     stream_options = body.get("stream_options")
     if stream_options is not None:
         if not body.get("stream") or not isinstance(stream_options, dict):
@@ -155,6 +159,8 @@ async def chat(request: Request, body: dict):
                "max_tokens": max_tokens,
                "tools": effective_tools, "tool_choice": tool_choice,
                "parallel_tool_calls": body.get("parallel_tool_calls", True)}
+    if chat_template_kwargs:
+        options["chat_template_kwargs"] = chat_template_kwargs
     for key in ("frequency_penalty", "presence_penalty", "seed", "stop"):
         if key in body:
             options[key] = body[key]
@@ -387,6 +393,28 @@ def _normalize_input_tool_calls(calls: list) -> list[dict]:
     if len(result) != len(calls):
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "tool_calls形式が不正です"})
     return result
+
+
+def _normalize_extra_body(value) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "extra_bodyはオブジェクトで指定してください", "param": "extra_body"})
+    unsupported = set(value) - {"chat_template_kwargs"}
+    if unsupported:
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "parameters": [f"extra_body.{key}" for key in sorted(unsupported)]})
+    kwargs = value.get("chat_template_kwargs", {})
+    if not isinstance(kwargs, dict):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "chat_template_kwargsはオブジェクトで指定してください",
+            "param": "extra_body.chat_template_kwargs"})
+    reserved = set(kwargs) & RESERVED_CHAT_TEMPLATE_KWARGS
+    if reserved:
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "parameters": [f"extra_body.chat_template_kwargs.{key}" for key in sorted(reserved)]})
+    return dict(kwargs)
 
 
 def _normalize_tools(value) -> list[dict]:

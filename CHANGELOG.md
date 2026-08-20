@@ -2,6 +2,16 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.3] - 2026-08-20
+
+### 修正
+
+- **ZCodeがOpenAI互換APIへ送る`extra_body.chat_template_kwargs`をHTTP 400 `UNSUPPORTED_PARAMETER`で拒否する問題を修正しました。** `extra_body`の形をCoordinatorで検証し、`enable_thinking`や`reasoning_effort`などのモデル固有値をmlx-lm・mlx-vlm両方のチャットテンプレートまで伝播するようにしました。tool callingの段階的フォールバック時にもこれらの値を保持します。MLXBar自身が管理する`tools`、`tool_choice`、`tokenize`等の上書きは入口で拒否します。
+
+### 検証
+
+- ZCode形式の正常系、不正入力、mlx-lm・mlx-vlmへの伝播、tool calling併用を回帰テストに追加し、Pythonテスト138件とSwiftのリリースビルドが成功しました。
+
 ## [1.3.2] - 2026-08-20
 
 外部クライアント(ZCode)からmlx-vlmモデルへ接続した際に生成が失敗する不具合を修正するパッチリリースです。

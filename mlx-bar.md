@@ -5,6 +5,12 @@
 
 ## 未解決の課題
 
+### ZCodeの`extra_body.chat_template_kwargs`対応（2026-08-20対応）
+- 症状: ZCode 3.2.5が`POST /v1/chat/completions`に`{"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`を追加すると、Coordinatorが`extra_body`を未対応パラメータと判定してHTTP 400 `UNSUPPORTED_PARAMETER`を返していた。モデルロードや量子化、生成Workerに到達する前のAPI入力検証が原因。
+- 修正: [openai_compat.py](Coordinator/mlxbar/api/openai_compat.py)で`extra_body.chat_template_kwargs`を検証・抽出し、Worker生成オプションへ追加。[tool_calls.py](Workers/common/tool_calls.py)のテンプレート引数フォールバックの各段階で値を保持し、mlx-lmの`processor.apply_chat_template`とmlx-vlmの`prompt_utils.apply_chat_template`の両方へ届ける。
+- 境界: `chat_template_kwargs`はモデル固有拡張のため任意のJSON値を伝播するが、MLXBarのAPI処理と衝突する`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`は予約済みとして拒否する。`extra_body`内の未対応項目も従来の厳密なAPI検証に合わせて拒否する。LM Studio経路はMLXテンプレートを使わないため伝播対象外。
+- 検証: API正常系・不正系、両Workerへの伝播、tool callingフォールバック時の保持をテストし、Pythonテスト138件が成功。Swiftは変更していないが、互換SDKを明示したリリースビルドも成功。
+
 ### 設定画面（Settings）の横幅が広すぎる
 - APIサーバーページなど、コンテンツが約650pxしか使っていないのにウィンドウ幅が約900pxあり、余白が目立つ。この「無駄な余白」自体はv1.2.3でも未解消（モデルタブの横はみ出し・見切れの方を修正した）。
 - 次に試すなら: `NavigationSplitView`をやめて`HSplitView`やカスタムレイアウトに置き換える方向で検討する。
