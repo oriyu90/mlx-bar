@@ -82,6 +82,15 @@ class BaseAdapter:
         except Exception:
             pass
 
+    def clear_prompt_cache(self) -> None:
+        """Release optional cross-request state without unloading the model."""
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            pass
+
     def memory_stats(self) -> dict:
         result = {"active_bytes": 0, "cache_bytes": 0, "peak_bytes": 0}
         try:
@@ -147,6 +156,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             if method == "unload":
                 await on_mlx_thread(adapter.unload)
                 return {"type": "completed"}
+            if method == "clear_prompt_cache":
+                await on_mlx_thread(adapter.clear_prompt_cache)
+                return {"type": "completed"}
             if method == "cancel":
                 adapter.cancelled.add(params.get("request_id", ""))
                 return {"cancelled": True, "forced": False}
@@ -177,6 +189,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 started = time.monotonic()
                 last_visible_event = started
                 count = 0
+                upstream_metrics = {}
                 buffered = ""
                 tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
                 tool_stream = IncrementalToolStream() if tool_mode else None
@@ -195,12 +208,15 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         break
                     if request_id in adapter.cancelled:
                         adapter.cancelled.discard(request_id)
+                        close = getattr(iterator, "close", None)
+                        if callable(close):
+                            await on_mlx_thread(close)
                         yield json.dumps({"type": "completed", "finish_reason": "cancelled"}) + "\n"
                         return
-                    count += 1
                     if tool_mode and event.get("type") == "reasoning_start":
                         tool_stream.start_reasoning()
                     elif tool_mode and event.get("type") == "delta":
+                        count += 1
                         buffered += str(event.get("text", ""))
                         visible_events = tool_stream.feed(str(event.get("text", "")))
                         for visible in visible_events:
@@ -210,6 +226,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                             yield json.dumps({"type": "heartbeat", "phase": "tool_parse",
                                               "elapsed_seconds": round(time.monotonic() - started, 1)}) + "\n"
                             last_visible_event = time.monotonic()
+                    elif event.get("type") == "delta":
+                        count += 1
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                        last_visible_event = time.monotonic()
+                    elif event.get("type") == "metrics":
+                        upstream_metrics.update(event)
                     else:
                         yield json.dumps(event, ensure_ascii=False) + "\n"
                         last_visible_event = time.monotonic()
@@ -227,7 +249,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                                           "message": "モデルのtool callを解析できませんでした",
                                           "retryable": False}, ensure_ascii=False) + "\n"
                         return
-                yield json.dumps({"type": "metrics", "generation_tps": count / elapsed}) + "\n"
+                metrics = {"type": "metrics", "generation_tps": count / elapsed,
+                           **upstream_metrics}
+                yield json.dumps(metrics) + "\n"
                 yield json.dumps({"type": "completed", "finish_reason": finish_reason}) + "\n"
             except Exception as exc:
                 yield json.dumps({"type": "error", "code": "GENERATION_FAILED", "message": str(exc)[-1000:],

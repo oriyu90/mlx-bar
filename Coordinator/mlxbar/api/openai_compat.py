@@ -69,6 +69,8 @@ async def chat(request: Request, body: dict):
         "stream": body.get("stream") if isinstance(body.get("stream"), bool) else False,
         "message_count": len(messages_for_log) if isinstance(messages_for_log, list) else 0,
         "tool_count": len(tools_for_log) if isinstance(tools_for_log, list) else 0,
+        "message_chars": _json_size(messages_for_log),
+        "tool_schema_chars": _json_size(tools_for_log),
     }
     # OpenAI-compatible clients routinely add provider-specific extension fields.
     # Unknown fields are intentionally ignored; known fields are validated below.
@@ -162,6 +164,8 @@ async def chat(request: Request, body: dict):
                "parallel_tool_calls": body.get("parallel_tool_calls", True)}
     if chat_template_kwargs:
         options["chat_template_kwargs"] = chat_template_kwargs
+    request.state.api_log.update({"max_tokens": max_tokens,
+                                  "reasoning_mode": _reasoning_mode(chat_template_kwargs)})
     for key in ("frequency_penalty", "presence_penalty", "seed", "stop"):
         if key in body:
             options[key] = body[key]
@@ -196,6 +200,14 @@ async def chat(request: Request, body: dict):
             created = int(time.time())
             completed = False
             failed = False
+
+            def mark_first_token() -> None:
+                if request.state.api_log.get("first_token_ms") is not None:
+                    return
+                origin = getattr(request.state, "api_started_monotonic", None)
+                if origin is not None:
+                    request.state.api_log["first_token_ms"] = round(
+                        (time.monotonic() - origin) * 1000)
             try:
                 initial = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                            "model": response_model, "choices": [{"index": 0,
@@ -204,6 +216,7 @@ async def chat(request: Request, body: dict):
                 async for event in app_state(request).workers.generate(
                         normalized_messages, images, options, request_id, image_root=image_root):
                     if event.get("type") == "delta":
+                        mark_first_token()
                         completion_text += event["text"]
                         usage = _usage(normalized_messages, completion_text)
                         delta = {"content": event["text"]}
@@ -212,15 +225,18 @@ async def chat(request: Request, body: dict):
                                  "delta": delta, "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "reasoning_delta":
+                        mark_first_token()
                         chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
                                  "delta": {"reasoning_content": event.get("text", "")},
                                  "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_calls":
+                        mark_first_token()
                         for chunk in _tool_call_stream_chunks(request_id, response_model, event.get("calls") or [], created):
                             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_call_delta":
+                        mark_first_token()
                         chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
                                  "delta": {"role": "assistant", "tool_calls": event.get("calls") or []},
@@ -239,6 +255,11 @@ async def chat(request: Request, body: dict):
                         completed = True
                     elif event.get("type") == "usage":
                         usage = _usage_from_event(event, usage)
+                        request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
+                    elif event.get("type") == "metrics":
+                        for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps"):
+                            if event.get(key) is not None:
+                                request.state.api_log[key] = event[key]
                     elif event.get("type") in {"phase", "heartbeat", "queue"}:
                         # SSE comments are ignored by OpenAI clients, but keep the
                         # connection alive during long tokenization/prefill.
@@ -281,6 +302,11 @@ async def chat(request: Request, body: dict):
         async for event in app_state(request).workers.generate(
                 normalized_messages, images, options, request_id, image_root=image_root):
             if event.get("type") == "delta":
+                if request.state.api_log.get("first_token_ms") is None:
+                    origin = getattr(request.state, "api_started_monotonic", None)
+                    if origin is not None:
+                        request.state.api_log["first_token_ms"] = round(
+                            (time.monotonic() - origin) * 1000)
                 text += event["text"]
             elif event.get("type") == "tool_calls":
                 tool_calls = _normalize_output_tool_calls(event.get("calls") or [])
@@ -291,6 +317,11 @@ async def chat(request: Request, body: dict):
                 finish_reason = event.get("finish_reason") or finish_reason
             elif event.get("type") == "usage":
                 usage = _usage_from_event(event)
+                request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
+            elif event.get("type") == "metrics":
+                for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps"):
+                    if event.get(key) is not None:
+                        request.state.api_log[key] = event[key]
             elif event.get("type") == "error":
                 raise MLXBarError(event.get("code", "GENERATION_FAILED"),
                                   event.get("message", "生成に失敗しました"), 502,
@@ -426,6 +457,28 @@ def _normalize_extra_body(value) -> dict:
     if reasoning_effort is not None:
         _apply_reasoning_effort(result, reasoning_effort, "extra_body.reasoning_effort")
     return result
+
+
+def _json_size(value) -> int:
+    """Return serialized character count without retaining private content."""
+    if value is None:
+        return 0
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reasoning_mode(kwargs: dict) -> str:
+    if kwargs.get("enable_thinking") is False:
+        return "disabled"
+    effort = kwargs.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        normalized = effort.strip().casefold()
+        return normalized if normalized in {"none", "minimal", "low", "medium", "high", "xhigh"} else "custom"
+    if kwargs.get("enable_thinking") is True:
+        return "enabled"
+    return "model_default"
 
 
 def _normalize_chat_template_kwargs(body: dict) -> dict:

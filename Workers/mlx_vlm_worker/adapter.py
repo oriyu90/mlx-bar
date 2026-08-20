@@ -14,11 +14,21 @@ class MLXVLMAdapter(BaseAdapter):
     def __init__(self):
         super().__init__()
         self.modalities = ["text", "image"]
+        self.prompt_cache_state = None
 
     def capabilities(self) -> dict:
         result = super().capabilities()
         result["modalities"] = self.modalities
+        result["promptCaching"] = self.prompt_cache_state is not None
         return result
+
+    def _reset_prompt_cache(self) -> None:
+        try:
+            from mlx_vlm.generate import PromptCacheState
+            self.prompt_cache_state = PromptCacheState()
+        except (ImportError, AttributeError):
+            # Older runtime slots remain usable without the optimization.
+            self.prompt_cache_state = None
 
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         if not path:
@@ -30,7 +40,17 @@ class MLXVLMAdapter(BaseAdapter):
         self.modalities = ["text", "image"] if has_visual_input else ["text"]
         from mlx_vlm import load
         self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
+        self._reset_prompt_cache()
         return self.capabilities()
+
+    def unload(self) -> None:
+        self.prompt_cache_state = None
+        super().unload()
+
+    def clear_prompt_cache(self) -> None:
+        self.prompt_cache_state = None
+        super().clear_prompt_cache()
+        self._reset_prompt_cache()
 
     def stream(self, request_id: str, params: dict):
         if self.model is None:
@@ -68,13 +88,39 @@ class MLXVLMAdapter(BaseAdapter):
                 kwargs[key] = value
         if images:
             kwargs["image"] = images if len(images) > 1 else images[0]
+        elif self.prompt_cache_state is not None:
+            # PromptCacheState reuses the longest token prefix from the previous
+            # text request. Never share it with image requests: equal image
+            # placeholder tokens do not prove that the underlying pixels match.
+            kwargs["prompt_cache_state"] = self.prompt_cache_state
         tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
         if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
-        for response in stream_generate(**kwargs):
-            text = getattr(response, "text", response if isinstance(response, str) else "")
-            if text:
-                yield {"type": "delta", "text": text}
+        last_response = None
+        completed = False
+        try:
+            for response in stream_generate(**kwargs):
+                last_response = response
+                text = getattr(response, "text", response if isinstance(response, str) else "")
+                if text:
+                    yield {"type": "delta", "text": text}
+            completed = True
+        finally:
+            if not completed and kwargs.get("prompt_cache_state") is not None:
+                # stream_generate mutates a reused cache in place. A cancelled
+                # or failed iteration cannot leave token_ids paired with a
+                # partially advanced cache.
+                self._reset_prompt_cache()
+        if (last_response is not None and not isinstance(last_response, str)
+                and hasattr(last_response, "prompt_tokens")):
+            yield {"type": "usage",
+                   "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
+                   "completion_tokens": int(getattr(last_response, "generation_tokens", 0) or 0)}
+            yield {"type": "metrics",
+                   "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
+                   "cached_tokens": int(getattr(last_response, "cached_tokens", 0) or 0),
+                   "prompt_tps": float(getattr(last_response, "prompt_tps", 0.0) or 0.0),
+                   "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
 
     def finalize(self, text: str, params: dict) -> dict:
         tools = params.get("tools") or []

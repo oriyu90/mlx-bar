@@ -8,7 +8,7 @@ APP_DIR="$DIST_DIR/MLXBar.app"
 CONTENTS="$APP_DIR/Contents"
 PYINSTALLER_DIR="$PROJECT_DIR/.release-python"
 DMG_STAGE="$PROJECT_DIR/.dmg-stage"
-VERSION=1.3.6
+VERSION=1.3.7
 
 export SWIFT_MODULE_CACHE_PATH="$PROJECT_DIR/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache"

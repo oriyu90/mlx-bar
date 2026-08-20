@@ -718,7 +718,16 @@ class WorkerSupervisor:
             physical = int(memory.get("physical_memory_bytes", 0))
             limit = float(self.settings.data["generation"]["memoryLimitRatio"])
             if physical > 0 and used / physical >= limit:
-                raise MLXBarError("MEMORY_PRESSURE", "MLXメモリ使用量が安全上限に達しているため生成を中止しました", 503, True)
+                # A retained ZCode prefix is disposable. Drop it once before
+                # rejecting the request so caching cannot turn memory safety
+                # into a persistent failure mode.
+                await self._call("clear_prompt_cache", {}, timeout=5)
+                result = await self._call("memory", {}, timeout=5)
+                memory = result.get("memory", {})
+                used = int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0))
+                physical = int(memory.get("physical_memory_bytes", 0))
+                if physical > 0 and used / physical >= limit:
+                    raise MLXBarError("MEMORY_PRESSURE", "MLXメモリ使用量が安全上限に達しているため生成を中止しました", 503, True)
         except MLXBarError:
             raise
         except Exception:

@@ -94,15 +94,25 @@ def tool_template_kwargs_attempts(params: dict) -> list[dict]:
     """
     template_kwargs = dict(params.get("chat_template_kwargs") or {})
     tools = params.get("tools")
-    if not tools:
-        return [template_kwargs]
     attempts = []
     tool_choice = params.get("tool_choice")
-    if tool_choice is not None:
+    if tools and tool_choice is not None:
         attempts.append({**template_kwargs, "tools": tools, "tool_choice": tool_choice})
-    attempts.append({**template_kwargs, "tools": tools})
+    if tools:
+        attempts.append({**template_kwargs, "tools": tools})
     attempts.append(template_kwargs)
-    return attempts
+    # OpenAI clients use high/minimal while Qwen's template uses xhigh/low.
+    # Keep the client spelling as the first attempt for generic templates and
+    # only try the Qwen-equivalent spelling after that rendering fails.
+    aliases = {"high": "xhigh", "minimal": "low"}
+    expanded = []
+    for attempt in attempts:
+        expanded.append(attempt)
+        effort = attempt.get("reasoning_effort")
+        alias = aliases.get(effort.casefold()) if isinstance(effort, str) else None
+        if alias:
+            expanded.append({**attempt, "reasoning_effort": alias})
+    return expanded
 
 
 def _argument(value: str):

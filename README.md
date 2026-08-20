@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.3.6 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.3.7 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -38,7 +38,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.3.6.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.3.7.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -209,6 +209,12 @@ ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルま
 
 tool calling有効時も通常本文を生成中に逐次配信します。Qwen等のthinking部分はストリームの`delta.reasoning_content`へ分離し、`<think>`や`<tool_call>`の内部マークアップを通常本文へ漏らしません。tool callの開始後だけ解析用に保持してOpenAI形式の`delta.tool_calls`へ変換します。解析不能なtool callは無言で終了せず`TOOL_PARSE_FAILED`を返します。
 
+mlx-vlmのテキスト要求では、直前要求との最長共通token prefixを安全に再利用します。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
+
+APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
+
+OpenAI系クライアントの`reasoning_effort=high` / `minimal`は最初に原値でテンプレートへ渡し、Qwenが拒否した場合だけ同等の`xhigh` / `low`へ再試行します。汎用テンプレートのOpenAI表記を優先しながらQwenのdialectにも対応します。
+
 v1.1.0のストリームは、全チャンクで同一の`id`と`created`を維持し、終了理由を持つチャンクを1回だけ送信します。長時間処理中はSSEコメントで接続を維持し、正常時は任意のusageチャンクの後に`data: [DONE]`で終了します。不正なJSON形状、`stream`、`stream_options`、token上限はOpenAI形式の`error`で返し、モデル実行前に終了します。
 
 ### Open Interpreter
@@ -289,7 +295,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.3.6.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.3.7.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

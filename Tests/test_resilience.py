@@ -371,6 +371,22 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
             await supervisor._ensure_memory_capacity()
         self.assertEqual(raised.exception.code, "MEMORY_PRESSURE")
 
+    async def test_memory_pressure_discards_prompt_cache_before_rejecting(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        calls = []
+
+        async def memory(method, _params, timeout=30):
+            calls.append(method)
+            if method == "clear_prompt_cache":
+                return {"type": "completed"}
+            used = 95 if calls.count("memory") == 1 else 70
+            return {"memory": {"active_bytes": used, "cache_bytes": 0,
+                               "physical_memory_bytes": 100}}
+
+        supervisor._call = memory
+        await supervisor._ensure_memory_capacity()
+        self.assertEqual(calls, ["memory", "clear_prompt_cache", "memory"])
+
 
 class ErrorWorker:
     loaded = {"id": "model"}

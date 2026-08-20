@@ -59,10 +59,22 @@ class MLXLMAdapter(BaseAdapter):
         tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
         if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
+        last_response = None
         for response in stream_generate(self.model, self.processor, **kwargs):
+            last_response = response
             text = getattr(response, "text", response if isinstance(response, str) else "")
             if text:
                 yield {"type": "delta", "text": text}
+        if (last_response is not None and not isinstance(last_response, str)
+                and hasattr(last_response, "prompt_tokens")):
+            yield {"type": "usage",
+                   "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
+                   "completion_tokens": int(getattr(last_response, "generation_tokens", 0) or 0)}
+            yield {"type": "metrics",
+                   "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
+                   "cached_tokens": int(getattr(last_response, "cached_tokens", 0) or 0),
+                   "prompt_tps": float(getattr(last_response, "prompt_tps", 0.0) or 0.0),
+                   "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
 
     def finalize(self, text: str, params: dict) -> dict:
         tools = params.get("tools") or []

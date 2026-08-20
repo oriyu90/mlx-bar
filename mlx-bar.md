@@ -5,6 +5,15 @@
 
 ## 未解決の課題
 
+### ZCodeのlarge tool prefixによるcold prefill遅延（2026-08-21対応）
+- 実機証拠: v1.3.6の直近ZCode要求は`stream=true`、messages 4件、tools 23件、HTTP 200で33.124秒。制御実験では同じQwenをthinking無効・toolsなしでfirst content 0.946秒、23 tools付きで7.506秒となり、thinking強度ではなくtool promptのprefillが差の中心だった。
+- 根本原因: v1.3.6は生成開始後の全量バッファを解消したが、各OpenAI Chat Completions要求を独立生成として`mlx_vlm.stream_generate`へ渡し、ZCodeが毎ターン再送するsystem prompt・tools schema・履歴の同一prefixも毎回先頭から計算していた。27B 8bitの実tool schemaは大きく、first token前のcold prefill中はSSE keep-aliveしか返せない。
+- 修正: mlx-vlm 0.6.15公式の`PromptCacheState`をWorkerのモデル寿命に合わせて1個保持し、テキスト要求の最長共通token prefixを再利用する。キャッシュは直前系列1件だけなので無制限に増えない。OpenAI入力のmessages/toolsやモデル出力は変更しない。
+- 安全境界: 画像のplaceholder tokenは画像内容の同一性を保証しないため画像要求へキャッシュを渡さない。生成キャンセル・例外時はin-place更新された途中キャッシュを破棄する。キャッシュ保持でメモリ比率が安全上限へ達した場合は`clear_prompt_cache` RPCで解放後に再測定し、それでも高い場合だけ`MEMORY_PRESSURE`を返す。古いmlx-vlmに`PromptCacheState`がない場合は最適化なしで継続する。
+- 可観測性: APIログへ本文・tool定義・キーを保存せず、文字数、first-token時間、prompt/cached tokens、prompt/generation TPS、推論モードだけを追加。既存SQLiteには追加列を自動migrationする。
+- 推論強度dialect: 汎用テンプレートとの互換性を保つためOpenAIの`high` / `minimal`を原値で先にrenderし、失敗時だけQwen相当の`xhigh` / `low`を再試行する。明示された`none`は従来どおりthinking無効化へ変換する。
+- 実モデル評価: 23 tools・55,881 schema文字・10,677 prompt tokensのcold要求はfirst delta 35.253秒／total 35.299秒。会話を1ターン延長したwarm要求は10,688 cached tokens、first delta 0.399秒／total 0.406秒、prompt TPS 308.92→36,911.43で約88倍のTTFT改善。モデルロード直後や共通prefixがない最初の要求は原理上cold prefillが残る。
+
 ### ZCode tool calling時の無表示・全量バッファ（2026-08-21対応）
 - 実機証拠: v1.3.5のZCode要求はHTTP 400ではなく200になったが、`stream: true`、ツール20件、会話履歴最大236件で、完了まで42〜519秒を要した。Workerクラッシュも1回記録。最小のQwen＋thinking＋1 tool要求でも、空の初期チャンクとkeep-aliveだけが55秒続き、本文が完了時に一括到着した。
 - 原因: [server.py](Workers/common/server.py)がtools有効時の全`delta`を`buffered`へ追加し、生成完了後のtool parserまで外部へ出していなかった。クイックチャットはtoolsなしのため逐次配信され、症状差と一致する。

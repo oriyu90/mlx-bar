@@ -37,6 +37,15 @@ class ThreadBoundAdapter(BaseAdapter):
         yield {"type": "delta", "text": "OK"}
 
 
+class CacheAwareAdapter(ThreadBoundAdapter):
+    def __init__(self):
+        super().__init__()
+        self.cache_cleared = False
+
+    def clear_prompt_cache(self) -> None:
+        self.cache_cleared = True
+
+
 def test_load_and_generation_use_the_same_dedicated_thread():
     adapter = ThreadBoundAdapter()
     with TestClient(create_app(adapter)) as client:
@@ -55,6 +64,16 @@ def test_load_and_generation_use_the_same_dedicated_thread():
     assert generated.status_code == 200
     assert '"text": "OK"' in generated.text
     assert "different thread" not in generated.text
+
+
+def test_worker_exposes_prompt_cache_clear_rpc():
+    adapter = CacheAwareAdapter()
+    with TestClient(create_app(adapter)) as client:
+        response = client.post("/rpc", json={
+            "protocol_version": 1, "method": "clear_prompt_cache", "params": {},
+        })
+    assert response.status_code == 200
+    assert adapter.cache_cleared is True
 
 
 class SlowPrefillAdapter(ThreadBoundAdapter):
@@ -291,6 +310,35 @@ def test_mlx_vlm_chat_template_kwargs_reach_template():
     assert captured["reasoning_effort"] == "max"
 
 
+def test_mlx_vlm_retries_openai_high_as_qwen_xhigh():
+    captured = []
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**_kwargs):
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(_processor, _config, _prompt, **kwargs):
+        captured.append(kwargs.get("reasoning_effort"))
+        if kwargs.get("reasoning_effort") == "high":
+            raise ValueError("Qwen supports xhigh, medium, and low")
+        return "prompt"
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = apply_chat_template
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        }))
+    assert events == [{"type": "delta", "text": "ok"}]
+    assert captured == ["high", "xhigh"]
+
+
 def test_mlx_vlm_retries_without_tools_when_template_rejects_them_entirely():
     """A template with no tool-calling support at all can fail deep inside Jinja2
     rendering (e.g. UndefinedError), not with a clean TypeError. That must still
@@ -364,6 +412,7 @@ def test_mlx_vlm_sampling_parameters_reach_stream_generate():
     adapter.model = SimpleNamespace(config=object())
     adapter.processor = object()
     adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
     with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
         events = list(adapter.stream("request", {"prompt": "hello", "temperature": 0.4,
             "top_p": 0.76, "repetition_penalty": 1.09, "repetition_context_size": 48,
@@ -375,3 +424,79 @@ def test_mlx_vlm_sampling_parameters_reach_stream_generate():
     assert captured["repetition_context_size"] == 48
     assert captured["presence_penalty"] == 0.1
     assert captured["frequency_penalty"] == 0.2
+    assert captured["prompt_cache_state"] is adapter.prompt_cache_state
+
+
+def test_mlx_vlm_prompt_cache_is_not_shared_with_image_requests():
+    captured = {}
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**kwargs):
+        captured.update(kwargs)
+        yield SimpleNamespace(text="ok")
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text", "image"]
+    adapter.prompt_cache_state = object()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        list(adapter.stream("request", {"prompt": "hello", "images": ["/private/image.png"]}))
+    assert captured["image"] == "/private/image.png"
+    assert "prompt_cache_state" not in captured
+
+
+def test_mlx_vlm_reports_runtime_usage_and_cache_metrics():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    def stream_generate(**_kwargs):
+        yield SimpleNamespace(text="ok", prompt_tokens=4096, generation_tokens=7,
+                              cached_tokens=3900, prompt_tps=850.5, generation_tps=12.25)
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {"prompt": "hello"}))
+    assert events[-2] == {"type": "usage", "prompt_tokens": 4096, "completion_tokens": 7}
+    assert events[-1] == {"type": "metrics", "prompt_tokens": 4096,
+                          "cached_tokens": 3900, "prompt_tps": 850.5,
+                          "generation_tps": 12.25}
+
+
+def test_mlx_vlm_cancelled_stream_discards_mutated_prompt_cache():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    generate_module = ModuleType("mlx_vlm.generate")
+
+    class PromptCacheState:
+        pass
+
+    def stream_generate(**_kwargs):
+        yield SimpleNamespace(text="first")
+        yield SimpleNamespace(text="second")
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    generate_module.PromptCacheState = PromptCacheState
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    original = PromptCacheState()
+    adapter.prompt_cache_state = original
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils,
+                                  "mlx_vlm.generate": generate_module}):
+        iterator = adapter.stream("request", {"prompt": "hello"})
+        assert next(iterator) == {"type": "delta", "text": "first"}
+        iterator.close()
+    assert isinstance(adapter.prompt_cache_state, PromptCacheState)
+    assert adapter.prompt_cache_state is not original

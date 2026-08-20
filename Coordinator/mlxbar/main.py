@@ -70,6 +70,7 @@ def make_public_app(state: AppState) -> FastAPI:
     @app.middleware("http")
     async def recent_api_log(request: Request, call_next):
         started = time.monotonic()
+        request.state.api_started_monotonic = started
         status = 500
         error_code = None
         recorded = False
@@ -89,6 +90,15 @@ def make_public_app(state: AppState) -> FastAPI:
                     "model": details.get("model"), "stream": details.get("stream", False),
                     "message_count": details.get("message_count", 0),
                     "tool_count": details.get("tool_count", 0),
+                    "message_chars": details.get("message_chars", 0),
+                    "tool_schema_chars": details.get("tool_schema_chars", 0),
+                    "max_tokens": details.get("max_tokens", 0),
+                    "reasoning_mode": details.get("reasoning_mode"),
+                    "first_token_ms": details.get("first_token_ms"),
+                    "prompt_tokens": details.get("prompt_tokens", 0),
+                    "cached_tokens": details.get("cached_tokens", 0),
+                    "prompt_tps": details.get("prompt_tps", 0),
+                    "generation_tps": details.get("generation_tps", 0),
                     "error_code": details.get("error_code") or error_code,
                     "client_scope": "local" if client_host in {"127.0.0.1", "::1", "testclient", ""} else "lan",
                 })

@@ -2,6 +2,21 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.7] - 2026-08-21
+
+### 改善
+
+- **ZCodeからQwen 27Bへ短い挨拶を送るだけでも、最初の応答まで約30秒以上かかる問題を改善しました。** ZCodeは毎ターン多数のtools定義・system指示・履歴を送るため、v1.3.6では同一prefixも27Bモデルが毎回cold prefillしていました。mlx-vlm公式の`PromptCacheState`をテキスト要求へ組み込み、直前要求との最長共通token prefixを再利用します。messages・toolsを省略または改変しないため、OpenAI APIとZCodeのtool calling semanticsを維持します。
+- 画像要求では異なる画像が同じplaceholder tokenを持ち得るためprompt cacheを共有しません。キャンセル・生成失敗時は途中キャッシュを破棄し、メモリ安全上限到達時はキャッシュだけを解放して再判定します。
+- APIアクセスログへ本文を保存しない性能情報（入力/tool定義の文字数、first-token時間、prompt/cached token数、prefill・生成速度、推論モード）を追加しました。既存データベースは起動時に自動移行します。
+- mlx-lm・mlx-vlmが返す実token使用量と生成メトリクスをCoordinatorへ伝播し、ストリームのusage精度を改善しました。
+- OpenAI系クライアントの`reasoning_effort=high` / `minimal`をまずそのまま試し、Qwenテンプレートが拒否した場合だけ`xhigh` / `low`へ再試行します。
+
+### 検証
+
+- 実機の`Qwen3.8-27B-MLX-8bit`と23 tools（55,881文字、10,677 prompt tokens）で、cold時のfirst token 35.253秒に対し、次ターンは10,688 tokensを再利用して0.399秒（約88倍高速）を確認しました。
+- prefix cache、画像分離、キャンセル時破棄、メモリ圧迫時解放、DB移行、性能ログ、usage/metrics、推論強度aliasを回帰テストへ追加し、Pythonテスト156件とSwiftリリースビルドを検証しました。
+
 ## [1.3.6] - 2026-08-21
 
 ### 修正

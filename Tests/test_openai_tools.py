@@ -284,6 +284,58 @@ def test_api_log_is_bounded_and_does_not_store_request_bodies():
         assert database.list_api_logs() == []
 
 
+def test_legacy_api_log_schema_is_migrated_with_performance_columns():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "state.sqlite3"
+        import sqlite3
+        connection = sqlite3.connect(path)
+        connection.execute("""CREATE TABLE api_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT, method TEXT NOT NULL,
+            path TEXT NOT NULL, status INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
+            model TEXT, stream INTEGER NOT NULL DEFAULT 0, message_count INTEGER NOT NULL DEFAULT 0,
+            tool_count INTEGER NOT NULL DEFAULT 0, error_code TEXT,
+            client_scope TEXT NOT NULL DEFAULT 'local', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        connection.commit()
+        connection.close()
+        database = Database(path)
+        columns = {row[1] for row in database.connection.execute("PRAGMA table_info(api_logs)")}
+        assert {"message_chars", "tool_schema_chars", "first_token_ms", "prompt_tokens",
+                "cached_tokens", "prompt_tps", "generation_tps", "reasoning_mode"} <= columns
+
+
+def test_stream_log_records_privacy_safe_prefill_and_cache_metrics():
+    class MetricsWorker(ToolWorker):
+        async def generate(self, *_args, **_kwargs):
+            yield {"type": "delta", "text": "hello"}
+            yield {"type": "usage", "prompt_tokens": 4200, "completion_tokens": 3}
+            yield {"type": "metrics", "prompt_tokens": 4200, "cached_tokens": 4000,
+                   "prompt_tps": 900.5, "generation_tps": 11.25}
+            yield {"type": "completed", "finish_reason": "stop"}
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        database = Database(root / "state.sqlite3")
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=MetricsWorker(), database=database,
+        )
+        response = TestClient(make_public_app(state)).post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e", "stream": True, "max_tokens": 64,
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "private user text"}],
+            "tools": [{"type": "function", "function": {"name": "read",
+                      "description": "private tool description", "parameters": {"type": "object"}}}],
+        })
+        assert response.status_code == 200
+        log = database.list_api_logs(1)[0]
+        assert log["message_chars"] > 0 and log["tool_schema_chars"] > 0
+        assert log["max_tokens"] == 64 and log["reasoning_mode"] == "low"
+        assert log["first_token_ms"] is not None
+        assert log["prompt_tokens"] == 4200 and log["cached_tokens"] == 4000
+        assert log["prompt_tps"] == 900.5 and log["generation_tps"] == 11.25
+        assert not {"messages", "tools", "content", "response"}.intersection(log)
+
+
 def test_rejected_request_records_model_and_error_code_without_body():
     with tempfile.TemporaryDirectory() as directory:
         client, _, database = make_client(Path(directory))
