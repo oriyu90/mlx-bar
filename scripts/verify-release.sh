@@ -3,7 +3,7 @@ set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 APP="$PROJECT_DIR/dist/MLXBar.app"
-DMG="$PROJECT_DIR/dist/MLXBar-${VERSION:-1.3.3}.dmg"
+DMG="$PROJECT_DIR/dist/MLXBar-${VERSION:-1.3.4}.dmg"
 
 test -x "$APP/Contents/MacOS/MLXBar"
 test -x "$APP/Contents/MacOS/MLXBarCoordinator"

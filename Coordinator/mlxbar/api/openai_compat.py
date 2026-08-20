@@ -67,13 +67,13 @@ async def chat(request: Request, body: dict):
                "top_p", "frequency_penalty", "presence_penalty", "seed", "n", "user", "logprobs",
                "repetition_penalty", "repetition_context_size",
                "top_logprobs", "response_format", "logit_bias", "modalities", "prediction", "audio",
-               "reasoning_effort", "service_tier", "metadata", "store", "extra_body"}
+               "reasoning_effort", "thinking", "service_tier", "metadata", "store", "extra_body"}
     unsupported = set(body) - allowed
     if unsupported:
         raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER", "parameters": sorted(unsupported)})
     if not isinstance(body.get("stream", False), bool):
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "stream must be a boolean", "param": "stream"})
-    chat_template_kwargs = _normalize_extra_body(body.get("extra_body"))
+    chat_template_kwargs = _normalize_chat_template_kwargs(body)
     stream_options = body.get("stream_options")
     if stream_options is not None:
         if not body.get("stream") or not isinstance(stream_options, dict):
@@ -415,6 +415,67 @@ def _normalize_extra_body(value) -> dict:
         raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
             "parameters": [f"extra_body.chat_template_kwargs.{key}" for key in sorted(reserved)]})
     return dict(kwargs)
+
+
+def _normalize_chat_template_kwargs(body: dict) -> dict:
+    kwargs = _normalize_extra_body(body.get("extra_body"))
+    thinking = body.get("thinking")
+    if thinking is not None:
+        for key, value in _normalize_thinking(thinking).items():
+            kwargs.setdefault(key, value)
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str) or not reasoning_effort.strip():
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+                "message": "reasoning_effortは空でない文字列で指定してください",
+                "param": "reasoning_effort"})
+        effort = reasoning_effort.strip().casefold()
+        kwargs.setdefault("reasoning_effort", effort)
+        if effort == "none":
+            kwargs.setdefault("enable_thinking", False)
+    return kwargs
+
+
+def _normalize_thinking(value) -> dict:
+    if isinstance(value, bool):
+        return {"enable_thinking": value}
+    if not isinstance(value, dict):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "thinkingはブール値またはオブジェクトで指定してください", "param": "thinking"})
+    unsupported = set(value) - {"type", "budget_tokens", "clear_thinking"}
+    if unsupported:
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "parameters": [f"thinking.{key}" for key in sorted(unsupported)]})
+    if not value:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "thinkingにtypeまたはbudget_tokensを指定してください", "param": "thinking"})
+    result = {}
+    thinking_type = value.get("type")
+    if thinking_type is not None:
+        if not isinstance(thinking_type, str) or thinking_type not in {"enabled", "disabled", "adaptive"}:
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+                "message": "thinking.typeはenabled、disabled、adaptiveのいずれかです",
+                "param": "thinking.type"})
+        result["enable_thinking"] = thinking_type != "disabled"
+    budget = value.get("budget_tokens")
+    if budget is not None:
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+                "message": "thinking.budget_tokensは正の整数で指定してください",
+                "param": "thinking.budget_tokens"})
+        result.setdefault("enable_thinking", True)
+        result["thinking_budget"] = budget
+    clear_thinking = value.get("clear_thinking")
+    if clear_thinking is not None:
+        if not isinstance(clear_thinking, bool):
+            raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+                "message": "thinking.clear_thinkingはブール値で指定してください",
+                "param": "thinking.clear_thinking"})
+        result["preserve_thinking"] = not clear_thinking
+    if not result:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "thinkingにtypeまたはbudget_tokensを指定してください", "param": "thinking"})
+    return result
 
 
 def _normalize_tools(value) -> list[dict]:

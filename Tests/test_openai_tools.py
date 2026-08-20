@@ -152,6 +152,54 @@ def test_zcode_extra_body_chat_template_kwargs_reach_worker():
         }
 
 
+def test_zcode_thinking_and_reasoning_effort_are_normalized_for_qwen():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        body = request_body()
+        body.update({
+            "thinking": {"type": "enabled", "budget_tokens": 4096, "clear_thinking": False},
+            "reasoning_effort": "XHIGH",
+        })
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert worker.received[2]["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "thinking_budget": 4096,
+            "preserve_thinking": True,
+            "reasoning_effort": "xhigh",
+        }
+
+
+def test_explicit_chat_template_kwargs_override_normalized_thinking_values():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        body = request_body()
+        body.update({
+            "extra_body": {"chat_template_kwargs": {
+                "enable_thinking": False, "reasoning_effort": "low",
+            }},
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "xhigh",
+        })
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert worker.received[2]["chat_template_kwargs"] == {
+            "enable_thinking": False, "reasoning_effort": "low",
+        }
+
+
+def test_reasoning_effort_none_disables_thinking_when_not_explicitly_configured():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        body = request_body()
+        body["reasoning_effort"] = "none"
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert worker.received[2]["chat_template_kwargs"] == {
+            "reasoning_effort": "none", "enable_thinking": False,
+        }
+
+
 def test_invalid_or_unsafe_extra_body_is_rejected_before_generation():
     with tempfile.TemporaryDirectory() as directory:
         client, worker, _ = make_client(Path(directory))
@@ -165,6 +213,25 @@ def test_invalid_or_unsafe_extra_body_is_rejected_before_generation():
             body = request_body()
             body["extra_body"] = extra_body
             response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == expected_status
+        assert worker.received is None
+
+
+def test_invalid_thinking_options_are_rejected_before_generation():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        invalid_values = (
+            ({"thinking": []}, 422),
+            ({"thinking": {}}, 422),
+            ({"thinking": {"type": "unknown"}}, 422),
+            ({"thinking": {"type": []}}, 422),
+            ({"thinking": {"unexpected": True}}, 400),
+            ({"thinking": {"budget_tokens": True}}, 422),
+            ({"thinking": {"clear_thinking": "no"}}, 422),
+            ({"reasoning_effort": False}, 422),
+        )
+        for values, expected_status in invalid_values:
+            response = client.post("/v1/chat/completions", json={**request_body(), **values})
             assert response.status_code == expected_status
         assert worker.received is None
 

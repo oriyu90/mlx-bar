@@ -2,6 +2,16 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.4] - 2026-08-21
+
+### 修正
+
+- **ZCodeがQwen3.8等の推論モデルへ送るトップレベルの`thinking`をHTTP 400 `UNSUPPORTED_PARAMETER`で拒否する問題を修正しました。** `thinking.type`を`enable_thinking`、`budget_tokens`を`thinking_budget`、`clear_thinking`を逆値の`preserve_thinking`へ正規化し、mlx-lm・mlx-vlm両方のチャットテンプレートへ伝播するようにしました。受理するだけで実質無視していたトップレベルの`reasoning_effort`も同名のテンプレート引数へ渡します。既存の`extra_body.chat_template_kwargs`による明示値を優先し、不正な形はモデルロード前に入力エラーで終了します。
+
+### 検証
+
+- ZCode形式の`thinking`、推論強度、budget、履歴保持、明示値の優先順位、不正入力を回帰テストに追加し、Pythonテスト142件が成功しました。
+
 ## [1.3.3] - 2026-08-20
 
 ### 修正

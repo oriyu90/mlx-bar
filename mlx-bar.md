@@ -5,6 +5,12 @@
 
 ## 未解決の課題
 
+### ZCodeのトップレベル`thinking`・`reasoning_effort`対応（2026-08-21対応）
+- 症状: v1.3.3で`extra_body.chat_template_kwargs`に対応した後も、ZCodeがQwen3.8の要求にトップレベルの`thinking`を追加すると、Coordinatorのホワイトリスト検証がHTTP 400 `UNSUPPORTED_PARAMETER`を返していた。さらに`reasoning_effort`は許可項目にあるが、生成`options`へ入れておらず実質的に無視していた。
+- 修正: `thinking`をブール値またはオブジェクトとして検証し、`type: enabled|adaptive`を`enable_thinking: true`、`type: disabled`を`false`、`budget_tokens`を`thinking_budget`、`clear_thinking`を逆値の`preserve_thinking`へ変換。トップレベルの`reasoning_effort`も小文字化して同名のテンプレート引数へ渡し、`none`の場合は明示値がない限りthinkingを無効化する。
+- 優先順位: モデルに直結する既存の`extra_body.chat_template_kwargs`を最優先し、トップレベルの`thinking`と`reasoning_effort`は未指定値だけを補う。ZCodeが新旧両形式を同時に送っても、明示的なテンプレート設定が意図せず上書きされない。
+- 検証: ZCode形式の正規化、明示値の優先、`reasoning_effort: none`、不正なtype・budget・履歴保持値を追加し、Pythonテスト142件が成功。
+
 ### ZCodeの`extra_body.chat_template_kwargs`対応（2026-08-20対応）
 - 症状: ZCode 3.2.5が`POST /v1/chat/completions`に`{"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}`を追加すると、Coordinatorが`extra_body`を未対応パラメータと判定してHTTP 400 `UNSUPPORTED_PARAMETER`を返していた。モデルロードや量子化、生成Workerに到達する前のAPI入力検証が原因。
 - 修正: [openai_compat.py](Coordinator/mlxbar/api/openai_compat.py)で`extra_body.chat_template_kwargs`を検証・抽出し、Worker生成オプションへ追加。[tool_calls.py](Workers/common/tool_calls.py)のテンプレート引数フォールバックの各段階で値を保持し、mlx-lmの`processor.apply_chat_template`とmlx-vlmの`prompt_utils.apply_chat_template`の両方へ届ける。
