@@ -49,6 +49,13 @@
   - **`remove-all-data`のログイン項目解除**: 同じ理由で`SMAppService.unregister()`をCLIから呼べない。`launchctl bootout`（Pythonの`subprocess`から実行可能）でサービス自体は確実に停止するため実害はなく、システム設定のログイン項目に見た目上のエントリが残るだけ（アプリ本体を削除すれば消える）。
 - 逆に言うと、`launchctl`・`defaults`はただのコマンドラインツールなのでPythonからも`subprocess`で問題なく呼べる。SwiftでしかできないのはFoundationの`ServiceManagement`フレームワーク呼び出しだけ、という切り分けを覚えておくこと。
 
+### メニューバーを開くと即座にクラッシュしていた問題（`Bundle.module`の資材解決ミスマッチ、v1.1.0から潜在・v1.3.0で発見）
+- 症状: メニューバーのアイコンをクリックすると、ポップアップが開く前に一瞬で消える（プロセスごと終了する）。v1.2.4の「アイコンがフラッシュして消える」報告と見た目は同じだが**原因は別**（v1.2.4は`refreshStatus()`の毎秒再描画によるちらつき、こちらは`fatalError`によるプロセス終了）。
+- 根本原因: [Localization.swift](Sources/MLXBar/Services/Localization.swift)の`AppLanguage.bundle(for:)`が、SwiftPM自動生成の`Bundle.module`アクセサ経由でローカライズ資材（`MLXBar_MLXBar.bundle`）を読んでいた。このアクセサ（executable target向け生成コード）は`Bundle.main.bundleURL`（`.app`直下）を探すが、`scripts/build-release.sh`は同バンドルを`Contents/Resources/`配下に配置している（[CoordinatorClient.swift:329](Sources/MLXBar/Services/CoordinatorClient.swift:329)の`bundleResources`もこちらの規約に従う）。探索先と実配置がずれており、`resource_bundle_accessor.swift`生成コードの`fatalError("could not load resource bundle: ...")`でプロセスごと終了していた。
+- 発火条件: `AppLanguage.text(_:language:)`は`current == sourceLanguage`（`"ja"`）のとき`Bundle.module`に触れず即returnするガードがある。`guiLanguage`はCoordinatorの`general.language`設定が無ければ`"en"`がデフォルト（[MenuBarViewModel.swift:502](Sources/MLXBar/MenuBar/MenuBarViewModel.swift:502)）のため、**新規インストール・英語UIのユーザーは高確率で即クラッシュする**一方、GUI言語を日本語で使うことが多い開発環境では踏みにくく、実機検証をすり抜けていたと考えられる。`AppLanguage`・`guiLanguage`はどちらもv1.1.0で導入されており、この構造自体はそこから潜在していた可能性が高い。
+- 修正: `AppLanguage`に`resourceBundle`という static let を追加し、`CoordinatorClient`と同じ`Contents/Resources/MLXBar_MLXBar.bundle`パスを最初に試し、見つからない場合（`swift run`でのローカル実行など`.app`化されていない場合）のみ`Bundle.module`にフォールバックするようにした。
+- 教訓: 同一コードベース内でリソースバンドルの場所を解決するロジックが2系統（SwiftPMの`Bundle.module`規約 と、`CoordinatorClient`が使う手動`Contents/Resources`パス構築）併存していたのが根本原因。**今後`Bundle.module`を新規に使う箇所を追加する前に、`CoordinatorClient.swift`の`bundleResources`と同じ手動解決に統一できないか検討すること。**
+
 ## リリース時のバージョン文字列更新チェックリスト
 
 新バージョンをリリースする際、以下のファイルの版数表記をすべて更新すること（漏れやすい）:

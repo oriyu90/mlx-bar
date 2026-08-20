@@ -17,9 +17,21 @@ enum AppLanguage {
     static var current = "en"
     private static var bundles: [String: Bundle] = [:]
 
+    /// `scripts/build-release.sh` places the SwiftPM resource bundle under
+    /// `Contents/Resources`, the same path `CoordinatorClient` uses for
+    /// `bundleResources`. SwiftPM's generated `Bundle.module` accessor instead
+    /// looks next to `Bundle.main.bundleURL` (the `.app` root), which never
+    /// matches a packaged build and made every menu open crash with
+    /// `fatalError("could not load resource bundle...")`. Prefer the packaged
+    /// location and fall back to `Bundle.module` for `swift run`.
+    private static let resourceBundle: Bundle = {
+        let packaged = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/MLXBar_MLXBar.bundle")
+        return Bundle(url: packaged) ?? Bundle.module
+    }()
+
     static func bundle(for code: String) -> Bundle? {
         if let cached = bundles[code] { return cached }
-        guard let path = Bundle.module.path(forResource: code, ofType: "lproj"),
+        guard let path = resourceBundle.path(forResource: code, ofType: "lproj"),
               let bundle = Bundle(path: path) else { return nil }
         bundles[code] = bundle
         return bundle
