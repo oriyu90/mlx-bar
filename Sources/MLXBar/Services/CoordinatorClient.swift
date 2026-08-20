@@ -332,7 +332,10 @@ final class CoordinatorClient: @unchecked Sendable {
         let plist: [String: Any] = [
             "Label": serviceLabel, "ProgramArguments": [coordinator.path], "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false], "ProcessType": "Interactive", "ThrottleInterval": 10,
-            "EnvironmentVariables": ["PATH": "\(bundleResources.path):/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"]
+            "EnvironmentVariables": [
+                "PATH": "\(bundleResources.path):/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            ]
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         let temporary = plistURL.appendingPathExtension("tmp")

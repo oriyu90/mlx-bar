@@ -2,6 +2,18 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.6] - 2026-08-21
+
+### 修正
+
+- **クイックチャットは動く一方、ZCodeでは長時間応答が表示されない問題を修正しました。** ZCodeがtool calling用のツールを送ると、従来のWorkerはツール判定のため全生成テキストを完了まで保持していました。通常本文を即時配信し、分割された`<tool_call>`開始だけを検出して以降を解析用に保持する増分処理へ変更しました。
+- QwenのthinkingをOpenAI互換ストリームの`reasoning_content`へ分離し、`<think>`・`</think>`・`<assistant>`・`<tool_call>`を通常本文へ漏らさないようにしました。tool call解析失敗時は`TOOL_PARSE_FAILED`を返します。
+- 同梱Workerの実行時にPythonがアプリバンドル内へ`__pycache__`を作成し、起動後のコード署名検証を壊す問題を修正しました。Coordinatorランチャー、fallback LaunchAgent、Worker環境でbytecode生成を無効化しました。
+
+### 検証
+
+- 通常本文の増分配信、thinking分離、分割tool marker、tool call確定、解析失敗、OpenAI SSE変換を回帰テストへ追加し、Pythonテスト148件とSwiftリリースビルドが成功しました。
+
 ## [1.3.5] - 2026-08-21
 
 ### 修正

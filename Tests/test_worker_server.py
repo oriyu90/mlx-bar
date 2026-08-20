@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "Workers"))
 
 import common.server as worker_server  # noqa: E402
 from common.server import BaseAdapter, create_app  # noqa: E402
+from common.tool_calls import parse_tool_markup  # noqa: E402
 from mlx_lm_worker.adapter import MLXLMAdapter  # noqa: E402
 from mlx_vlm_worker.adapter import MLXVLMAdapter  # noqa: E402
 
@@ -104,6 +106,69 @@ def test_buffered_tool_generation_still_emits_heartbeats():
         assert '"phase": "tool_parse"' in generated.text
     finally:
         worker_server.GENERATION_HEARTBEAT_SECONDS = previous
+
+
+class IncrementalPlainToolAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        for text in ("Hello", " from", " MLXBar"):
+            yield {"type": "delta", "text": text}
+
+
+def test_normal_tool_capable_response_is_streamed_incrementally():
+    adapter = IncrementalPlainToolAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "plain-tool", "params": {
+            "prompt": "hello", "tools": [{"type": "function", "function": {"name": "read"}}],
+            "tool_choice": "auto",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    deltas = [event["text"] for event in events if event.get("type") == "delta"]
+    assert deltas == ["Hello", " from", " MLXBar"]
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+class IncrementalReasoningToolAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "reasoning_start"}
+        for text in ("private reasoning", "</thi", "nk>Visible answer. ", "<tool", "_call>",
+                     '{"name":"read","arguments":{"path":"README.md"}}', "</tool_call>"):
+            yield {"type": "delta", "text": text}
+
+    def finalize(self, text: str, params: dict) -> dict:
+        return parse_tool_markup(text)
+
+
+def test_reasoning_and_tool_markup_are_separated_while_streaming():
+    adapter = IncrementalReasoningToolAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "reasoning-tool", "params": {
+            "prompt": "use a tool", "tools": [{"type": "function", "function": {"name": "read"}}],
+            "tool_choice": "auto",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert "".join(event["text"] for event in events if event.get("type") == "reasoning_delta") == "private reasoning"
+    assert "".join(event["text"] for event in events if event.get("type") == "delta") == "Visible answer. "
+    calls = [event for event in events if event.get("type") == "tool_calls"]
+    assert calls[0]["calls"][0]["function"]["name"] == "read"
+    assert not any("<think>" in str(event) or "<tool_call>" in str(event) for event in events)
+    assert events[-1] == {"type": "completed", "finish_reason": "tool_calls"}
+
+
+class BrokenToolMarkupAdapter(IncrementalReasoningToolAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "delta", "text": "<tool_call>not valid</tool_call>"}
+
+
+def test_detected_but_unparseable_tool_call_returns_explicit_error():
+    adapter = BrokenToolMarkupAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "broken-tool", "params": {
+            "prompt": "use a tool", "tools": [{"type": "function", "function": {"name": "read"}}],
+            "tool_choice": "auto",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == "TOOL_PARSE_FAILED"
 
 
 def test_mlx_lm_sampling_parameters_reach_sampler_and_logits_processors():

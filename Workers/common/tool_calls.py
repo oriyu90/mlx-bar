@@ -5,6 +5,83 @@ import re
 import uuid
 
 
+class IncrementalToolStream:
+    """Separate visible text, reasoning, and tool markup without full buffering.
+
+    Tool-capable chat templates commonly emit ordinary text first and only add
+    ``<tool_call>`` if a call is actually needed. Keeping a short possible-tag
+    suffix is enough to stream normal output immediately while ensuring that a
+    split tool marker is never exposed as assistant content.
+    """
+
+    TOOL_START = "<tool_call>"
+    THINK_START = "<think>"
+    THINK_END = "</think>"
+    ASSISTANT_TAGS = ("<assistant>", "</assistant>")
+
+    def __init__(self):
+        self.pending = ""
+        self.in_reasoning = False
+        self.tool_detected = False
+
+    def start_reasoning(self) -> None:
+        self.in_reasoning = True
+
+    def feed(self, text: str) -> list[dict]:
+        if not text or self.tool_detected:
+            return []
+        self.pending += text
+        events: list[dict] = []
+        while self.pending and not self.tool_detected:
+            markers = ((self.THINK_END, self.TOOL_START) if self.in_reasoning else
+                       (self.TOOL_START, self.THINK_START, self.THINK_END, *self.ASSISTANT_TAGS))
+            match = self._first_marker(self.pending, markers)
+            if match is None:
+                safe = self._safe_prefix_length(self.pending, markers)
+                if safe:
+                    events.append({"type": "reasoning_delta" if self.in_reasoning else "delta",
+                                   "text": self.pending[:safe]})
+                    self.pending = self.pending[safe:]
+                break
+            position, marker = match
+            if position:
+                events.append({"type": "reasoning_delta" if self.in_reasoning else "delta",
+                               "text": self.pending[:position]})
+            self.pending = self.pending[position + len(marker):]
+            if marker == self.TOOL_START:
+                self.tool_detected = True
+            elif marker == self.THINK_START:
+                self.in_reasoning = True
+            elif marker == self.THINK_END:
+                self.in_reasoning = False
+            # Assistant wrapper tags are discarded.
+        return [event for event in events if event.get("text")]
+
+    def finish(self) -> list[dict]:
+        if self.tool_detected or not self.pending:
+            self.pending = ""
+            return []
+        event = {"type": "reasoning_delta" if self.in_reasoning else "delta", "text": self.pending}
+        self.pending = ""
+        return [event]
+
+    @staticmethod
+    def _first_marker(text: str, markers: tuple[str, ...]) -> tuple[int, str] | None:
+        matches = [(text.find(marker), marker) for marker in markers if marker in text]
+        return min(matches, key=lambda item: item[0]) if matches else None
+
+    @staticmethod
+    def _safe_prefix_length(text: str, markers: tuple[str, ...]) -> int:
+        hold = 0
+        for marker in markers:
+            maximum = min(len(text), len(marker) - 1)
+            for length in range(maximum, 0, -1):
+                if text.endswith(marker[:length]):
+                    hold = max(hold, length)
+                    break
+        return len(text) - hold
+
+
 def tool_template_kwargs_attempts(params: dict) -> list[dict]:
     """Ordered fallback kwargs for rendering a chat template that may not support tools.
 

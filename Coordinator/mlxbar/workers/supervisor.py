@@ -167,6 +167,7 @@ class WorkerSupervisor:
         self.socket_path = socket_dir / f"{engine}-{uuid.uuid4().hex[:8]}.sock"
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join([*self._worker_import_paths(), env.get("PYTHONPATH", "")])
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
         # Worker diagnostics go to a log file rather than a pipe: nothing drains

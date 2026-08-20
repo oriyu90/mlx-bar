@@ -5,6 +5,13 @@
 
 ## 未解決の課題
 
+### ZCode tool calling時の無表示・全量バッファ（2026-08-21対応）
+- 実機証拠: v1.3.5のZCode要求はHTTP 400ではなく200になったが、`stream: true`、ツール20件、会話履歴最大236件で、完了まで42〜519秒を要した。Workerクラッシュも1回記録。最小のQwen＋thinking＋1 tool要求でも、空の初期チャンクとkeep-aliveだけが55秒続き、本文が完了時に一括到着した。
+- 原因: [server.py](Workers/common/server.py)がtools有効時の全`delta`を`buffered`へ追加し、生成完了後のtool parserまで外部へ出していなかった。クイックチャットはtoolsなしのため逐次配信され、症状差と一致する。
+- 修正: 増分フィルターが通常本文とreasoningを即時イベント化し、分割され得る制御タグの短い接尾辞だけを保留する。`<tool_call>`を検出した時点から解析用に保持し、確定したcallだけをOpenAI形式へ変換する。thinkingは`reasoning_content`へ分離し、解析失敗は明示エラーにする。
+- 署名: runtime Pythonが同梱Workerソースへ`__pycache__`を作り、起動後にsealed resource追加として署名検証を壊していた。全Coordinator/Worker起動経路へ`PYTHONDONTWRITEBYTECODE=1`を設定する。
+- 検証: 実機で観測したQwenのthinking終端とtool markerの分割パターンを含む回帰テストを追加し、Pythonテスト148件とSwiftリリースビルドが成功。
+
 ### ZCode互換拡張の将来互換化（2026-08-21対応）
 - 症状: v1.3.4でトップレベルの`thinking`を追加した後も、実機のZCodeからQwen3.8へ送った要求がHTTP 400 `UNSUPPORTED_PARAMETER`になった。インストール済みアプリと配布DMGのCoordinatorハッシュは一致しており、v1.3.4未適用ではなかった。
 - 原因: OpenAI互換入口、`extra_body`、`thinking`の各階層に未知項目を拒否するホワイトリストが残っており、ZCodeのバージョンやモデル別dialectによる追加項目で再発できる設計だった。旧監査ログは早期入力エラーのモデル名とエラーコードも記録できず、ZCode側も`parameters`配列を表示しないため、実機の拒否項目名を後から特定できなかった。

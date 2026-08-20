@@ -56,6 +56,9 @@ class MLXLMAdapter(BaseAdapter):
                 kwargs["logits_processors"] = processors
         except Exception:
             kwargs["temp"] = temperature
+        tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
+        if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
+            yield {"type": "reasoning_start"}
         for response in stream_generate(self.model, self.processor, **kwargs):
             text = getattr(response, "text", response if isinstance(response, str) else "")
             if text:

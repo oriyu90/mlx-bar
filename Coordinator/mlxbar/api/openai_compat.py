@@ -211,6 +211,12 @@ async def chat(request: Request, body: dict):
                                  "model": response_model, "choices": [{"index": 0,
                                  "delta": delta, "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+                    elif event.get("type") == "reasoning_delta":
+                        chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
+                                 "model": response_model, "choices": [{"index": 0,
+                                 "delta": {"reasoning_content": event.get("text", "")},
+                                 "finish_reason": None}]}
+                        yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_calls":
                         for chunk in _tool_call_stream_chunks(request_id, response_model, event.get("calls") or [], created):
                             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"

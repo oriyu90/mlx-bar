@@ -3,4 +3,5 @@ set -eu
 CONTENTS=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RESOURCE_BUNDLE="$CONTENTS/Resources/MLXBar_MLXBar.bundle"
 export PATH="$RESOURCE_BUNDLE:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+export PYTHONDONTWRITEBYTECODE=1
 exec "$CONTENTS/Resources/coordinator/MLXBarCoordinator" "$@"

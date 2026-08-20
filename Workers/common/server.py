@@ -15,6 +15,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
+from .tool_calls import IncrementalToolStream
+
 
 GENERATION_HEARTBEAT_SECONDS = 10.0
 # A cancel that lands after its generation already finished has nothing left to
@@ -177,6 +179,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 count = 0
                 buffered = ""
                 tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
+                tool_stream = IncrementalToolStream() if tool_mode else None
                 iterator = adapter.stream(request_id, params)
                 while True:
                     pending = asyncio.create_task(on_mlx_thread(next_event, iterator))
@@ -195,9 +198,15 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         yield json.dumps({"type": "completed", "finish_reason": "cancelled"}) + "\n"
                         return
                     count += 1
-                    if tool_mode and event.get("type") == "delta":
+                    if tool_mode and event.get("type") == "reasoning_start":
+                        tool_stream.start_reasoning()
+                    elif tool_mode and event.get("type") == "delta":
                         buffered += str(event.get("text", ""))
-                        if time.monotonic() - last_visible_event >= heartbeat_interval:
+                        visible_events = tool_stream.feed(str(event.get("text", "")))
+                        for visible in visible_events:
+                            yield json.dumps(visible, ensure_ascii=False) + "\n"
+                            last_visible_event = time.monotonic()
+                        if not visible_events and time.monotonic() - last_visible_event >= heartbeat_interval:
                             yield json.dumps({"type": "heartbeat", "phase": "tool_parse",
                                               "elapsed_seconds": round(time.monotonic() - started, 1)}) + "\n"
                             last_visible_event = time.monotonic()
@@ -207,12 +216,17 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 elapsed = max(time.monotonic() - started, 0.001)
                 finish_reason = "stop"
                 if tool_mode:
+                    for visible in tool_stream.finish():
+                        yield json.dumps(visible, ensure_ascii=False) + "\n"
                     result = await on_mlx_thread(adapter.finalize, buffered, params)
-                    if result.get("text"):
-                        yield json.dumps({"type": "delta", "text": result["text"]}, ensure_ascii=False) + "\n"
                     if result.get("tool_calls"):
                         finish_reason = "tool_calls"
                         yield json.dumps({"type": "tool_calls", "calls": result["tool_calls"]}, ensure_ascii=False) + "\n"
+                    elif tool_stream.tool_detected:
+                        yield json.dumps({"type": "error", "code": "TOOL_PARSE_FAILED",
+                                          "message": "モデルのtool callを解析できませんでした",
+                                          "retryable": False}, ensure_ascii=False) + "\n"
+                        return
                 yield json.dumps({"type": "metrics", "generation_tps": count / elapsed}) + "\n"
                 yield json.dumps({"type": "completed", "finish_reason": finish_reason}) + "\n"
             except Exception as exc:

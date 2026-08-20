@@ -490,6 +490,30 @@ def test_stream_starts_with_role_and_translates_internal_heartbeat_to_sse_commen
         assert '"content": "ready"' in response.text
 
 
+def test_reasoning_delta_uses_openai_compatible_reasoning_content_field():
+    class ReasoningWorker(ToolWorker):
+        async def generate(self, *_args, **_kwargs):
+            yield {"type": "reasoning_delta", "text": "checking"}
+            yield {"type": "delta", "text": "answer"}
+            yield {"type": "completed", "finish_reason": "stop"}
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=ReasoningWorker(), database=Database(root / "state.sqlite3"),
+        )
+        response = TestClient(make_public_app(state)).post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e", "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: {")]
+        deltas = [event["choices"][0]["delta"] for event in events if event.get("choices")]
+        assert {"reasoning_content": "checking"} in deltas
+        assert {"content": "answer"} in deltas
+
+
 def test_multiple_completions_are_rejected_cleanly():
     with tempfile.TemporaryDirectory() as directory:
         client, _, _ = make_autoload_client(Path(directory))

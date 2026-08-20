@@ -22,6 +22,7 @@ int main(int argc, char **argv) {
     strlcpy(directory, resolved, sizeof(directory));
     char target[PATH_MAX];
     snprintf(target, sizeof(target), "%s/../Resources/coordinator/MLXBarCoordinator", dirname(directory));
+    setenv("PYTHONDONTWRITEBYTECODE", "1", 1);
     argv[0] = target;
     execv(target, argv);
     perror("MLXBarCoordinator");

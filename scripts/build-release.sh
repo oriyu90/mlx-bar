@@ -8,7 +8,7 @@ APP_DIR="$DIST_DIR/MLXBar.app"
 CONTENTS="$APP_DIR/Contents"
 PYINSTALLER_DIR="$PROJECT_DIR/.release-python"
 DMG_STAGE="$PROJECT_DIR/.dmg-stage"
-VERSION=1.3.5
+VERSION=1.3.6
 
 export SWIFT_MODULE_CACHE_PATH="$PROJECT_DIR/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache"
@@ -53,6 +53,11 @@ chmod +x "$CONTENTS/MacOS/MLXBar" "$CONTENTS/MacOS/MLXBarCoordinator" \
   "$CONTENTS/Resources/MLXBar_MLXBar.bundle/start-service" \
   "$CONTENTS/Resources/cli/MLXBarCLI"
 
+# Worker sources are bundled as PyInstaller data. Exclude bytecode caches that
+# may have been created by local tests before signing the app bundle.
+find "$CONTENTS/Resources/coordinator" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$CONTENTS/Resources/coordinator" -type f -name '*.py[co]' -delete
+
 IDENTITY=${DEVELOPER_ID_APPLICATION:--}
 if [ "$IDENTITY" = "-" ]; then
   codesign --force --sign - "$CONTENTS/Resources/coordinator/MLXBarCoordinator"
@@ -84,6 +89,8 @@ for item in README.md licence.md CHANGELOG.md SECURITY.md Package.swift Coordina
   cp -R "$PROJECT_DIR/$item" "$DMG_STAGE/Source code/"
 done
 rm -rf "$DMG_STAGE/Source code/Coordinator/.venv" "$DMG_STAGE/Source code/Coordinator/.pytest_cache"
+find "$DMG_STAGE/Source code" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$DMG_STAGE/Source code" -type f -name '*.py[co]' -delete
 
 rm -f "$DIST_DIR/MLXBar-$VERSION.dmg"
 if [ "${SKIP_DMG:-0}" = "1" ]; then
