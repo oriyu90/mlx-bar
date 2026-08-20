@@ -2,6 +2,14 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.1] - 2026-08-20
+
+v1.3.0のリリース直後、実機で「メニューバーのアイコンをクリックすると、ポップアップが開く前に一瞬で消える」不具合が発覚し、その修正のみを目的としたパッチリリースです。
+
+### 修正
+
+- **メニューバーのアイコンをクリックするとアプリが即座にクラッシュする問題を修正しました。** [Services/Localization.swift](Sources/MLXBar/Services/Localization.swift)の`AppLanguage.bundle(for:)`が、SwiftPM自動生成の`Bundle.module`アクセサ経由でローカライズ資材(`MLXBar_MLXBar.bundle`)を読んでいましたが、このアクセサ(executable target向け生成コード)は`.app`直下(`Bundle.main.bundleURL`)を探す実装でした。一方`scripts/build-release.sh`は同バンドルを`Contents/Resources/`配下に配置しており([Services/CoordinatorClient.swift](Sources/MLXBar/Services/CoordinatorClient.swift)の`bundleResources`もこちらの規約に従います)、探索先と実配置がずれていたため、メニューを開いてローカライズ文字列を読もうとするたびに`resource_bundle_accessor.swift`生成コードの`fatalError`でプロセスごと終了していました。GUI言語設定が日本語(ソース言語)のときはこのコードパスを通らないガードがあるため症状が出ず、開発環境では踏みにくい一方、新規インストールでは`guiLanguage`が既定で`"en"`のため高確率で再現する状態でした。`AppLanguage`側の資材解決を`CoordinatorClient`と同じ`Contents/Resources`パスに統一し、`.app`化されていない`swift run`実行時のみ`Bundle.module`にフォールバックするようにしました。詳細な調査記録は[mlx-bar.md](mlx-bar.md)を参照してください。
+
 ## [1.3.0] - 2026-08-20
 
 v1.2.4のリリース検証中に実機で発生した「インストール直後にCoordinatorがクラッシュする」不具合の調査を発端に、CLI(`mlxbarctl`)のGUIとの機能パリティ、起動信頼性、「すべてのデータを削除」の完全性をまとめて強化しました。
