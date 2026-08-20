@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.2.4 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.3.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -38,7 +38,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.2.4.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.3.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -142,22 +142,44 @@ mlxbarctl status --json
 mlxbarctl model list --json
 mlxbarctl model scan --wait
 mlxbarctl model load MODEL_ID --engine auto
+mlxbarctl model add-folder /path/to/models
+mlxbarctl model remove-folder /path/to/models
 mlxbarctl generate --prompt "こんにちは"
 mlxbarctl generate --prompt "こんにちは" --temperature 0.4 --top-p 0.9 --repetition-penalty 1.1 --repetition-context-size 64
 mlxbarctl model unload
+mlxbarctl cancel-all
 mlxbarctl runtime list
 mlxbarctl runtime stage mlx-lm --version VERSION --wait
 mlxbarctl runtime update mlx-lm --wait
 mlxbarctl runtime update mlx-vlm --wait
 mlxbarctl runtime activate mlx-lm SLOT_ID
 mlxbarctl runtime rollback mlx-lm
+mlxbarctl runtime delete-slot mlx-lm SLOT_ID
+mlxbarctl runtime cancel-job mlx-lm
 mlxbarctl config get
 mlxbarctl config set api.port 12000
+mlxbarctl config set-language ja
+mlxbarctl config set-max-tokens 8192
+mlxbarctl config set-queue-limits --max-queued 16 --timeout-seconds 3600
+mlxbarctl config set-sampling-defaults --temperature 0.7 --top-p 1.0 --repetition-penalty 1.0 --repetition-context-size 20
+mlxbarctl config set-launch-at-login true  # デスクトップのGUIが次に起動したときにOS登録へ反映されます
+mlxbarctl secrets get-api-token
+mlxbarctl secrets regenerate-api-token
+mlxbarctl secrets set-lmstudio-token TOKEN
+mlxbarctl secrets set-lmstudio-token  # 引数省略で削除
+mlxbarctl logs show --limit 100
+mlxbarctl logs clear
+mlxbarctl network set-lan --enabled
+mlxbarctl network set-lan --disabled
+mlxbarctl network set-port 12000
 mlxbarctl api test-port 12000
 mlxbarctl diagnostics
+mlxbarctl remove-all-data --yes  # 設定・APIキー・モデルDB・ランタイム・ログを削除してサービスを停止します
 ```
 
 終了コードは、0=成功、2=入力不正、3=未起動、4=競合、5=互換性なし、6=更新失敗、7=認証失敗、8=内部エラーです。
+
+GUIで操作できることはほぼすべて`mlxbarctl`からも操作できます。唯一「ログイン時に起動」だけは、macOSのログイン項目登録API(`SMAppService`)がSwift専用のためCLIから直接は変更できず、CLIは設定値だけを変更します。実際のOS登録は、次にGUIアプリが起動または設定を再取得したタイミングで反映されます。
 
 ## OpenAI互換API
 
@@ -261,7 +283,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.2.4.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.3.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 
@@ -275,16 +297,17 @@ swift build --disable-sandbox -c release
 
 ## 起動時のトラブルシューティング
 
-- メニューバーに警告が出た場合は、数秒待ってからメニューを開き直してください。
+- メニューバーに警告が出た場合は、数秒待ってからメニューを開き直してください。バックグラウンド実行の許可待ちや、過去にインストールした別ビルドの登録が残っている場合、起動シーケンスが自動的に再登録を試みてから起動します。
 - バックグラウンド実行の許可を求められた場合は、「システム設定」→「一般」→「ログイン項目と機能拡張」でMLXBarを許可します。
-- サービスログは`~/Library/Logs/MLXBar/coordinator.log`に保存されます。
+- サービスログは`~/Library/Application Support/MLXBar/logs/coordinator.log`に保存されます。バックグラウンドサービスがクラッシュした場合の記録は、同じフォルダの`coordinator-crash.log`を確認してください。
 - APIポートが他のアプリと競合しても管理サービスは停止せず、設定画面から空きポートへ変更できます。
+- 上記でも解決しない場合は、「アンインストール」の手順で一度すべてのデータを削除してから再インストールしてください。
 
 実モデルを使う受け入れ試験は、モデルの種類、サイズ、インストール済みランタイムに依存します。小型モデルを用いて、LM、VLM、LM Studioの各経路でロード→生成→アンロードを確認してください。
 
 ## アンインストール
 
-設定の「削除」から「すべてのデータを削除して終了…」を選ぶと、バックグラウンドサービスとログイン時起動を解除したあと、設定、履歴、APIキー、MLXBarがダウンロードしたランタイム、キャッシュ、ログを削除して終了します。その後、`MLXBar.app`をゴミ箱へ移動してください。
+設定の「削除」から「すべてのデータを削除して終了…」を選ぶと、バックグラウンドサービスとログイン時起動を解除したあと、設定、履歴、APIキー、MLXBarがダウンロードしたランタイム、キャッシュ、ログを削除して終了します。その後、`MLXBar.app`をゴミ箱へ移動してください。同じ操作は`mlxbarctl remove-all-data --yes`からも実行できます（ログイン項目の登録解除だけはCLIから行えず、システム設定に見た目上のエントリが残ることがありますが、サービス自体は確実に停止するため再インストールへの影響はありません）。
 
 Hugging FaceやLM Studioなど、外部フォルダに保存されているモデル本体は読み取り専用で参照しているため、この操作では削除されません。Finderからアプリ本体だけを先に削除するとアプリ内の削除機能を利用できなくなるため、先に設定画面からデータを削除してください。
 

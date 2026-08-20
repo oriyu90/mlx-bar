@@ -47,6 +47,12 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
 
+    def close(self) -> None:
+        """Releases the connection so the WAL/SHM sidecar files (and the
+        database file itself) can be safely deleted, e.g. by a system reset."""
+        with self.lock:
+            self.connection.close()
+
     def replace_models(self, models: list[dict]) -> None:
         with self.lock, self.connection:
             self.connection.execute("DELETE FROM models")

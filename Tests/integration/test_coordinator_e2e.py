@@ -240,6 +240,38 @@ class CoordinatorE2ETests(unittest.TestCase):
         finally:
             provider.shutdown(); provider.server_close(); thread.join(timeout=2)
 
+    def test_system_reset_wipes_root_and_shuts_down(self):
+        port = self.free_port()
+        _, socket_path = self.start(port)
+        marker = self.home / "marker.txt"
+        marker.write_text("should be gone", encoding="utf-8")
+        with self.client(socket_path) as client:
+            response = client.post("/api/v1/system/reset")
+            self.assertIn(response.status_code, (200, 202))
+            self.assertEqual(response.json().get("status"), "resetting")
+        # The process tears itself down shortly after responding -- proves
+        # the response really was sent before teardown, since httpx above
+        # would have raised if the connection died mid-response.
+        self.process.wait(timeout=10)
+        self.assertIsNotNone(self.process.returncode)
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.home / "state.sqlite3").exists())
+        self.assertFalse((self.home / "control" / "coordinator.sock").exists())
+        self.assertFalse((self.home / "control" / "api-token").exists())
+
+    def test_system_reset_cancels_active_jobs(self):
+        port = self.free_port()
+        _, socket_path = self.start(port)
+        with self.client(socket_path) as client:
+            job = client.post("/api/v1/models/scan").json()
+            self.assertIn(job.get("state"), {"queued", "running", "completed"})
+            response = client.post("/api/v1/system/reset")
+            self.assertIn(response.status_code, (200, 202))
+        # Reset must not hang waiting on the in-flight job -- if cancel_all()
+        # ever deadlocks, this wait() times out and fails the test.
+        self.process.wait(timeout=10)
+        self.assertIsNotNone(self.process.returncode)
+
 
 if __name__ == "__main__":
     unittest.main()

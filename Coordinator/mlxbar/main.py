@@ -9,6 +9,8 @@ import os
 import signal
 import socket
 import time
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -19,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
+from .settings import app_support_dir
 from .state import AppState, CATALOG_CLASSIFIER_VERSION
 
 
@@ -224,6 +227,18 @@ async def serve(root: Path | None = None) -> None:
     control.mkdir(parents=True, exist_ok=True)
     socket_path = control / "coordinator.sock"
     socket_path.unlink(missing_ok=True)
+    # Scheduled before the management API can accept any connection (it only
+    # *schedules* background jobs -- the actual install/scan work still runs
+    # concurrently afterward, so this doesn't delay responsiveness). Doing
+    # this earlier closes a race where a client could reach the socket and
+    # call e.g. /system/reset while this synchronous setup was still
+    # in-flight, tearing down state this was about to write to.
+    state.install_missing_runtimes()
+    if (state.database.metadata_value("catalog_classifier_version") != CATALOG_CLASSIFIER_VERSION
+            or not state.database.list_models()
+            or state.database.has_duplicate_model_paths()
+            or state.database.has_mergeable_pathless_providers()):
+        state.scan_job()
     listener = PublicListener(state)
     state.listener = listener
     if state.settings.data["api"].get("enabled", True):
@@ -234,6 +249,7 @@ async def serve(root: Path | None = None) -> None:
     management = uvicorn.Server(uvicorn.Config(make_management_app(state), uds=str(socket_path),
                                                 log_level="warning", access_log=False,
                                                 timeout_graceful_shutdown=10, lifespan="off"))
+    state.management_server = management
     management_task = asyncio.create_task(management.serve())
     # launchd sends SIGTERM on logout, restart and `launchctl bootout`. Without
     # a handler the process dies before `finally` runs, stranding the worker
@@ -247,14 +263,6 @@ async def serve(root: Path | None = None) -> None:
             os.chmod(socket_path, 0o600)
             break
         await asyncio.sleep(0.1)
-    # Keep first launch responsive while isolated runtimes are installed in
-    # background jobs. Progress and failures are visible in Runtime settings.
-    state.install_missing_runtimes()
-    if (state.database.metadata_value("catalog_classifier_version") != CATALOG_CLASSIFIER_VERSION
-            or not state.database.list_models()
-            or state.database.has_duplicate_model_paths()
-            or state.database.has_mergeable_pathless_providers()):
-        state.scan_job()
     try:
         await management_task
     finally:
@@ -274,6 +282,32 @@ async def serve(root: Path | None = None) -> None:
         socket_path.unlink(missing_ok=True)
 
 
+def _emergency_log(root: Path | None, exc: BaseException) -> None:
+    """Writes a crash record independent of the `logging` module's state.
+
+    launchd's plists deliberately set no StandardErrorPath (a shared /tmp
+    path is a symlink-attack vector), so Python's default excepthook -- and
+    anything that throws before configure_logging() has run -- would
+    otherwise vanish into /dev/null with zero trace. This writes with plain
+    file I/O so it works even if logging itself is what failed to configure.
+    Wrapped entirely in its own try/except so a failure here can never mask
+    the original exception.
+    """
+    try:
+        directory = (root or app_support_dir()) / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "coordinator-crash.log"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"--- {timestamp} ---\n")
+            handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            handle.write("\n")
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
 def run() -> None:
     parser = argparse.ArgumentParser(description="MLXBar coordinator")
     parser.add_argument("--home", type=Path)
@@ -282,6 +316,14 @@ def run() -> None:
         asyncio.run(serve(args.home))
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        if logging.getLogger().handlers:
+            logging.getLogger(__name__).exception("Coordinator crashed")
+        _emergency_log(args.home, exc)
+        # Re-raise so launchd sees a non-zero exit and its KeepAlive
+        # (SuccessfulExit=false) restarts the service, instead of this
+        # looking like a clean, intentional quit.
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

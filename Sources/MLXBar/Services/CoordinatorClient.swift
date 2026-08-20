@@ -190,12 +190,43 @@ final class CoordinatorClient: @unchecked Sendable {
         case .requiresApproval:
             throw ClientError.command("バックグラウンド実行の許可が必要です。システム設定のログイン項目でMLXBarを許可してください。")
         case .notRegistered, .notFound:
-            do { try service.register() } catch { registrationError = error }
+            do {
+                try service.register()
+                // `register()` can succeed while leaving the service in a
+                // `.requiresApproval` state; without this check that's only
+                // ever detected on a *later* launch (the `.requiresApproval`
+                // arm above only fires when the status was already that on
+                // entry), so a first-time user would just see a generic
+                // timeout instead of the actionable message below.
+                if service.status == .requiresApproval {
+                    throw ClientError.command("バックグラウンド実行の許可が必要です。システム設定のログイン項目でMLXBarを許可してください。")
+                }
+            } catch let error as ClientError { throw error }
+            catch { registrationError = error }
         @unknown default:
             break
         }
 
         if await waitUntilExpectedVersionHealthy(seconds: 5) { return }
+
+        // Best-effort recovery for the failure mode this was added for: a
+        // stale LaunchAgent registration under this same label, left behind
+        // by a previously-replaced ad-hoc-signed build (ad-hoc signatures
+        // change identity on every rebuild). Clearing both possible
+        // registrations and retrying once is cheap and a no-op if there was
+        // nothing stale to clear.
+        let domain = "gui/\(getuid())"
+        let fallbackPlist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(serviceLabel).plist")
+        _ = try? await launchctl(["bootout", "\(domain)/\(serviceLabel)"], timeoutSeconds: 10)
+        _ = try? await launchctl(["bootout", domain, fallbackPlist.path], timeoutSeconds: 10)
+        if service.status == .enabled {
+            _ = try? await launchctl(["kickstart", "-k", "\(domain)/\(serviceLabel)"])
+        } else {
+            _ = try? service.register()
+        }
+        if await waitUntilExpectedVersionHealthy(seconds: 3) { return }
+
         do {
             try await installFallbackLaunchAgent()
         } catch {
@@ -203,23 +234,35 @@ final class CoordinatorClient: @unchecked Sendable {
             throw ClientError.command("\(primary)バックエンドサービスを登録できません: \(error.localizedDescription)")
         }
         if await waitUntilExpectedVersionHealthy(seconds: 10) { return }
-        throw ClientError.unavailable
+        throw ClientError.command("""
+            MLXBarサービスを起動できません。システム設定 > プライバシーとセキュリティ > ログイン項目で\
+            MLXBarが許可されているか確認してください。解決しない場合は、設定の「すべてのデータを削除して終了」を試すか、\
+            ~/Library/Application Support/MLXBar/logs/ 内の coordinator.log・coordinator-crash.log をご確認ください。
+            """)
     }
 
     func removeAllData() async throws {
-        // Stop active work first so partially-created runtime environments are
-        // cleaned by the coordinator before its launch agent is unloaded.
-        if let data = try? await request("GET", "/api/v1/runtimes"),
-           let runtimes = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for engine in ["mlx-lm", "mlx-vlm"] {
-                guard let runtime = runtimes[engine] as? [String: Any],
-                      let job = runtime["activeJob"] as? [String: Any],
-                      let jobID = job["id"] as? String else { continue }
-                _ = try? await request("POST", "/api/v1/runtimes/\(engine)/jobs/\(jobID)/cancel")
-            }
-        }
-        _ = try? await request("DELETE", "/api/v1/models/loaded")
+        // The coordinator owns the wipe of its own data directory (settings,
+        // tokens, database, runtime installs, uv cache, worker sockets) via
+        // this single endpoint, which also triggers its own graceful
+        // shutdown -- see Coordinator/mlxbar/state.py's `reset_all()`. This
+        // both centralizes the file list in the one process that actually
+        // knows its own root (rather than duplicating a hardcoded path list
+        // here) and is shared with `mlxbarctl remove-all-data`.
+        _ = try? await request("POST", "/api/v1/system/reset")
 
+        for _ in 0..<20 {
+            if !(await isHealthy()) { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if await isHealthy() {
+            throw ClientError.command("バックグラウンドサービスを停止できなかったため、データ削除を中止しました")
+        }
+
+        // Everything below is outside the coordinator's own data directory --
+        // OS-level registration and app-bundle-adjacent files -- and has no
+        // Python/shell equivalent for SMAppService specifically, so it stays
+        // Swift-side.
         let domain = "gui/\(getuid())"
         let fallbackPlist = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/\(serviceLabel).plist")
@@ -230,20 +273,11 @@ final class CoordinatorClient: @unchecked Sendable {
         try? await service.unregister()
         try? await SMAppService.mainApp.unregister()
 
-        for _ in 0..<20 {
-            if !(await isHealthy()) { break }
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        if await isHealthy() {
-            throw ClientError.command("バックグラウンドサービスを停止できなかったため、データ削除を中止しました")
-        }
-
         _ = try? await runProcess(URL(fileURLWithPath: "/usr/bin/defaults"),
                                   ["delete", "com.yukiorita.MLXBar"], timeoutSeconds: 10)
 
         let home = FileManager.default.homeDirectoryForCurrentUser
         let paths = [
-            home.appendingPathComponent("Library/Application Support/MLXBar"),
             home.appendingPathComponent("Library/Logs/MLXBar"),
             home.appendingPathComponent("Library/Caches/com.yukiorita.MLXBar"),
             home.appendingPathComponent("Library/Saved Application State/com.yukiorita.MLXBar.savedState"),

@@ -501,8 +501,28 @@ final class MenuBarViewModel: ObservableObject {
             settings = try await json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
             guiLanguage = ((settings["general"] as? [String: Any])?["language"] as? String) ?? "en"
             effectiveMaxTokens = loadedModelMaxTokens.map { min(configuredMaxTokens, $0) } ?? configuredMaxTokens
+            await reconcileLaunchAtLogin()
         }
         catch { errorMessage = error.localizedDescription }
+    }
+
+    /// Applies `general.launchAtLogin` to the actual OS registration.
+    ///
+    /// `mlxbarctl` can only change the *setting* (`config set-launch-at-login`)
+    /// — `SMAppService` is a Swift/ObjC-only API with no CLI equivalent — so a
+    /// change made from the CLI while the GUI wasn't running has no effect on
+    /// its own. This reconciles the two whenever settings are refreshed (i.e.
+    /// on every GUI launch, at minimum), so a CLI-set desired state still
+    /// eventually takes effect. Checking the current status first avoids
+    /// calling register()/unregister() when they'd be a no-op.
+    private func reconcileLaunchAtLogin() async {
+        let desired = (settings["general"] as? [String: Any])?["launchAtLogin"] as? Bool ?? false
+        let current = SMAppService.mainApp.status
+        if desired, current != .enabled {
+            try? SMAppService.mainApp.register()
+        } else if !desired, current == .enabled {
+            try? await SMAppService.mainApp.unregister()
+        }
     }
 
     var configuredMaxTokens: Int {

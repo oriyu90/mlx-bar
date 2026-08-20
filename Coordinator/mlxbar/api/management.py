@@ -323,3 +323,17 @@ async def recent_logs(request: Request, limit: int = 500):
 @router.delete("/logs")
 async def clear_logs(request: Request):
     return {"deleted": state(request).database.clear_api_logs()}
+
+
+@router.post("/system/reset")
+async def system_reset(request: Request):
+    """Wipes every file this coordinator owns and shuts itself down.
+
+    This is the single source of truth for "remove all data" -- both the
+    GUI and mlxbarctl call this instead of each independently guessing at
+    the coordinator's own data layout. It only cancels/unloads/wipes/exits;
+    OS-level registration (LaunchAgent/SMAppService/Login Items) is outside
+    this process's own footprint and stays the caller's responsibility.
+    """
+    await state(request).reset_all()
+    return {"status": "resetting"}

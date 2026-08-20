@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import json
+import logging
+import os
+import shutil
+import signal
 import socket
 import time
 from pathlib import Path
@@ -32,6 +37,7 @@ class AppState:
         self.runtime_update_jobs: dict[str, str] = {}
         self.model_autoload_lock = asyncio.Lock()
         self.listener = None
+        self.management_server = None
         self.public_listener_error: str | None = None
         self.started_at = asyncio.get_event_loop().time()
 
@@ -72,6 +78,53 @@ class AppState:
             return []
         return [self.runtime_update_job(engine) for engine in ("mlx-lm", "mlx-vlm")
                 if not self.slots.active(engine).get("active")]
+
+    async def reset_all(self) -> None:
+        """Cancels all work, wipes every file this coordinator owns, and
+        triggers its own graceful shutdown.
+
+        Reuses the exact same signal-driven teardown `serve()`'s `finally`
+        block already runs on SIGTERM (cancel_all/unload/shutdown are
+        idempotent, so running them here first and again there is harmless).
+        The socket this request arrived on is deliberately left alone here --
+        it's still bound and in use to send the response -- and is unlinked
+        last by that existing shutdown sequence, exactly as it already does
+        today via `socket_path.unlink(missing_ok=True)`.
+        """
+        with contextlib.suppress(Exception):
+            await self.jobs.cancel_all()
+        with contextlib.suppress(Exception):
+            await self.workers.unload()
+        with contextlib.suppress(Exception):
+            await self.workers.shutdown()
+        shutil.rmtree(self.workers.socket_dir, ignore_errors=True)
+        with contextlib.suppress(Exception):
+            self.database.close()
+        for handler in list(logging.getLogger().handlers):
+            with contextlib.suppress(Exception):
+                handler.close()
+            logging.getLogger().removeHandler(handler)
+        control = self.root / "control"
+        for entry in self.root.iterdir():
+            if entry.name == "control":
+                continue
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+        if control.exists():
+            for entry in control.iterdir():
+                if entry.name == "coordinator.sock":
+                    continue
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+        if self.management_server is not None:
+            # Directly triggers the same graceful-shutdown flag `handle_exit`
+            # (the SIGTERM/SIGINT handler) sets, without going through actual
+            # signal delivery -- self-signalling from inside the very request
+            # handler asyncio is running turned out not to reliably wake the
+            # event loop's signal-handling path in testing.
+            self.management_server.should_exit = True
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)
 
     @staticmethod
     def test_port(port: int, host: str = "127.0.0.1") -> dict:
