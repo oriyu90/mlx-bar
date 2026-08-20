@@ -113,8 +113,15 @@ class RuntimeUpdater:
                 async def download_heartbeat(elapsed: int) -> None:
                     await update(0.28, f"{package}をダウンロード・インストール中（{elapsed}秒経過）")
 
+                # jinja2 backs `apply_chat_template` on the transformers processor both
+                # adapters call in `stream()`/`prompt_utils`, but transformers treats it as
+                # optional and doesn't install it itself. mlx-lm currently pulls it in via
+                # an unrelated transitive dependency; mlx-vlm doesn't, and generation fails
+                # at request time with "apply_chat_template requires jinja2" once a chat
+                # template is actually rendered. Pin it explicitly so neither engine's
+                # working chat templates depend on what else happens to get resolved.
                 await self._command(uv, "pip", "install", "--python", str(python), spec,
-                                    "fastapi>=0.115,<1", "uvicorn>=0.30,<1",
+                                    "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "jinja2>=3.1,<4",
                                     heartbeat=download_heartbeat,
                                     timeout=INSTALL_TIMEOUT_SECONDS, env=uv_env)
                 await update(0.65, "依存関係を検証中")

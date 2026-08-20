@@ -56,6 +56,14 @@
 - 修正: `AppLanguage`に`resourceBundle`という static let を追加し、`CoordinatorClient`と同じ`Contents/Resources/MLXBar_MLXBar.bundle`パスを最初に試し、見つからない場合（`swift run`でのローカル実行など`.app`化されていない場合）のみ`Bundle.module`にフォールバックするようにした。
 - 教訓: 同一コードベース内でリソースバンドルの場所を解決するロジックが2系統（SwiftPMの`Bundle.module`規約 と、`CoordinatorClient`が使う手動`Contents/Resources`パス構築）併存していたのが根本原因。**今後`Bundle.module`を新規に使う箇所を追加する前に、`CoordinatorClient.swift`の`bundleResources`と同じ手動解決に統一できないか検討すること。**
 
+### mlx-vlmモデルでの生成が`apply_chat_template requires jinja2`で失敗していた問題（v1.3.2で発見・修正）
+- 症状: ZCode（外部のOpenAI互換クライアント）からmlx-vlmモデル（画像対応、モデル名`Laguna-S-2.1-oQ2e`）へ生成リクエストを送ると、`GENERATION_FAILED` / `apply_chat_template requires jinja2 to be installed. Please install it using pip install jinja2.`で失敗する。mlx-lmモデル（テキストのみ）では発生しない。
+- 根本原因: `apply_chat_template`は`mlx_vlm.prompt_utils.apply_chat_template`（[Workers/mlx_vlm_worker/adapter.py:43](Workers/mlx_vlm_worker/adapter.py:43)）経由で最終的にHugging Face `transformers`のtokenizer/processorが担当するが、`transformers`自体は`jinja2`を必須依存として宣言していない（オプション扱い）。ランタイムのインストール処理（[Coordinator/mlxbar/runtimes/updater.py](Coordinator/mlxbar/runtimes/updater.py)の`stage()`）は`uv pip install --python <venv> <engine> fastapi uvicorn`のみを指定しており、`jinja2`を明示していなかった。
+- 実機の`~/Library/Application Support/MLXBar/runtimes/{mlx-lm,mlx-vlm}/slots/*/requirements.lock`を比較して確定: **`mlx-lm`側はたまたま別の依存経由で`jinja2==3.1.6`が入っていた**（`mlx-vlm`側の依存グラフには`mlx-audio`・`opencv-python`など`mlx-lm`にはない多数のパッケージが入っており、逆に`mlx-lm`側にだけ`jinja2`/`markupsafe`が入っている非対称な状態だった）一方、**`mlx-vlm`側には`jinja2`もその依存の`markupsafe`も一切含まれていなかった**。`.venv`のsite-packagesを直接確認しても`mlx-vlm`スロットにだけ`jinja2`ディレクトリが存在しないことを確認済み。
+- 修正: `updater.py`の`uv pip install`コマンドに`jinja2>=3.1,<4`を明示追加。両エンジンとも今後は依存解決の巡り合わせに関係なく確実にインストールされる。
+- 注意（重要）: **この修正はインストーラーのコードのみを直しており、既にインストール済みのランタイムスロットは自動的には直らない。** 影響を受けたユーザーは、アップデート後にランタイム画面（または`mlxbarctl runtime`）からmlx-vlmランタイムを再インストール・更新して新しいslotを作らせる必要がある。このMac自体は応急処置として、既存slotの`.venv`へ`uv pip install --python <venv>/bin/python jinja2`を直接実行し、`requirements.lock`も`uv pip freeze`で更新して整合させた上でCoordinatorを`launchctl kickstart -k`で再起動して即時復旧させた。
+- 教訓: `uv pip install`で「そのパッケージが動くのに必要な全依存」を、宣言されたものだけに頼って揃えようとすると、あるライブラリ（ここでは`transformers`）がオプション扱いにしている実行時必須の機能（`apply_chat_template`のjinja2レンダリング）が、たまたま別経路で入るかどうかに左右されてしまう。**両エンジンに共通で必要な「暗黙の実行時依存」がないか、他のアダプター（[Workers/common](Workers/common)）の使い方も含めて棚卸しする価値がある。**
+
 ## リリース時のバージョン文字列更新チェックリスト
 
 新バージョンをリリースする際、以下のファイルの版数表記をすべて更新すること（漏れやすい）:

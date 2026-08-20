@@ -2,6 +2,19 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.3.2] - 2026-08-20
+
+外部クライアント(ZCode)からmlx-vlmモデルへ接続した際に生成が失敗する不具合を修正するパッチリリースです。
+
+### 修正
+
+- **mlx-vlmモデルでの生成が`apply_chat_template requires jinja2 to be installed.`で失敗する問題を修正しました。** チャットテンプレートの適用(`apply_chat_template`)は最終的にHugging Face `transformers`のtokenizer/processorが担当しますが、`transformers`自体は`jinja2`を必須依存にしていません。ランタイムのインストール処理([Coordinator/mlxbar/runtimes/updater.py](Coordinator/mlxbar/runtimes/updater.py))は`uv pip install`で`mlx-lm`/`mlx-vlm`本体・`fastapi`・`uvicorn`のみを明示指定しており、`jinja2`を指定していませんでした。実機の`requirements.lock`を比較したところ、`mlx-lm`側はたまたま別の依存経由で`jinja2`が入っていた一方、`mlx-vlm`側には全く含まれておらず、画像対応モデルでチャットテンプレートを適用するたびに`ImportError`で生成が失敗していました。インストールコマンドに`jinja2>=3.1,<4`を明示追加し、両エンジンで確実にインストールされるようにしました。詳細な調査記録は[mlx-bar.md](mlx-bar.md)を参照してください。
+
+### 備考
+
+- Swift側(GUI)は今回変更していません。既存のCoordinatorテスト134件は無変更で成功しています。
+- 影響を受けるのは、この不具合が入った状態で`mlx-vlm`ランタイムを新規インストール・更新した環境のみです。既にインストール済みのランタイムスロットは、ランタイム更新画面から更新するか、`mlxbarctl runtime`で再インストールしてください。
+
 ## [1.3.1] - 2026-08-20
 
 v1.3.0のリリース直後、実機で「メニューバーのアイコンをクリックすると、ポップアップが開く前に一瞬で消える」不具合が発覚し、その修正のみを目的としたパッチリリースです。
