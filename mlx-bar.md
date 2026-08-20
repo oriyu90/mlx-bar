@@ -14,6 +14,7 @@
 - `LabeledContent`は同一Form内（少なくとも同一セクション内）の行でラベル用の配置カラムを共有する。幅無制限の`Slider`など「際限なく広がりたい」コントロールを`LabeledContent`と同じForm内に置くと、その共有カラム計算が壊れ、長いラベルが左端で欠けたり、キャプションの`Text`がウィンドウ幅を無視してそのまま突き抜けたりする（v1.2.3で発見・修正）。幅が可変・無制限になり得る行は`LabeledContent`を使わず、`VStack(alignment: .leading)`でラベルとコントロールを別行に分離し、`.frame(maxWidth:)`で明示的に幅を制限すること。
 - `.navigationSplitViewColumnWidth(min:ideal:max:)`はidealではなくmaxに近い値で初期サイズが決まる、かつ状況によりサイドバーの初期表示が不安定になることを確認。
 - `MenuBarExtra`の`.window`スタイル配下では`ScrollView`はコンテンツの理想サイズを正しく報告できず、ポップアップが数px程度に潰れることがある（v1.2.1で実際に発生、v1.2.2で素の`VStack`に戻して解消）。同様の構成を作る際は要注意。一方、`NavigationSplitView`のdetailペイン（`Settings`ウィンドウ等）ではこの制約はなく、`Form`が縦方向にスクロールしない場合は素直に`ScrollView`で包んで問題ない（v1.2.3で確認）。
+- 上記と同系統の問題として、`.window`スタイルの`MenuBarExtra`は**内容が高頻度で更新されるだけでもステータスバーの表示が不安定になる**（v1.2.4で発見・修正）。`MenuBarView`はメニューを開いている間`refreshStatus()`を1秒間隔で呼ぶが、`@Published`プロパティは値が変化していなくても代入するだけで`objectWillChange`を発火するため、同じ状態でも毎秒SwiftUIへの再描画要求が発生し、ステータスバーの`Label(shortStatus, systemImage: icon)`とポップアップ本体が再描画され続けてアイコンがちらつく・一瞬消えるという形で表面化した。`MenuBarExtra`をバックエンドとする`ObservableObject`を高頻度ポーリングで更新する場合は、`if 現在値 != 新しい値 { 現在値 = 新しい値 }`のように**値が実際に変化したときだけ代入する**こと（`MenuBarViewModel.setIfChanged`参照）。
 
 ### Coordinatorのシャットダウンとバックグラウンドジョブ
 - ランタイム自動インストール（`AppState.install_missing_runtimes()`）が起動するジョブは、`uv`のサブプロセスを`start_new_session=True`で独立したプロセスグループとして起動する（`RuntimeUpdater._command`）。これは明示的なジョブキャンセル（`/cancel`エンドポイント）時に`killpg`で確実に止められるようにするための設計。

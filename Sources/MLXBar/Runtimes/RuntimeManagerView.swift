@@ -191,8 +191,8 @@ struct RuntimeManagerView: View {
                     .disabled(!canRollback || updating || model.busy)
                     .accessibilityLabel("\(runtime.id) — \(LS("前の版へ戻す"))")
             }
-            ForEach(runtime.slots.indices, id: \.self) { index in
-                slotRow(runtime, slot: runtime.slots[index])
+            ForEach(runtime.slots, id: \.slotIdentifier) { slot in
+                slotRow(runtime, slot: slot)
             }
         }
     }
@@ -231,8 +231,8 @@ struct RuntimeManagerView: View {
     private func history(_ runtime: RuntimeInfo) -> some View {
         if !runtime.history.isEmpty {
             DisclosureGroup(LS("更新履歴")) {
-                ForEach(runtime.history.indices, id: \.self) { index in
-                    historyRow(runtime.history[index])
+                ForEach(runtime.history, id: \.historyIdentifier) { item in
+                    historyRow(item)
                 }
             }
         }
@@ -312,5 +312,25 @@ struct RuntimeManagerView: View {
                 .replacingOccurrences(of: "秒経過", with: "s elapsed")
         }
         return value
+    }
+}
+
+/// Stable `ForEach` identities for slot/history rows.
+///
+/// Both `ForEach`s previously keyed on `.indices`, which ties SwiftUI's
+/// diffing to array position rather than content: an insert, removal, or
+/// reorder (e.g. a runtime job finishing and the slot list refreshing) can
+/// make SwiftUI reuse a row's identity — and any per-row state or in-flight
+/// animation — for what is actually a different slot/history entry. Keying on
+/// the backend's own identifiers keeps a row tied to the same real record
+/// across refreshes.
+private extension [String: Any] {
+    var slotIdentifier: String { self["id"] as? String ?? "unknown" }
+
+    var historyIdentifier: String {
+        let createdAt = self["created_at"] as? String ?? ""
+        let action = self["action"] as? String ?? ""
+        let slotID = self["slot_id"] as? String ?? ""
+        return "\(createdAt)|\(action)|\(slotID)"
     }
 }

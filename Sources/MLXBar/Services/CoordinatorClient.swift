@@ -108,6 +108,15 @@ final class CoordinatorClient: @unchecked Sendable {
             if chunk.isEmpty { return }
             buffer.appendDiagnostic(chunk)
         }
+        // If `process.run()` throws below, the continuation is resumed before
+        // this function reaches its normal cleanup, which would otherwise
+        // leave these handlers registered forever — pinning their pipes and,
+        // transitively, `buffer`/`onEvent` (and whatever `self` the caller's
+        // closure captured) alive with no way to release them.
+        defer {
+            output.fileHandleForReading.readabilityHandler = nil
+            error.fileHandleForReading.readabilityHandler = nil
+        }
 
         let status: Int32 = try await withCheckedThrowingContinuation { continuation in
             process.terminationHandler = { process in
@@ -118,8 +127,6 @@ final class CoordinatorClient: @unchecked Sendable {
         // Drain whatever the handlers had not yet been scheduled for.
         buffer.append(output.fileHandleForReading.readDataToEndOfFile())
         buffer.appendDiagnostic(error.fileHandleForReading.readDataToEndOfFile())
-        output.fileHandleForReading.readabilityHandler = nil
-        error.fileHandleForReading.readabilityHandler = nil
 
         guard status == 0 else {
             if status == 28 { throw ClientError.timedOut }
@@ -146,7 +153,8 @@ final class CoordinatorClient: @unchecked Sendable {
 
         func appendDiagnostic(_ chunk: Data) {
             guard !chunk.isEmpty else { return }
-            lock.lock(); diagnostic.append(chunk); lock.unlock()
+            lock.lock(); defer { lock.unlock() }
+            diagnostic.append(chunk)
         }
 
         func append(_ chunk: Data) {
@@ -215,8 +223,8 @@ final class CoordinatorClient: @unchecked Sendable {
         let domain = "gui/\(getuid())"
         let fallbackPlist = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/\(serviceLabel).plist")
-        _ = try? await launchctl(["bootout", "\(domain)/\(serviceLabel)"])
-        _ = try? await launchctl(["bootout", domain, fallbackPlist.path])
+        _ = try? await launchctl(["bootout", "\(domain)/\(serviceLabel)"], timeoutSeconds: 10)
+        _ = try? await launchctl(["bootout", domain, fallbackPlist.path], timeoutSeconds: 10)
 
         let service = SMAppService.agent(plistName: "com.yukiorita.MLXBar.Coordinator.plist")
         try? await service.unregister()
@@ -231,7 +239,7 @@ final class CoordinatorClient: @unchecked Sendable {
         }
 
         _ = try? await runProcess(URL(fileURLWithPath: "/usr/bin/defaults"),
-                                  ["delete", "com.yukiorita.MLXBar"])
+                                  ["delete", "com.yukiorita.MLXBar"], timeoutSeconds: 10)
 
         let home = FileManager.default.homeDirectoryForCurrentUser
         let paths = [
@@ -305,30 +313,68 @@ final class CoordinatorClient: @unchecked Sendable {
     }
 
     @discardableResult
-    private func launchctl(_ arguments: [String]) async throws -> Data {
-        try await runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments)
+    private func launchctl(_ arguments: [String], timeoutSeconds: Int? = nil) async throws -> Data {
+        try await runProcess(URL(fileURLWithPath: "/bin/launchctl"), arguments, timeoutSeconds: timeoutSeconds)
     }
 
+    /// Guards a `CheckedContinuation` so two racing completion paths — a
+    /// process's `terminationHandler` and a timeout watchdog — can each try to
+    /// resume it without the second one tripping `withCheckedThrowingContinuation`'s
+    /// fatal "resumed more than once" check.
+    private final class SingleResume: @unchecked Sendable {
+        private let lock = NSLock()
+        private var didResume = false
+        func run(_ body: () -> Void) {
+            lock.lock()
+            let alreadyResumed = didResume
+            didResume = true
+            lock.unlock()
+            guard !alreadyResumed else { return }
+            body()
+        }
+    }
+
+    /// Runs a process and resolves once, either when it exits or — if
+    /// `timeoutSeconds` is given — when the watchdog fires first.
+    ///
+    /// Unlike `request()`'s curl calls (which have `--max-time` built in),
+    /// plain `launchctl`/`defaults` invocations have no self-timeout: a wedged
+    /// `launchctl bootout` used to leave the awaiting call (and callers like
+    /// `removeAllData()`'s `busy`/`isRemovingAllData` spinner) hanging with no
+    /// way back short of a relaunch.
     private func runProcess(_ executable: URL, _ arguments: [String],
-                            timeoutStatuses: Set<Int32> = []) async throws -> Data {
+                            timeoutStatuses: Set<Int32> = [],
+                            timeoutSeconds: Int? = nil) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = executable; process.arguments = arguments
             let output = Pipe(), error = Pipe()
             process.standardOutput = output; process.standardError = error
+
+            let resume = SingleResume()
             process.terminationHandler = { process in
                 let data = output.fileHandleForReading.readDataToEndOfFile()
-                if process.terminationStatus == 0 {
-                    continuation.resume(returning: data)
-                } else if timeoutStatuses.contains(process.terminationStatus) {
-                    continuation.resume(throwing: ClientError.timedOut)
-                } else {
-                    let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    let stdout = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(throwing: ClientError.command([stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)))
+                resume.run {
+                    if process.terminationStatus == 0 {
+                        continuation.resume(returning: data)
+                    } else if timeoutStatuses.contains(process.terminationStatus) {
+                        continuation.resume(throwing: ClientError.timedOut)
+                    } else {
+                        let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                        let stdout = String(data: data, encoding: .utf8) ?? ""
+                        continuation.resume(throwing: ClientError.command([stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)))
+                    }
                 }
             }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+            if let timeoutSeconds {
+                Task {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    guard process.isRunning else { return }
+                    process.terminate()
+                    resume.run { continuation.resume(throwing: ClientError.timedOut) }
+                }
+            }
+            do { try process.run() } catch { resume.run { continuation.resume(throwing: error) } }
         }
     }
 }

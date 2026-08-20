@@ -151,7 +151,7 @@ final class MenuBarViewModel: ObservableObject {
         if errorMessage != nil { return "exclamationmark.triangle" }
         if busy || activeRequestCount > 0 || queuedRequestCount > 0 { return "waveform" }
         if loadedName != nil { return "cpu.fill" }
-        return serviceRunning ? "cpu" : "cpu"
+        return serviceRunning ? "cpu" : "moon.zzz"
     }
     var shortStatus: String {
         if let loadingModelName { return guiLanguage == "ja" ? "ロード中 · \(loadingModelName)" : "Loading · \(loadingModelName)" }
@@ -180,6 +180,24 @@ final class MenuBarViewModel: ObservableObject {
         await refreshStatus(); await refreshModels(); await refreshRuntimes(); await refreshSettings()
     }
 
+    /// Assigns only when the value actually differs.
+    ///
+    /// `refreshStatus()` runs every second while the menu is open (see
+    /// `MenuBarView.task`) and re-decodes the full status payload on every
+    /// tick. `@Published` broadcasts `objectWillChange` on every assignment
+    /// regardless of whether the new value equals the old one, so writing
+    /// unconditionally here forced the status item's `Label(shortStatus,
+    /// systemImage: icon)` to re-render up to a dozen times per second even
+    /// when nothing changed. `MenuBarExtra`'s `.menuBarExtraStyle(.window)`
+    /// is known (see mlx-bar.md) to render unreliably under rapid content
+    /// churn — that's what previously collapsed the popover to a few px in
+    /// v1.2.1 — and the same churn here was flashing/hiding the menu bar
+    /// icon itself right after opening it. Guarding each field keeps
+    /// `objectWillChange` quiet when the poll result matches current state.
+    private func setIfChanged<T: Equatable>(_ keyPath: ReferenceWritableKeyPath<MenuBarViewModel, T>, _ newValue: T) {
+        if self[keyPath: keyPath] != newValue { self[keyPath: keyPath] = newValue }
+    }
+
     func refreshStatus() async {
         // Two loops poll status (the view model's timer and the open menu's
         // 1-second refresh). Without a token, a slow response from one can land
@@ -190,54 +208,55 @@ final class MenuBarViewModel: ObservableObject {
             guard let json = try await json("GET", "/api/v1/status") as? [String: Any] else { return }
             guard token == statusRequestToken else { return }
             let wasRunning = serviceRunning
-            serviceRunning = true
+            setIfChanged(\.serviceRunning, true)
             // A successful status poll must not erase a model/runtime error the
             // user still needs to read. Only clear an earlier connection error
             // when the service has actually recovered.
-            if !wasRunning { errorMessage = nil }
-            serviceStatus = json["service"] as? String == "running"
+            if !wasRunning { setIfChanged(\.errorMessage, nil) }
+            setIfChanged(\.serviceStatus, json["service"] as? String == "running"
                 ? (guiLanguage == "ja" ? "サービス稼働中" : "Service running")
-                : (guiLanguage == "ja" ? "サービス停止" : "Service stopped")
-            activeRequestCount = (json["activeRequestCount"] as? NSNumber)?.intValue ?? 0
-            queuedRequestCount = (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0
-            oldestQueuedSeconds = (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0
+                : (guiLanguage == "ja" ? "サービス停止" : "Service stopped"))
+            setIfChanged(\.activeRequestCount, (json["activeRequestCount"] as? NSNumber)?.intValue ?? 0)
+            setIfChanged(\.queuedRequestCount, (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0)
+            setIfChanged(\.oldestQueuedSeconds, (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0)
             if let loaded = json["loadedModel"] as? [String: Any] {
-                loadedName = loaded["name"] as? String; loadedEngine = loaded["engine"] as? String
-                loadedModalities = (loaded["capabilities"] as? [String: Any])?["modalities"] as? [String]
-                    ?? loaded["modalities"] as? [String] ?? ["text"]
-                loadedModelMaxTokens = ((loaded["capabilities"] as? [String: Any])?["modelMaxTokens"] as? NSNumber)?.intValue
-                effectiveMaxTokens = (loaded["effectiveMaxTokens"] as? NSNumber)?.intValue ?? configuredMaxTokens
-                effectiveMaxPromptCharacters = (loaded["effectiveMaxPromptCharacters"] as? NSNumber)?.intValue ?? 100000
+                setIfChanged(\.loadedName, loaded["name"] as? String)
+                setIfChanged(\.loadedEngine, loaded["engine"] as? String)
+                setIfChanged(\.loadedModalities, (loaded["capabilities"] as? [String: Any])?["modalities"] as? [String]
+                    ?? loaded["modalities"] as? [String] ?? ["text"])
+                setIfChanged(\.loadedModelMaxTokens, ((loaded["capabilities"] as? [String: Any])?["modelMaxTokens"] as? NSNumber)?.intValue)
+                setIfChanged(\.effectiveMaxTokens, (loaded["effectiveMaxTokens"] as? NSNumber)?.intValue ?? configuredMaxTokens)
+                setIfChanged(\.effectiveMaxPromptCharacters, (loaded["effectiveMaxPromptCharacters"] as? NSNumber)?.intValue ?? 100000)
             } else {
-                loadedName = nil; loadedEngine = nil; loadedModalities = []
-                loadedModelMaxTokens = nil; effectiveMaxTokens = configuredMaxTokens
-                effectiveMaxPromptCharacters = 100000; activeRequestCount = 0
-                queuedRequestCount = 0; oldestQueuedSeconds = 0
+                setIfChanged(\.loadedName, nil); setIfChanged(\.loadedEngine, nil); setIfChanged(\.loadedModalities, [])
+                setIfChanged(\.loadedModelMaxTokens, nil); setIfChanged(\.effectiveMaxTokens, configuredMaxTokens)
+                setIfChanged(\.effectiveMaxPromptCharacters, 100000); setIfChanged(\.activeRequestCount, 0)
+                setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
             }
             if let loading = json["loadingModel"] as? [String: Any] {
-                loadingModelName = loading["name"] as? String
-                loadingEngine = loading["engine"] as? String
-                loadingPhase = loading["phase"] as? String
+                setIfChanged(\.loadingModelName, loading["name"] as? String)
+                setIfChanged(\.loadingEngine, loading["engine"] as? String)
+                setIfChanged(\.loadingPhase, loading["phase"] as? String)
                 if let timestamp = (loading["startedAt"] as? NSNumber)?.doubleValue {
-                    loadingStartedAt = Date(timeIntervalSince1970: timestamp)
+                    setIfChanged(\.loadingStartedAt, Date(timeIntervalSince1970: timestamp))
                 }
             } else if !localLoadInProgress {
-                loadingModelName = nil
-                loadingEngine = nil; loadingPhase = nil; loadingStartedAt = nil
+                setIfChanged(\.loadingModelName, nil)
+                setIfChanged(\.loadingEngine, nil); setIfChanged(\.loadingPhase, nil); setIfChanged(\.loadingStartedAt, nil)
             }
             if let api = json["api"] as? [String: Any] {
-                apiURL = api["url"] as? String ?? apiURL
-                localAPIURL = api["localUrl"] as? String ?? apiURL
-                lanAPIURLs = api["lanUrls"] as? [String] ?? []
-                lanEnabled = api["lanEnabled"] as? Bool ?? false
+                setIfChanged(\.apiURL, api["url"] as? String ?? apiURL)
+                setIfChanged(\.localAPIURL, api["localUrl"] as? String ?? apiURL)
+                setIfChanged(\.lanAPIURLs, api["lanUrls"] as? [String] ?? [])
+                setIfChanged(\.lanEnabled, api["lanEnabled"] as? Bool ?? false)
             }
         } catch {
             guard token == statusRequestToken else { return }
-            serviceRunning = false
-            serviceStatus = guiLanguage == "ja" ? "サービス停止" : "Service stopped"
-            activeRequestCount = 0
-            queuedRequestCount = 0; oldestQueuedSeconds = 0
-            errorMessage = error.localizedDescription
+            setIfChanged(\.serviceRunning, false)
+            setIfChanged(\.serviceStatus, guiLanguage == "ja" ? "サービス停止" : "Service stopped")
+            setIfChanged(\.activeRequestCount, 0)
+            setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
+            setIfChanged(\.errorMessage, error.localizedDescription)
         }
     }
 
@@ -287,7 +306,8 @@ final class MenuBarViewModel: ObservableObject {
             let body: [String: Any] = ["prompt": prompt, "images": images.map(\.path),
                                        "temperature": temperature, "max_tokens": maxTokens,
                                        "requestId": requestID]
-            try await client.stream("/api/v1/generate", bodyJSON: try self.encode(body)) { event in
+            try await client.stream("/api/v1/generate", bodyJSON: try self.encode(body)) { [weak self] event in
+                guard let self else { return }
                 Task { @MainActor in
                     if event.type == "delta", let text = event.text {
                         self.chatOutput += text
@@ -422,7 +442,7 @@ final class MenuBarViewModel: ObservableObject {
         guard info.isActive, !monitoredRuntimeJobIDs.contains(info.id) else { return }
         monitoredRuntimeJobIDs.insert(info.id)
         updatingEngines.insert(engine)
-        Task { await self.monitorRuntimeJob(engine, initial: value) }
+        Task { [weak self] in await self?.monitorRuntimeJob(engine, initial: value) }
     }
 
     private func monitorRuntimeJob(_ engine: String, initial: [String: Any]) async {
@@ -734,9 +754,10 @@ final class MenuBarViewModel: ObservableObject {
         NSPasteboard.general.setString(loadedName, forType: .string)
         modelCopyStatus = ui("Model name copied", "モデル名をコピーしました")
         let copiedStatus = modelCopyStatus
-        Task {
+        Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
-            if self.modelCopyStatus == copiedStatus { self.modelCopyStatus = nil }
+            guard let self, self.modelCopyStatus == copiedStatus else { return }
+            self.modelCopyStatus = nil
         }
     }
 
