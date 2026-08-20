@@ -25,6 +25,9 @@ from .settings import app_support_dir
 from .state import AppState, CATALOG_CLASSIFIER_VERSION
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def make_management_app(state: AppState) -> FastAPI:
     app = FastAPI(title="MLXBar Management API", docs_url=None, redoc_url=None)
     app.state.mlxbar = state
@@ -37,8 +40,14 @@ def make_public_app(state: AppState) -> FastAPI:
     app.state.mlxbar = state
 
     @app.exception_handler(HTTPException)
-    async def openai_http_error(_request: Request, exc: HTTPException):
+    async def openai_http_error(request: Request, exc: HTTPException):
         detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        api_log = getattr(request.state, "api_log", None)
+        if isinstance(api_log, dict):
+            api_log["error_code"] = detail.get("code") or "HTTP_ERROR"
+        if detail.get("code") or detail.get("parameters"):
+            LOGGER.warning("OpenAI request rejected: code=%s parameters=%s path=%s",
+                           detail.get("code"), detail.get("parameters"), request.url.path)
         error = {"message": detail.get("message") or detail.get("code") or "Request failed",
                  "type": detail.get("type", "invalid_request_error"),
                  "param": detail.get("param"), "code": detail.get("code")}

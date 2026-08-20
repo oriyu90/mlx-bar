@@ -170,6 +170,24 @@ def test_zcode_thinking_and_reasoning_effort_are_normalized_for_qwen():
         }
 
 
+def test_zcode_extension_variants_do_not_trigger_unsupported_parameter():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        body = request_body()
+        body.update({
+            "future_client_field": {"ignored": True},
+            "extra_body": {
+                "thinking": {"type": "enabled", "effort": "XHIGH", "future_option": True},
+                "future_provider_field": "ignored",
+            },
+        })
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert worker.received[2]["chat_template_kwargs"] == {
+            "enable_thinking": True, "reasoning_effort": "xhigh",
+        }
+
+
 def test_explicit_chat_template_kwargs_override_normalized_thinking_values():
     with tempfile.TemporaryDirectory() as directory:
         client, worker, _ = make_client(Path(directory))
@@ -206,7 +224,6 @@ def test_invalid_or_unsafe_extra_body_is_rejected_before_generation():
         invalid_values = (
             ([], 422),
             ({"chat_template_kwargs": False}, 422),
-            ({"unknown": True}, 400),
             ({"chat_template_kwargs": {"tools": []}}, 400),
         )
         for extra_body, expected_status in invalid_values:
@@ -222,10 +239,8 @@ def test_invalid_thinking_options_are_rejected_before_generation():
         client, worker, _ = make_client(Path(directory))
         invalid_values = (
             ({"thinking": []}, 422),
-            ({"thinking": {}}, 422),
             ({"thinking": {"type": "unknown"}}, 422),
             ({"thinking": {"type": []}}, 422),
-            ({"thinking": {"unexpected": True}}, 400),
             ({"thinking": {"budget_tokens": True}}, 422),
             ({"thinking": {"clear_thinking": "no"}}, 422),
             ({"reasoning_effort": False}, 422),
@@ -267,6 +282,19 @@ def test_api_log_is_bounded_and_does_not_store_request_bodies():
         assert not {"messages", "tools", "authorization", "response"}.intersection(logs[0])
         assert database.clear_api_logs() == 2000
         assert database.list_api_logs() == []
+
+
+def test_rejected_request_records_model_and_error_code_without_body():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, database = make_client(Path(directory))
+        response = client.post("/v1/chat/completions", json={
+            **request_body(), "thinking": {"type": "invalid"},
+        })
+        assert response.status_code == 422
+        log = database.list_api_logs(1)[0]
+        assert log["model"] == "Laguna-S-2.1-oQ2e"
+        assert log["error_code"] == "INVALID_REQUEST"
+        assert not {"messages", "thinking", "response"}.intersection(log)
 
 
 def test_zcode_oversized_max_tokens_is_clamped_instead_of_rejected():

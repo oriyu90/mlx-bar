@@ -43,7 +43,7 @@
       "alternateName": ["エムエルエックスバー", "MLXバー"],
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "macOS 14.0 or later, Apple Silicon",
-      "softwareVersion": "1.3.4",
+      "softwareVersion": "1.3.5",
       "url": "https://mlx-bar.pages.dev/",
       "downloadUrl": "https://github.com/oriyu90/mlx-bar/releases",
       "codeRepository": "https://github.com/oriyu90/mlx-bar",
@@ -315,7 +315,7 @@ footer .legal { margin: 0; line-height: 1.8; }
   <div class="hero">
     <div class="wrap">
       <div>
-        <p class="kicker">macOS 14+ / Apple Silicon / v1.3.4</p>
+        <p class="kicker">macOS 14+ / Apple Silicon / v1.3.5</p>
         <h1 data-i18n="hero.h1">MacのローカルAIを、メニューバーから。</h1>
         <p data-i18n="hero.p">
           MLXBar（エムエルエックスバー）は、Apple Silicon Mac上のMLX LM・MLX VLM・LM Studioモデルを
@@ -391,7 +391,7 @@ footer .legal { margin: 0; line-height: 1.8; }
           <dt data-i18n="features.f1t">クイックチャット</dt>
           <dd data-i18n="features.f1d">読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。</dd>
           <dt data-i18n="features.f2t">OpenAI互換API</dt>
-          <dd data-i18n="features.f2d">Chat Completions、モデル一覧、tool calling、ストリーミングに対応。ZCodeのthinking・推論強度もQwen等のMLXモデルへ伝えます。</dd>
+          <dd data-i18n="features.f2d">Chat Completions、tool calling、ストリーミングに対応。ZCodeのthinking・推論強度をMLXモデルへ伝え、未知の互換拡張も安全に扱います。</dd>
           <dt data-i18n="features.f3t">生成パラメータ</dt>
           <dd data-i18n="features.f3d">Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。</dd>
         </dl>
@@ -412,7 +412,7 @@ footer .legal { margin: 0; line-height: 1.8; }
       <h2 data-i18n="start.h2">使いはじめる</h2>
       <p class="lede" data-i18n="start.lede">アカウント登録も、APIキーの取得も要りません。</p>
       <ol class="steps">
-        <li><span data-i18n="start.s1" data-i18n-html="true"><b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.3.4.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。</span></li>
+        <li><span data-i18n="start.s1" data-i18n-html="true"><b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.3.5.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。</span></li>
         <li><span data-i18n="start.s2" data-i18n-html="true"><b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。</span></li>
         <li><span data-i18n="start.s3" data-i18n-html="true"><b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。</span></li>
         <li><span data-i18n="start.s4" data-i18n-html="true"><b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。</span></li>
@@ -445,7 +445,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       <table class="spec">
         <tr><th scope="row" data-i18n="spec.mac">対応Mac</th><td>Apple Silicon（M1以降）</td></tr>
         <tr><th scope="row" data-i18n="spec.macos">macOS</th><td data-i18n="spec.macosValue">14以降（15以降を推奨）</td></tr>
-        <tr><th scope="row" data-i18n="spec.latest">最新版</th><td>v1.3.4</td></tr>
+        <tr><th scope="row" data-i18n="spec.latest">最新版</th><td>v1.3.5</td></tr>
         <tr><th scope="row" data-i18n="spec.price">価格</th><td data-i18n="spec.priceValue">無料（MITライセンスのオープンソース）</td></tr>
         <tr><th scope="row" data-i18n="spec.lang">表示言語</th><td>English / 日本語</td></tr>
         <tr><th scope="row" data-i18n="spec.optional">任意</th><td data-i18n="spec.optionalValue" data-i18n-html="true">GGUFモデルを使う場合はLM Studioと <code>lms</code> CLI</td></tr>
@@ -534,7 +534,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f1t": "クイックチャット",
       "features.f1d": "読み込んだモデルとそのまま対話できます。ストリーミング生成、途中キャンセル、VLM選択時の画像入力に対応します。",
       "features.f2t": "OpenAI互換API",
-      "features.f2d": "Chat Completions、モデル一覧、tool calling、ストリーミングに対応。ZCodeのthinking・推論強度もQwen等のMLXモデルへ伝えます。",
+      "features.f2d": "Chat Completions、tool calling、ストリーミングに対応。ZCodeのthinking・推論強度をMLXモデルへ伝え、未知の互換拡張も安全に扱います。",
       "features.f3t": "生成パラメータ",
       "features.f3d": "Max token上限、温度、Top P、繰り返しペナルティを既定値として保存。モデル固有のコンテキスト長を検出し、超過した要求は自動で調整します。",
       "features.f4t": "並列リクエスト",
@@ -545,7 +545,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f6d": "GUIと同じ管理APIを使う <code>mlxbarctl</code> を同梱。表示言語はEnglishと日本語を設定から切り替えられます。",
       "start.h2": "使いはじめる",
       "start.lede": "アカウント登録も、APIキーの取得も要りません。",
-      "start.s1": "<b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.3.4.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。",
+      "start.s1": "<b>ダウンロードして開く。</b> GitHub Releasesから <code>MLXBar-1.3.5.dmg</code> を取得し、<code>MLXBar.app</code> を「アプリケーション」へコピーします。",
       "start.s2": "<b>起動する。</b> メニューバーにアイコンが並びます。<code>mlx-lm</code> と <code>mlx-vlm</code> が未導入の場合は、バックグラウンドで自動的に用意されます。",
       "start.s3": "<b>モデルを選ぶ。</b> 「モデルを選択…」から、Mac上にあるモデルを検索して読み込みます。",
       "start.s4": "<b>使う。</b> 「クイックチャット…」で対話するか、<code>http://127.0.0.1:11435</code> のOpenAI互換APIへ接続します。",
@@ -616,7 +616,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f1t": "Quick Chat",
       "features.f1d": "Chat directly with the loaded model. Supports streaming generation, mid-generation cancellation, and image input when a VLM is selected.",
       "features.f2t": "OpenAI-compatible API",
-      "features.f2d": "Supports Chat Completions, model listing, tool calling, and streaming. ZCode thinking and reasoning effort are forwarded to MLX models such as Qwen.",
+      "features.f2d": "Supports Chat Completions, tool calling, and streaming. ZCode thinking and reasoning effort reach MLX models, while unknown compatibility extensions are handled safely.",
       "features.f3t": "Generation parameters",
       "features.f3d": "Saves default max tokens, temperature, Top P, and repetition penalty. Detects each model's context length and automatically adjusts requests that exceed it.",
       "features.f4t": "Parallel requests",
@@ -627,7 +627,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f6d": "Ships <code>mlxbarctl</code>, which uses the same management API as the GUI. Interface language can be switched between English and Japanese in Settings.",
       "start.h2": "Get started",
       "start.lede": "No account, no API key to obtain.",
-      "start.s1": "<b>Download and open it.</b> Get <code>MLXBar-1.3.4.dmg</code> from GitHub Releases and copy <code>MLXBar.app</code> to Applications.",
+      "start.s1": "<b>Download and open it.</b> Get <code>MLXBar-1.3.5.dmg</code> from GitHub Releases and copy <code>MLXBar.app</code> to Applications.",
       "start.s2": "<b>Launch it.</b> An icon appears in the menu bar. If <code>mlx-lm</code> and <code>mlx-vlm</code> aren't installed yet, they're set up automatically in the background.",
       "start.s3": "<b>Choose a model.</b> Use “Select Model…” to search for and load a model already on your Mac.",
       "start.s4": "<b>Use it.</b> Chat via “Quick Chat…”, or connect to the OpenAI-compatible API at <code>http://127.0.0.1:11435</code>.",
@@ -693,7 +693,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f1t": "快速对话",
       "features.f1d": "可直接与已加载的模型对话。支持流式生成、中途取消，以及选择 VLM 时的图像输入。",
       "features.f2t": "OpenAI 兼容 API",
-      "features.f2d": "支持 Chat Completions、模型列表、工具调用（tool calling）与流式输出。ZCode 的思考开关与推理强度也会传递给 Qwen 等 MLX 模型。",
+      "features.f2d": "支持 Chat Completions、工具调用与流式输出。ZCode 的思考开关和推理强度会传递给 MLX 模型，未知兼容扩展也会被安全处理。",
       "features.f3t": "生成参数",
       "features.f3d": "保存最大 Token 数、温度、Top P、重复惩罚等默认值。自动检测各模型的上下文长度，并对超出限制的请求自动调整。",
       "features.f4t": "并行请求",
@@ -704,7 +704,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f6d": "内置与 GUI 共用同一管理 API 的 <code>mlxbarctl</code>。界面语言可在设置中切换为英语或日语。",
       "start.h2": "开始使用",
       "start.lede": "无需注册账号，也无需获取 API 密钥。",
-      "start.s1": "<b>下载并打开。</b> 从 GitHub Releases 获取 <code>MLXBar-1.3.4.dmg</code>，将 <code>MLXBar.app</code> 复制到「应用程序」中。",
+      "start.s1": "<b>下载并打开。</b> 从 GitHub Releases 获取 <code>MLXBar-1.3.5.dmg</code>，将 <code>MLXBar.app</code> 复制到「应用程序」中。",
       "start.s2": "<b>启动应用。</b> 菜单栏中会出现图标。如果尚未安装 <code>mlx-lm</code> 与 <code>mlx-vlm</code>，会在后台自动安装。",
       "start.s3": "<b>选择模型。</b> 通过「选择模型…」搜索并加载 Mac 上已有的模型。",
       "start.s4": "<b>开始使用。</b> 通过「快速对话…」进行对话，或连接到 <code>http://127.0.0.1:11435</code> 的 OpenAI 兼容 API。",
@@ -770,7 +770,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f1t": "Chat rápido",
       "features.f1d": "Converse diretamente com o modelo carregado. Suporta geração em streaming, cancelamento no meio da geração e entrada de imagens ao selecionar um VLM.",
       "features.f2t": "API compatível com OpenAI",
-      "features.f2d": "Suporta Chat Completions, listagem de modelos, tool calling e streaming. O modo de raciocínio e seu nível no ZCode são encaminhados a modelos MLX como o Qwen.",
+      "features.f2d": "Suporta Chat Completions, tool calling e streaming. O modo e o nível de raciocínio do ZCode chegam aos modelos MLX, e extensões desconhecidas são tratadas com segurança.",
       "features.f3t": "Parâmetros de geração",
       "features.f3d": "Salva valores padrão de tokens máximos, temperatura, Top P e penalidade de repetição. Detecta o tamanho de contexto de cada modelo e ajusta automaticamente requisições que o excedam.",
       "features.f4t": "Requisições paralelas",
@@ -781,7 +781,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
       "features.f6d": "Inclui o <code>mlxbarctl</code>, que usa a mesma API de gerenciamento do app gráfico. O idioma da interface pode ser alternado entre inglês e japonês nos Ajustes.",
       "start.h2": "Como começar",
       "start.lede": "Sem conta, sem precisar obter uma chave de API.",
-      "start.s1": "<b>Baixe e abra.</b> Obtenha <code>MLXBar-1.3.4.dmg</code> nos GitHub Releases e copie <code>MLXBar.app</code> para Aplicativos.",
+      "start.s1": "<b>Baixe e abra.</b> Obtenha <code>MLXBar-1.3.5.dmg</code> nos GitHub Releases e copie <code>MLXBar.app</code> para Aplicativos.",
       "start.s2": "<b>Inicie o app.</b> Um ícone aparece na barra de menus. Se <code>mlx-lm</code> e <code>mlx-vlm</code> ainda não estiverem instalados, eles são preparados automaticamente em segundo plano.",
       "start.s3": "<b>Escolha um modelo.</b> Use “Selecionar modelo…” para buscar e carregar um modelo já presente no seu Mac.",
       "start.s4": "<b>Use.</b> Converse pelo “Chat rápido…” ou conecte-se à API compatível com OpenAI em <code>http://127.0.0.1:11435</code>.",

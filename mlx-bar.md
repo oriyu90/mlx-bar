@@ -5,6 +5,13 @@
 
 ## 未解決の課題
 
+### ZCode互換拡張の将来互換化（2026-08-21対応）
+- 症状: v1.3.4でトップレベルの`thinking`を追加した後も、実機のZCodeからQwen3.8へ送った要求がHTTP 400 `UNSUPPORTED_PARAMETER`になった。インストール済みアプリと配布DMGのCoordinatorハッシュは一致しており、v1.3.4未適用ではなかった。
+- 原因: OpenAI互換入口、`extra_body`、`thinking`の各階層に未知項目を拒否するホワイトリストが残っており、ZCodeのバージョンやモデル別dialectによる追加項目で再発できる設計だった。旧監査ログは早期入力エラーのモデル名とエラーコードも記録できず、ZCode側も`parameters`配列を表示しないため、実機の拒否項目名を後から特定できなかった。
+- 修正: 未知の互換拡張はWorkerへ渡さず無視し、既知の値だけを検証・正規化する。`extra_body.thinking`、`extra_body.reasoning_effort`、`thinking.effort`も受理する。MLXBar自身が管理する予約済み`chat_template_kwargs`は引き続き拒否する。
+- 診断: API処理の先頭で本文を含まない監査メタデータを作り、HTTP入力エラーのモデル名とコードをSQLiteへ、拒否項目名だけをCoordinatorログへ残す。会話本文、応答本文、APIキーは保存しない。
+- 検証: ZCode互換拡張と診断ログの回帰テストを追加し、Pythonテスト144件が成功。
+
 ### ZCodeのトップレベル`thinking`・`reasoning_effort`対応（2026-08-21対応）
 - 症状: v1.3.3で`extra_body.chat_template_kwargs`に対応した後も、ZCodeがQwen3.8の要求にトップレベルの`thinking`を追加すると、Coordinatorのホワイトリスト検証がHTTP 400 `UNSUPPORTED_PARAMETER`を返していた。さらに`reasoning_effort`は許可項目にあるが、生成`options`へ入れておらず実質的に無視していた。
 - 修正: `thinking`をブール値またはオブジェクトとして検証し、`type: enabled|adaptive`を`enable_thinking: true`、`type: disabled`を`false`、`budget_tokens`を`thinking_budget`、`clear_thinking`を逆値の`preserve_thinking`へ変換。トップレベルの`reasoning_effort`も小文字化して同名のテンプレート引数へ渡し、`none`の場合は明示値がない限りthinkingを無効化する。
