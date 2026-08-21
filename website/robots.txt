@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://mlx-bar.pages.dev/sitemap.xml
+Sitemap: https://studio-rizi.pages.dev/sitemap.xml
