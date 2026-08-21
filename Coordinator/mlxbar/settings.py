@@ -49,6 +49,10 @@ DEFAULTS: dict[str, Any] = {
         "cancelGraceSeconds": 5,
         "memoryLimitRatio": 0.90,
     },
+    "promptCache": {
+        "diskEnabled": True,
+        "diskMaxGB": 5,
+    },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info", "language": "en"},
@@ -118,6 +122,13 @@ class SettingsStore:
             raise ValueError("api.host must be 127.0.0.1 or 0.0.0.0")
         if allow_lan != (host == "0.0.0.0"):
             raise ValueError("api.host and security.allowLan must be changed together")
+        prompt_cache = data.get("promptCache", {})
+        if not isinstance(prompt_cache.get("diskEnabled", True), bool):
+            raise ValueError("promptCache.diskEnabled must be boolean")
+        disk_max_gb = prompt_cache.get("diskMaxGB", 5)
+        if (isinstance(disk_max_gb, bool) or not isinstance(disk_max_gb, (int, float))
+                or not 1 <= float(disk_max_gb) <= 100):
+            raise ValueError("promptCache.diskMaxGB must be between 1 and 100")
         if allow_lan and not api.get("requireToken", True):
             raise ValueError("LAN公開中はAPIキーを無効にできません")
         if not isinstance(data.get("security", {}).get("allowRemoteImageUrls", False), bool):

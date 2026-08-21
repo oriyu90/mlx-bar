@@ -300,7 +300,8 @@ def test_legacy_api_log_schema_is_migrated_with_performance_columns():
         database = Database(path)
         columns = {row[1] for row in database.connection.execute("PRAGMA table_info(api_logs)")}
         assert {"message_chars", "tool_schema_chars", "first_token_ms", "prompt_tokens",
-                "cached_tokens", "prompt_tps", "generation_tps", "reasoning_mode"} <= columns
+                "cached_tokens", "prompt_tps", "generation_tps", "reasoning_mode",
+                "cache_tier"} <= columns
 
 
 def test_stream_log_records_privacy_safe_prefill_and_cache_metrics():
@@ -309,7 +310,8 @@ def test_stream_log_records_privacy_safe_prefill_and_cache_metrics():
             yield {"type": "delta", "text": "hello"}
             yield {"type": "usage", "prompt_tokens": 4200, "completion_tokens": 3}
             yield {"type": "metrics", "prompt_tokens": 4200, "cached_tokens": 4000,
-                   "prompt_tps": 900.5, "generation_tps": 11.25}
+                   "prompt_tps": 900.5, "generation_tps": 11.25,
+                   "cache_tier": "disk"}
             yield {"type": "completed", "finish_reason": "stop"}
 
     with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +335,7 @@ def test_stream_log_records_privacy_safe_prefill_and_cache_metrics():
         assert log["first_token_ms"] is not None
         assert log["prompt_tokens"] == 4200 and log["cached_tokens"] == 4000
         assert log["prompt_tps"] == 900.5 and log["generation_tps"] == 11.25
+        assert log["cache_tier"] == "disk"
         assert not {"messages", "tools", "content", "response"}.intersection(log)
 
 

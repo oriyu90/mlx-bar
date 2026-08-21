@@ -99,6 +99,7 @@ def make_public_app(state: AppState) -> FastAPI:
                     "cached_tokens": details.get("cached_tokens", 0),
                     "prompt_tps": details.get("prompt_tps", 0),
                     "generation_tps": details.get("generation_tps", 0),
+                    "cache_tier": details.get("cache_tier"),
                     "error_code": details.get("error_code") or error_code,
                     "client_scope": "local" if client_host in {"127.0.0.1", "::1", "testclient", ""} else "lan",
                 })

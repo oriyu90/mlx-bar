@@ -2,6 +2,22 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.4.0] - 2026-08-21
+
+### 改善
+
+- **mlx-vlmモデルで、Worker再起動後の最初のZCode会話にも長い共通prefixを再利用できる永続cacheを追加しました。** mlx-vlm公式`APCManager` / `DiskBlockStore`をディスク専用層として組み込み、v1.3.7の`PromptCacheState`を高速なRAM層として維持します。OpenAI互換messages・tools・tool callingの意味は変更しません。
+- Qwen3.8等のhybrid exact-cacheでは末尾256 tokensをcoldに残す境界snapshotを保存し、最初のユーザー文が変わっても、その前の大きなsystem prompt・tools定義を再利用できるようにしました。
+- モデルパス、設定/tokenizer/chat template、重みのsize/mtime、mlx-vlm版、cache形式版からnamespaceを分離します。APCは安定SHA-256 block hashを使用し、最大5 GB（設定で1〜100 GB）のLRU disk tierとして動作します。
+- APC障害が応答開始前に発生した場合だけ、既存のPromptCacheState/cold経路で一度再試行します。APCと無関係なモデルエラーは再試行せず、そのまま報告します。
+- 設定画面へ「キャッシュ」を追加し、有効/無効、容量上限、使用量、disk hit、RAM/disk個別消去を操作できるようにしました。APIログには本文を保存せず`cold` / `memory` / `disk`のcache tierを記録します。
+- FastAPI／Starletteのテストクライアントを新しい`httpx2`経路へ移行し、旧`httpx`互換経路の非推奨警告を解消しました。本体のHTTP通信は従来どおり安定版`httpx`を使用します。
+
+### 検証
+
+- Disk APCのlayering、モデル/runtime指紋、容量上限、ディレクトリ権限、破損時fallback、無関係なエラーの非再試行、管理API、設定検証、DB移行を回帰テストへ追加しました。
+- Pythonテスト164件（非推奨警告0件）、Swift Debug／Release build、署名、DMG構造検証が成功しました。実機`Qwen3.8-27B-MLX-8bit`へ15,852-tokenの合成ZCode入力を送り、cold 56.106秒に対してWorker再作成相当のdisk hitは15,596 tokensを再利用して1.531秒、最初のユーザー文を変更しても同じ15,596 tokensを再利用して1.414秒、次のRAM hitは15,862 tokensを再利用して0.262秒でした。APC RAM blocksは0、reject/fallbackは0でした。
+
 ## [1.3.7] - 2026-08-21
 
 ### 改善

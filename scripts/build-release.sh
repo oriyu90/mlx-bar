@@ -8,8 +8,14 @@ APP_DIR="$DIST_DIR/MLXBar.app"
 CONTENTS="$APP_DIR/Contents"
 PYINSTALLER_DIR="$PROJECT_DIR/.release-python"
 DMG_STAGE="$PROJECT_DIR/.dmg-stage"
-VERSION=1.3.7
+VERSION=1.4.0
 
+# Prefer the complete Xcode toolchain when it is installed. A separately
+# updated Command Line Tools package can temporarily expose a compiler/SDK
+# build-number mismatch even though Xcode itself is internally consistent.
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app/Contents/Developer ]; then
+  export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
 export SWIFT_MODULE_CACHE_PATH="$PROJECT_DIR/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="$PROJECT_DIR/.build/clang-cache"
 export UV_CACHE_DIR="$PROJECT_DIR/.uv-cache"
@@ -85,7 +91,7 @@ rm -rf "$DMG_STAGE"
 mkdir -p "$DMG_STAGE/Source code"
 cp -R "$APP_DIR" "$DMG_STAGE/MLXBar.app"
 ln -s /Applications "$DMG_STAGE/Applications"
-for item in README.md licence.md CHANGELOG.md SECURITY.md Package.swift Coordinator Workers CLI Sources Tests Packaging scripts '設計書_v2.1.md'; do
+for item in README.md licence.md CHANGELOG.md SECURITY.md TEST_PLAN_v1.4.0.md Package.swift Coordinator Workers CLI Sources Tests Packaging scripts '設計書_v2.1.md'; do
   cp -R "$PROJECT_DIR/$item" "$DMG_STAGE/Source code/"
 done
 rm -rf "$DMG_STAGE/Source code/Coordinator/.venv" "$DMG_STAGE/Source code/Coordinator/.pytest_cache"

@@ -91,6 +91,14 @@ class BaseAdapter:
         except Exception:
             pass
 
+    def prompt_cache_stats(self) -> dict:
+        """Return privacy-safe cache metadata for diagnostics."""
+        return {"enabled": False, "engine": self.engine}
+
+    def clear_disk_prompt_cache(self) -> None:
+        """Clear optional persistent cache state owned by this worker."""
+        return None
+
     def memory_stats(self) -> dict:
         result = {"active_bytes": 0, "cache_bytes": 0, "peak_bytes": 0}
         try:
@@ -159,6 +167,11 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             if method == "clear_prompt_cache":
                 await on_mlx_thread(adapter.clear_prompt_cache)
                 return {"type": "completed"}
+            if method == "prompt_cache_stats":
+                return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
+            if method == "clear_disk_prompt_cache":
+                await on_mlx_thread(adapter.clear_disk_prompt_cache)
+                return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
             if method == "cancel":
                 adapter.cancelled.add(params.get("request_id", ""))
                 return {"cancelled": True, "forced": False}

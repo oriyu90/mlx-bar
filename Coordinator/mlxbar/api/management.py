@@ -222,6 +222,27 @@ async def get_settings(request: Request):
     return state(request).settings.public()
 
 
+@router.get("/prompt-cache")
+async def prompt_cache(request: Request):
+    try:
+        return await state(request).workers.prompt_cache_stats()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+
+@router.post("/prompt-cache/memory/clear")
+async def clear_memory_prompt_cache(request: Request):
+    return await state(request).workers.clear_memory_prompt_cache()
+
+
+@router.post("/prompt-cache/disk/clear")
+async def clear_disk_prompt_cache(request: Request):
+    try:
+        return await state(request).workers.clear_disk_prompt_cache()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+
 @router.get("/settings/api-token")
 async def get_api_token(request: Request):
     token = state(request).settings.api_token

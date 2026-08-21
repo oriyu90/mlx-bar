@@ -129,6 +129,8 @@ final class MenuBarViewModel: ObservableObject {
     @Published var isRemovingAllData = false
     @Published var recentLogs: [[String: Any]] = []
     @Published var logStatus: String?
+    @Published var promptCacheStatus: [String: Any] = [:]
+    @Published var promptCacheMessage: String?
     @Published var guiLanguage = "en" {
         // Views read their strings through `LS(_:)`, which resolves against the
         // language recorded here, so the two must move together.
@@ -627,6 +629,42 @@ final class MenuBarViewModel: ObservableObject {
                 lmStudioToken = lm["token"] as? String ?? ""
             }
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    func refreshPromptCache() async {
+        do {
+            promptCacheStatus = try await json("GET", "/api/v1/prompt-cache") as? [String: Any] ?? [:]
+        } catch {
+            promptCacheMessage = error.localizedDescription
+        }
+    }
+
+    func setPromptCacheSettings(enabled: Bool, maximumGB: Int) async {
+        guard 1...100 ~= maximumGB else {
+            errorMessage = ui("Disk cache must be between 1 and 100 GB",
+                              "ディスクキャッシュは1〜100 GBで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["promptCache": [
+                "diskEnabled": enabled, "diskMaxGB": maximumGB,
+            ]])
+            await self.refreshSettings()
+            self.promptCacheMessage = self.ui(
+                "The setting applies the next time the model worker starts",
+                "設定は次にモデルWorkerを起動したときに反映されます")
+        }
+    }
+
+    func clearPromptCache(memory: Bool) async {
+        await perform {
+            let endpoint = memory ? "/api/v1/prompt-cache/memory/clear"
+                                  : "/api/v1/prompt-cache/disk/clear"
+            self.promptCacheStatus = try await self.json("POST", endpoint) as? [String: Any] ?? [:]
+            self.promptCacheMessage = memory
+                ? self.ui("Memory prompt cache cleared", "メモリーキャッシュを消去しました")
+                : self.ui("Disk prompt cache cleared", "ディスクキャッシュを消去しました")
+        }
     }
 
     func refreshRecentLogs() async {

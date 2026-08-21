@@ -67,6 +67,17 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.update({"api": {"port": 80}})
 
+    def test_prompt_cache_defaults_and_limits_are_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertTrue(store.data["promptCache"]["diskEnabled"])
+            self.assertEqual(store.data["promptCache"]["diskMaxGB"], 5)
+            updated = store.update({"promptCache": {"diskEnabled": False, "diskMaxGB": 10}})
+            self.assertFalse(updated["promptCache"]["diskEnabled"])
+            self.assertEqual(updated["promptCache"]["diskMaxGB"], 10)
+            with self.assertRaisesRegex(ValueError, "diskMaxGB"):
+                store.update({"promptCache": {"diskMaxGB": 0}})
+
     def test_lan_access_requires_matching_host_and_api_token(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))

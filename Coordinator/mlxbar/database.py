@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS api_logs (
   max_tokens INTEGER NOT NULL DEFAULT 0, reasoning_mode TEXT,
   first_token_ms INTEGER, prompt_tokens INTEGER NOT NULL DEFAULT 0,
   cached_tokens INTEGER NOT NULL DEFAULT 0, prompt_tps REAL NOT NULL DEFAULT 0,
-  generation_tps REAL NOT NULL DEFAULT 0,
+  generation_tps REAL NOT NULL DEFAULT 0, cache_tier TEXT,
   error_code TEXT, client_scope TEXT NOT NULL DEFAULT 'local',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -66,6 +66,7 @@ class Database:
             "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
             "prompt_tps": "REAL NOT NULL DEFAULT 0",
             "generation_tps": "REAL NOT NULL DEFAULT 0",
+            "cache_tier": "TEXT",
         }
         with self.connection:
             for name, definition in additions.items():
@@ -256,6 +257,8 @@ class Database:
             "cached_tokens": max(0, int(entry.get("cached_tokens") or 0)),
             "prompt_tps": max(0.0, float(entry.get("prompt_tps") or 0.0)),
             "generation_tps": max(0.0, float(entry.get("generation_tps") or 0.0)),
+            "cache_tier": (str(entry.get("cache_tier"))[:16]
+                           if entry.get("cache_tier") in {"cold", "memory", "disk"} else None),
             "error_code": str(entry.get("error_code") or "")[:96] or None,
             "client_scope": "lan" if entry.get("client_scope") == "lan" else "local",
         }
@@ -263,10 +266,11 @@ class Database:
             self.connection.execute(
                 """INSERT INTO api_logs(request_id,method,path,status,duration_ms,model,stream,
                    message_count,tool_count,message_chars,tool_schema_chars,max_tokens,reasoning_mode,
-                   first_token_ms,prompt_tokens,cached_tokens,prompt_tps,generation_tps,error_code,client_scope)
+                   first_token_ms,prompt_tokens,cached_tokens,prompt_tps,generation_tps,cache_tier,
+                   error_code,client_scope)
                    VALUES(:request_id,:method,:path,:status,:duration_ms,:model,:stream,
                    :message_count,:tool_count,:message_chars,:tool_schema_chars,:max_tokens,:reasoning_mode,
-                   :first_token_ms,:prompt_tokens,:cached_tokens,:prompt_tps,:generation_tps,
+                   :first_token_ms,:prompt_tokens,:cached_tokens,:prompt_tps,:generation_tps,:cache_tier,
                    :error_code,:client_scope)""", safe
             )
             self.connection.execute(

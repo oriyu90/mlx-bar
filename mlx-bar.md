@@ -133,3 +133,13 @@
 ## その他
 
 - （2026-08-19時点）開発用Macの重複コピー`MLXBar 2.app`は解消済み。今後また似た状態に気付いたら削除を検討。
+
+### v1.4.0永続Prompt Cache（2026-08-21）
+
+- v1.3.7の`PromptCacheState`は、同一Worker内のRAM cacheとして実機で約88倍の改善を確認済みなので置換しない。v1.4.0は`APCManager(num_blocks=0)`と`DiskBlockStore`を下位の永続tierとして追加する。Qwen 27BでAPC RAM block/exact LRUを併用すると同じ大容量状態を二重保持するため、`APC_EXACT_CACHE_ENTRIES=0`に固定する。
+- Qwen3.8/Qwen3.5 hybrid cacheは任意blockを連結できずexact snapshot経路になる。既定16-token guardでは最初のユーザー文が変わるとstable system/tools prefixまでhitしにくいため、`APC_EXACT_PREFIX_GUARD_TOKENS=256`を使用する。この末尾だけは再計算する。
+- 永続namespaceはprompt本文から独自判定しない。モデルのresolved path、config/tokenizer/chat template内容、safetensorsの名前/size/mtime、mlx-vlm版、MLXBar cache形式版だけをSHA-256化し、実際のtoken-prefix一致はmlx-vlm APCへ委譲する。
+- cache rootは`Application Support/MLXBar/prompt-cache/mlx-vlm`、既定上限5 GB。KV tensorだけでなくtoken IDsもsafetensors metadataへ残るため、root/namespaceは0700とし、設定画面から消去できるようにする。全データ削除はApplication Support rootごと削除するため自動的に包含される。
+- APC起因の例外はtracebackが`mlx_vlm/apc`を通るか、APC/safetensors/cache snapshotを示す場合だけfallback対象とする。応答送信前ならAPCを閉じ、PromptCacheStateを再作成して一度再試行する。モデルkernel等の無関係な失敗は二重実行しない。
+- 中心シナリオ実測: Qwen3.8-27B、15,852 prompt tokensでcold 56.106秒、Disk APC同一質問1.531秒（15,596 cached）、最初の質問変更1.414秒（15,596 cached）、RAM継続0.262秒（15,862 cached）。モデルload 12.912秒、APC `num_blocks=0` / resident bytes 0 / reject 0。exact snapshot 2境界はclose後約2.37 GBだったため、既定5 GBはこのサイズの巨大prefixを概ね2組保持する容量である。追加stressは`TEST_PLAN_v1.4.0.md`参照。
+- FastAPI 0.141.1／Starlette 1.6.0の`TestClient`は`httpx2`を優先するため、開発依存へ`httpx2>=2,<3`を追加した。本体側は`httpx`のAPIを使用するため置換せず、テスト設定で`StarletteDeprecationWarning`をエラーにして将来の退行を検出する。

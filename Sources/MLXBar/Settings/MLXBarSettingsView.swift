@@ -5,7 +5,7 @@ struct MLXBarSettingsView: View {
     @State private var selection = "APIサーバー"
     /// The Japanese titles double as localization keys, so the selection stays
     /// valid when the interface language changes underneath it.
-    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "ランタイム", "詳細", "削除"]
+    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "ランタイム", "キャッシュ", "詳細", "削除"]
 
     var body: some View {
         NavigationSplitView {
@@ -19,6 +19,7 @@ struct MLXBarSettingsView: View {
             case "APIサーバー": APISettingsView(model: model)
             case "LM Studio": LMStudioSettingsView(model: model)
             case "ランタイム": RuntimeManagerView(model: model)
+            case "キャッシュ": PromptCacheSettingsView(model: model)
             case "詳細": DiagnosticsSettingsView(model: model)
             case "削除": DataRemovalSettingsView(model: model)
             default: EmptyView()
@@ -26,6 +27,72 @@ struct MLXBarSettingsView: View {
         }
         .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         .task { await model.refreshSettings(); await model.refreshSecrets() }
+    }
+}
+
+struct PromptCacheSettingsView: View {
+    @ObservedObject var model: MenuBarViewModel
+    @State private var diskEnabled = true
+    @State private var diskMaxGB = 5
+    @State private var confirmsDiskClear = false
+
+    private var configured: [String: Any] {
+        model.settings["promptCache"] as? [String: Any] ?? [:]
+    }
+
+    private func bytes(_ value: Any?) -> String {
+        let number = (value as? NSNumber)?.int64Value ?? 0
+        return ByteCountFormatter.string(fromByteCount: number, countStyle: .file)
+    }
+
+    var body: some View {
+        Form {
+            Section(LS("永続プロンプトキャッシュ")) {
+                Toggle(LS("再起動後もプロンプトキャッシュを再利用"), isOn: $diskEnabled)
+                Stepper("\(LS("最大ディスク容量")): \(diskMaxGB) GB", value: $diskMaxGB, in: 1...100)
+                Button(LS("設定を適用")) {
+                    Task { await model.setPromptCacheSettings(enabled: diskEnabled, maximumGB: diskMaxGB) }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("ZCodeの長いsystem promptとtools定義をローカルディスクへ保存します。設定変更は次回のモデルWorker起動時に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section(LS("キャッシュ状態")) {
+                LabeledContent(LS("メモリー"), value: (model.promptCacheStatus["memory"] as? Bool) == true ? LS("有効") : LS("無効"))
+                LabeledContent(LS("ディスク"), value: (model.promptCacheStatus["disk"] as? Bool) == true ? LS("有効") : LS("無効"))
+                LabeledContent(LS("ディスク使用量"), value: bytes(model.promptCacheStatus["disk_bytes"]))
+                LabeledContent(LS("ディスクヒット"), value: "\((model.promptCacheStatus["disk_hits"] as? NSNumber)?.intValue ?? 0)")
+                if let reason = model.promptCacheStatus["disabledReason"] as? String {
+                    Text("\(LS("無効理由")): \(reason)").font(.caption).foregroundStyle(.orange)
+                }
+                HStack {
+                    Button(LS("更新")) { Task { await model.refreshPromptCache() } }
+                    Button(LS("メモリーキャッシュを消去")) {
+                        Task { await model.clearPromptCache(memory: true) }
+                    }
+                    Button(LS("ディスクキャッシュを消去…"), role: .destructive) {
+                        confirmsDiskClear = true
+                    }
+                }
+                if let message = model.promptCacheMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding()
+        .task {
+            await model.refreshSettings()
+            diskEnabled = configured["diskEnabled"] as? Bool ?? true
+            diskMaxGB = (configured["diskMaxGB"] as? NSNumber)?.intValue ?? 5
+            await model.refreshPromptCache()
+        }
+        .confirmationDialog(LS("ディスクキャッシュを消去しますか？"), isPresented: $confirmsDiskClear) {
+            Button(LS("ディスクキャッシュを消去"), role: .destructive) {
+                Task { await model.clearPromptCache(memory: false) }
+            }
+            Button(LS("キャンセル"), role: .cancel) {}
+        } message: {
+            Text(LS("次の会話ではプロンプトを再計算します。モデルや会話履歴は削除しません。"))
+        }
     }
 }
 

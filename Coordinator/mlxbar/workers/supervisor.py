@@ -168,6 +168,22 @@ class WorkerSupervisor:
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join([*self._worker_import_paths(), env.get("PYTHONPATH", "")])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        cache_settings = self.settings.data.get("promptCache", {})
+        env["MLXBAR_PROMPT_CACHE_ROOT"] = str(self.root / "prompt-cache" / engine)
+        env["MLXBAR_PROMPT_CACHE_DISK_ENABLED"] = (
+            "1" if cache_settings.get("diskEnabled", True) else "0"
+        )
+        max_gb = min(100.0, max(1.0, float(cache_settings.get("diskMaxGB", 5))))
+        env["MLXBAR_PROMPT_CACHE_MAX_BYTES"] = str(int(max_gb * (1 << 30)))
+        # Stable block hashes are required for reuse across Python processes.
+        # PromptCacheState owns the RAM tier, so do not duplicate exact hybrid
+        # snapshots inside APC's separate in-memory LRU.
+        env["APC_HASH"] = "sha256"
+        env["APC_EXACT_CACHE_ENTRIES"] = "0"
+        # Hybrid models can persist only exact prefix snapshots. Keep the final
+        # 256 tokens cold so a different first user message can still reuse the
+        # much larger, stable ZCode system/tools prefix.
+        env["APC_EXACT_PREFIX_GUARD_TOKENS"] = "256"
         module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
         # Worker diagnostics go to a log file rather than a pipe: nothing drains
@@ -342,11 +358,36 @@ class WorkerSupervisor:
             self.loaded = None
             return {"state": "unloaded"}
         try:
-            await asyncio.wait_for(self._call("unload", {}, timeout=5), timeout=5)
+            # DiskBlockStore drains its background safetensors writer during
+            # unload. Large hybrid snapshots can take longer than the old
+            # five-second model-only shutdown budget.
+            await asyncio.wait_for(self._call("unload", {}, timeout=30), timeout=30)
         except Exception:
             await self._stop_worker()
         self.loaded = None
         return {"state": "unloaded"}
+
+    async def prompt_cache_stats(self) -> dict:
+        if (not self.loaded or self.loaded.get("engine") == "lm-studio"
+                or not self.socket_path):
+            return {"enabled": False, "engine": self.loaded.get("engine") if self.loaded else None}
+        response = await self._call("prompt_cache_stats", {}, timeout=10)
+        return response.get("cache", {})
+
+    async def clear_memory_prompt_cache(self) -> dict:
+        if (self.loaded and self.loaded.get("engine") != "lm-studio" and self.socket_path):
+            await self._call("clear_prompt_cache", {}, timeout=10)
+        return await self.prompt_cache_stats()
+
+    async def clear_disk_prompt_cache(self) -> dict:
+        if (self.loaded and self.loaded.get("engine") != "lm-studio" and self.socket_path):
+            response = await self._call("clear_disk_prompt_cache", {}, timeout=30)
+            return response.get("cache", {})
+        root = self.root / "prompt-cache"
+        if root.exists():
+            import shutil
+            shutil.rmtree(root)
+        return {"enabled": False, "disk_bytes": 0}
 
     async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None,
                        image_root: Path | None = None):

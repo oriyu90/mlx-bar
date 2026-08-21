@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.3.7 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.4.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -19,6 +19,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
+- mlx-vlmの長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
 - ZCode等のOpenAI Chat Completionsクライアント向けtool calling（履歴、`tools`、`tool_choice`、ストリーミング差分）
 - 本文とAPIキーを含めない、最大2,000件の最近のAPIログ
 - モデルから検出したトークン上限の表示、ユーザー上限設定、超過要求の自動調整
@@ -38,7 +39,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.3.7.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.4.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -56,6 +57,7 @@ Developer ID署名・公証済みの正式配布版では、手順3は通常不�
 ├── state.sqlite3
 ├── control/coordinator.sock
 ├── control/api-token
+├── prompt-cache/
 ├── runtimes/
 └── logs/
 ```
@@ -73,6 +75,7 @@ Developer ID署名・公証済みの正式配布版では、手順3は通常不�
 - 「APIサーバー」: URL確認、コピー、ポート変更
 - 「詳細」: 最近のAPIアクセスを最大500件表示、コピー、消去
 - 「ランタイム」設定: 自動インストール状況の確認、最新版または指定版への更新、検証後の切替・復元・旧版削除
+- 「キャッシュ」設定: 永続プロンプトキャッシュの有効化、容量上限、使用量確認、RAM／ディスクキャッシュの個別消去
 
 モデルのロード中は、対象モデル名、エンジン、現在段階、経過秒数をモデル画面とメニューバーに表示します。完了後は「モデル名をコピー」またはメニューバーのコピーボタンから、読み込み済みモデル名をクリップボードへコピーできます。
 
@@ -211,7 +214,11 @@ tool calling有効時も通常本文を生成中に逐次配信します。Qwen�
 
 mlx-vlmのテキスト要求では、直前要求との最長共通token prefixを安全に再利用します。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
 
-APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
+v1.4.0では、mlx-vlm公式の`APCManager` / `DiskBlockStore`をディスク専用の下位層として追加しました。現在の`PromptCacheState`は高速なRAM層として維持され、Worker再起動後は`~/Library/Application Support/MLXBar/prompt-cache/`から共通prefixを復元します。モデル、tokenizer/chat template、重み、mlx-vlmランタイム版が変わると別namespaceになるため、互換性のないcacheを読みません。hybrid exact-cacheでは末尾256 tokensを毎回再計算し、その前の長いsystem/tools prefixを異なる最初のユーザー文でも再利用できるようにします。画像要求は引き続き共有対象外です。
+
+「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GBの容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
+
+APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、`cache_tier`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
 
 OpenAI系クライアントの`reasoning_effort=high` / `minimal`は最初に原値でテンプレートへ渡し、Qwenが拒否した場合だけ同等の`xhigh` / `low`へ再試行します。汎用テンプレートのOpenAI表記を優先しながらQwenのdialectにも対応します。
 
@@ -295,7 +302,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.3.7.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.4.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -469,7 +470,7 @@ def test_mlx_vlm_reports_runtime_usage_and_cache_metrics():
     assert events[-2] == {"type": "usage", "prompt_tokens": 4096, "completion_tokens": 7}
     assert events[-1] == {"type": "metrics", "prompt_tokens": 4096,
                           "cached_tokens": 3900, "prompt_tps": 850.5,
-                          "generation_tps": 12.25}
+                          "generation_tps": 12.25, "cache_tier": "memory"}
 
 
 def test_mlx_vlm_cancelled_stream_discards_mutated_prompt_cache():
@@ -500,3 +501,205 @@ def test_mlx_vlm_cancelled_stream_discards_mutated_prompt_cache():
         iterator.close()
     assert isinstance(adapter.prompt_cache_state, PromptCacheState)
     assert adapter.prompt_cache_state is not original
+
+
+def test_mlx_vlm_disk_apc_is_layered_below_prompt_cache_state():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    class Manager:
+        def __init__(self):
+            self.disk_hits = 0
+
+        def stats_snapshot(self):
+            return {"disk_hits": self.disk_hits}
+
+    manager = Manager()
+    captured = {}
+
+    def stream_generate(**kwargs):
+        captured.update(kwargs)
+        manager.disk_hits += 1
+        yield SimpleNamespace(text="ok", prompt_tokens=100, generation_tokens=1,
+                              cached_tokens=96, prompt_tps=1000, generation_tps=10)
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
+    adapter.apc_manager = manager
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {"prompt": "hello"}))
+    assert captured["prompt_cache_state"] is adapter.prompt_cache_state
+    assert captured["apc_manager"] is manager
+    assert captured["apc_tenant"] == "mlxbar-local"
+    assert events[-1]["cache_tier"] == "disk"
+
+
+def test_mlx_vlm_apc_failure_retries_once_without_disk_cache():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    generate_module = ModuleType("mlx_vlm.generate")
+    calls = []
+
+    class PromptCacheState:
+        pass
+
+    class Manager:
+        closed = False
+
+        def stats_snapshot(self):
+            return {"disk_hits": 0}
+
+        def close(self):
+            self.closed = True
+
+    manager = Manager()
+
+    def stream_generate(**kwargs):
+        calls.append(dict(kwargs))
+        if kwargs.get("apc_manager") is manager:
+            raise RuntimeError("corrupt APC safetensors header")
+        yield SimpleNamespace(text="recovered", prompt_tokens=20, generation_tokens=1,
+                              cached_tokens=0, prompt_tps=10, generation_tps=5)
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    generate_module.PromptCacheState = PromptCacheState
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = PromptCacheState()
+    adapter.apc_manager = manager
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils,
+                                  "mlx_vlm.generate": generate_module}):
+        events = list(adapter.stream("request", {"prompt": "hello"}))
+    assert len(calls) == 2
+    assert calls[0]["apc_manager"] is manager
+    assert "apc_manager" not in calls[1]
+    assert manager.closed is True
+    assert adapter.apc_manager is None
+    assert adapter.apc_disabled_reason == "runtime_failed:RuntimeError"
+    assert events[0] == {"type": "delta", "text": "recovered"}
+    assert events[-1]["cache_tier"] == "cold"
+
+
+def test_mlx_vlm_unrelated_failure_is_not_retried_or_mislabelled_as_apc():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    calls = []
+
+    class Manager:
+        def stats_snapshot(self):
+            return {"disk_hits": 0}
+
+        def close(self):
+            raise AssertionError("unrelated failures must not disable APC")
+
+    def stream_generate(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("model kernel rejected an invalid shape")
+        yield  # pragma: no cover
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
+    adapter.apc_manager = Manager()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        try:
+            list(adapter.stream("request", {"prompt": "hello"}))
+        except RuntimeError as exc:
+            assert "invalid shape" in str(exc)
+        else:
+            raise AssertionError("expected model failure")
+    assert len(calls) == 1
+    assert adapter.apc_manager is not None
+
+
+def test_mlx_vlm_broken_apc_stats_do_not_break_generation():
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+
+    class Manager:
+        def stats_snapshot(self):
+            raise RuntimeError("diagnostics unavailable")
+
+    def stream_generate(**_kwargs):
+        yield SimpleNamespace(text="ok", prompt_tokens=10, generation_tokens=1,
+                              cached_tokens=0, prompt_tps=100, generation_tps=10)
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "prompt"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
+    adapter.apc_manager = Manager()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {"prompt": "hello"}))
+    assert events[0] == {"type": "delta", "text": "ok"}
+    assert events[-1]["cache_tier"] == "cold"
+
+
+def test_mlx_vlm_model_fingerprint_changes_with_runtime_and_weight_metadata(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type":"qwen"}')
+    weight = tmp_path / "model.safetensors"
+    weight.write_bytes(b"one")
+    first = MLXVLMAdapter._model_fingerprint(tmp_path, "0.6.15")
+    second = MLXVLMAdapter._model_fingerprint(tmp_path, "0.6.16")
+    weight.write_bytes(b"different")
+    third = MLXVLMAdapter._model_fingerprint(tmp_path, "0.6.15")
+    assert len(first) == 64
+    assert first != second
+    assert first != third
+
+
+def test_mlx_vlm_initializes_disk_only_apc_with_bounded_private_store(tmp_path):
+    apc_module = ModuleType("mlx_vlm.apc")
+    captured = {}
+
+    class DiskBlockStore:
+        def __init__(self, root, namespace, max_bytes):
+            captured.update(root=Path(root), namespace=namespace, max_bytes=max_bytes)
+            self.dir = Path(root) / namespace
+            self.dir.mkdir(parents=True)
+
+    class APCManager:
+        def __init__(self, num_blocks, disk):
+            captured.update(num_blocks=num_blocks, disk=disk)
+            self.disk = disk
+
+        def stats_snapshot(self):
+            return {"disk_bytes": 0, "disk_hits": 0}
+
+        def close(self):
+            captured["closed"] = True
+
+    apc_module.DiskBlockStore = DiskBlockStore
+    apc_module.APCManager = APCManager
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    cache = tmp_path / "cache"
+    adapter = MLXVLMAdapter()
+    with patch.dict(sys.modules, {"mlx_vlm.apc": apc_module}), patch.dict(os.environ, {
+        "MLXBAR_PROMPT_CACHE_DISK_ENABLED": "1",
+        "MLXBAR_PROMPT_CACHE_ROOT": str(cache),
+        "MLXBAR_PROMPT_CACHE_MAX_BYTES": "123456",
+    }), patch("mlx_vlm_worker.adapter.importlib.metadata.version", return_value="0.6.15"):
+        adapter._init_apc(str(model))
+    assert captured["num_blocks"] == 0
+    assert captured["max_bytes"] == 123456
+    assert captured["namespace"].startswith("mlxbar-vlm-v1-")
+    assert captured["disk"].dir.stat().st_mode & 0o777 == 0o700
+    adapter._close_apc()
+    assert captured["closed"] is True

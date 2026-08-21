@@ -171,6 +171,20 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()["cancelled"])
         worker.cancel_all.assert_awaited_once()
 
+    async def test_prompt_cache_management_routes_use_public_worker_methods(self):
+        worker = SimpleNamespace(
+            prompt_cache_stats=AsyncMock(return_value={"disk": True, "disk_bytes": 1024}),
+            clear_memory_prompt_cache=AsyncMock(return_value={"memory": True}),
+            clear_disk_prompt_cache=AsyncMock(return_value={"disk": True, "disk_bytes": 0}),
+        )
+        client = TestClient(make_management_app(SimpleNamespace(workers=worker)))
+        self.assertEqual(client.get("/api/v1/prompt-cache").json()["disk_bytes"], 1024)
+        self.assertTrue(client.post("/api/v1/prompt-cache/memory/clear").json()["memory"])
+        self.assertEqual(client.post("/api/v1/prompt-cache/disk/clear").json()["disk_bytes"], 0)
+        worker.prompt_cache_stats.assert_awaited_once()
+        worker.clear_memory_prompt_cache.assert_awaited_once()
+        worker.clear_disk_prompt_cache.assert_awaited_once()
+
     async def test_frozen_distribution_finds_bundled_worker_modules(self):
         frozen = self.root / "_internal"
         workers = frozen / "Workers"

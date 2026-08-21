@@ -257,7 +257,7 @@ async def chat(request: Request, body: dict):
                         usage = _usage_from_event(event, usage)
                         request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
                     elif event.get("type") == "metrics":
-                        for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps"):
+                        for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps", "cache_tier"):
                             if event.get(key) is not None:
                                 request.state.api_log[key] = event[key]
                     elif event.get("type") in {"phase", "heartbeat", "queue"}:
@@ -319,7 +319,7 @@ async def chat(request: Request, body: dict):
                 usage = _usage_from_event(event)
                 request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
             elif event.get("type") == "metrics":
-                for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps"):
+                for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps", "cache_tier"):
                     if event.get(key) is not None:
                         request.state.api_log[key] = event[key]
             elif event.get("type") == "error":
