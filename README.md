@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.4.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.4.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -39,7 +39,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.4.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.4.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -212,6 +212,8 @@ ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルま
 
 tool calling有効時も通常本文を生成中に逐次配信します。Qwen等のthinking部分はストリームの`delta.reasoning_content`へ分離し、`<think>`や`<tool_call>`の内部マークアップを通常本文へ漏らしません。tool callの開始後だけ解析用に保持してOpenAI形式の`delta.tool_calls`へ変換します。解析不能なtool callは無言で終了せず`TOOL_PARSE_FAILED`を返します。
 
+v1.4.1では、ZCodeやGUIがSSE接続を途中で閉じても内側の生成処理を明示的に終了します。生成ロックは要求ID付きで所有され、所有者が実行中にも待機中にも存在しない孤立状態だけをGUI状態更新やキューheartbeatが自動回復します。正常なキュー移行や別要求のロックは解放しないため、モデル生成の直列性を維持します。診断情報の`generationLockState`と`generationLockRecoveries`で回復状態を確認できます。
+
 mlx-vlmのテキスト要求では、直前要求との最長共通token prefixを安全に再利用します。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
 
 v1.4.0では、mlx-vlm公式の`APCManager` / `DiskBlockStore`をディスク専用の下位層として追加しました。現在の`PromptCacheState`は高速なRAM層として維持され、Worker再起動後は`~/Library/Application Support/MLXBar/prompt-cache/`から共通prefixを復元します。モデル、tokenizer/chat template、重み、mlx-vlmランタイム版が変わると別namespaceになるため、互換性のないcacheを読みません。hybrid exact-cacheでは末尾256 tokensを毎回再計算し、その前の長いsystem/tools prefixを異なる最初のユーザー文でも再利用できるようにします。画像要求は引き続き共有対象外です。
@@ -302,7 +304,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.4.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.4.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

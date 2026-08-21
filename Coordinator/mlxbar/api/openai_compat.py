@@ -200,6 +200,7 @@ async def chat(request: Request, body: dict):
             created = int(time.time())
             completed = False
             failed = False
+            generation = None
 
             def mark_first_token() -> None:
                 if request.state.api_log.get("first_token_ms") is not None:
@@ -213,8 +214,9 @@ async def chat(request: Request, body: dict):
                            "model": response_model, "choices": [{"index": 0,
                            "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield "data: " + json.dumps(initial, ensure_ascii=False) + "\n\n"
-                async for event in app_state(request).workers.generate(
-                        normalized_messages, images, options, request_id, image_root=image_root):
+                generation = app_state(request).workers.generate(
+                    normalized_messages, images, options, request_id, image_root=image_root)
+                async for event in generation:
                     if event.get("type") == "delta":
                         mark_first_token()
                         completion_text += event["text"]
@@ -271,6 +273,9 @@ async def chat(request: Request, body: dict):
                               "message": event.get("message", "生成に失敗しました"),
                               "retryable": event.get("retryable", False)}}, ensure_ascii=False) + "\n\n"
                         break
+            except asyncio.CancelledError:
+                request.state.api_log["error_code"] = "CLIENT_DISCONNECTED"
+                raise
             except MLXBarError as exc:
                 failed = True
                 request.state.api_log["error_code"] = exc.code
@@ -281,6 +286,8 @@ async def chat(request: Request, body: dict):
                 yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
                                                          "retryable": False}}, ensure_ascii=False) + "\n\n"
             finally:
+                if generation is not None:
+                    await generation.aclose()
                 if image_workspace:
                     image_workspace.cleanup()
             if not failed and not completed:
@@ -298,9 +305,10 @@ async def chat(request: Request, body: dict):
     tool_calls: list[dict] = []
     finish_reason = "stop"
     usage = None
+    generation = app_state(request).workers.generate(
+        normalized_messages, images, options, request_id, image_root=image_root)
     try:
-        async for event in app_state(request).workers.generate(
-                normalized_messages, images, options, request_id, image_root=image_root):
+        async for event in generation:
             if event.get("type") == "delta":
                 if request.state.api_log.get("first_token_ms") is None:
                     origin = getattr(request.state, "api_started_monotonic", None)
@@ -329,6 +337,7 @@ async def chat(request: Request, body: dict):
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     finally:
+        await generation.aclose()
         if image_workspace:
             image_workspace.cleanup()
     message = {"role": "assistant", "content": text or None if tool_calls else text}

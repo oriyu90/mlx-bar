@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 from pathlib import Path
@@ -9,11 +10,13 @@ from types import SimpleNamespace
 
 import httpx
 from fastapi.testclient import TestClient
+from starlette.responses import StreamingResponse
 
+from mlxbar.api.management import generate as management_generate
 from mlxbar.errors import MLXBarError
 from mlxbar.main import make_management_app, make_public_app
 from mlxbar.settings import SettingsStore
-from mlxbar.workers.supervisor import ActiveRequest, WorkerSupervisor
+from mlxbar.workers.supervisor import ActiveRequest, QueuedRequest, WorkerSupervisor
 
 
 class ControlledSupervisor(WorkerSupervisor):
@@ -34,6 +37,12 @@ class ControlledSupervisor(WorkerSupervisor):
         self.stopped = True
         self.process = None
         self.engine = None
+
+
+class StressSupervisor(WorkerSupervisor):
+    async def _lmstudio_generate(self, prompt: str, options: dict):
+        await asyncio.sleep(0.001)
+        yield {"type": "delta", "text": str(prompt)}
 
 
 class ResilienceTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +125,85 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         await first_event
         await first.aclose()
 
+    async def test_orphaned_generation_lock_is_recovered_before_next_request(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        supervisor.loaded = {"id": "model", "name": "model", "engine": "lm-studio"}
+        await supervisor.generation_lock.acquire()
+        supervisor.generation_owner = "disconnected-request"
+
+        self.assertEqual(supervisor.status()["generationLockState"], "idle")
+        self.assertEqual(supervisor.status()["generationLockRecoveries"], 1)
+
+        generation = supervisor.generate("next", [], {}, "next")
+        event = asyncio.create_task(anext(generation))
+        await supervisor.stream_started.wait()
+        supervisor.stream_release.set()
+        self.assertEqual((await event)["text"], "ok")
+        await generation.aclose()
+        self.assertFalse(supervisor.generation_lock.locked())
+        self.assertIsNone(supervisor.generation_owner)
+
+    async def test_valid_queue_handoff_is_never_misidentified_as_orphan(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        queued = QueuedRequest(asyncio.Event(), time.monotonic())
+        supervisor.queued_requests["handoff"] = queued
+        await supervisor._acquire_generation_slot("handoff")
+
+        status = supervisor.status()
+
+        self.assertEqual(status["generationLockState"], "handoff")
+        self.assertEqual(status["generationLockRecoveries"], 0)
+        self.assertTrue(supervisor.generation_lock.locked())
+        self.assertTrue(supervisor._release_generation_slot("handoff"))
+        supervisor.queued_requests.clear()
+
+    async def test_wrong_request_cannot_release_another_requests_slot(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        await supervisor._acquire_generation_slot("owner")
+
+        self.assertFalse(supervisor._release_generation_slot("other"))
+        self.assertTrue(supervisor.generation_lock.locked())
+        self.assertEqual(supervisor.generation_owner, "owner")
+        self.assertTrue(supervisor._release_generation_slot("owner"))
+
+    async def test_waiter_already_queued_wakes_after_orphan_recovery(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        await supervisor.generation_lock.acquire()
+        supervisor.generation_owner = "vanished"
+        supervisor.queued_requests["waiting"] = QueuedRequest(asyncio.Event(), time.monotonic())
+        acquire = asyncio.create_task(supervisor._acquire_generation_slot("waiting"))
+        await asyncio.sleep(0)
+
+        self.assertTrue(supervisor._recover_orphaned_generation_slot("test"))
+        await acquire
+
+        self.assertEqual(supervisor.generation_owner, "waiting")
+        self.assertTrue(supervisor.generation_lock.locked())
+        supervisor.queued_requests.clear()
+        self.assertTrue(supervisor._release_generation_slot("waiting"))
+
+    async def test_many_disconnects_never_leave_generation_slot_locked(self):
+        supervisor = StressSupervisor(self.root, self.settings)
+        supervisor.settings.data["generation"]["streamHeartbeatSeconds"] = 0.001
+        supervisor.loaded = {"id": "model", "name": "model", "engine": "lm-studio"}
+
+        async def consume(index: int):
+            async for _event in supervisor.generate(str(index), [], {}, f"request-{index}"):
+                await asyncio.sleep(0)
+
+        tasks = [asyncio.create_task(consume(index)) for index in range(100)]
+        await asyncio.sleep(0.01)
+        for task in tasks[::3]:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        status = supervisor.status()
+        self.assertEqual(status["activeRequestCount"], 0)
+        self.assertEqual(status["queuedRequestCount"], 0)
+        self.assertEqual(status["generationLockState"], "idle")
+        self.assertFalse(supervisor.generation_lock.locked())
+        self.assertIsNone(supervisor.generation_owner)
+
     async def test_queue_full_and_timeout_are_bounded_errors(self):
         supervisor = ControlledSupervisor(self.root, self.settings)
         limits = supervisor.settings.data["generation"]
@@ -170,6 +258,55 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["cancelled"])
         worker.cancel_all.assert_awaited_once()
+
+    async def test_management_sse_disconnect_explicitly_closes_worker_generation(self):
+        closed = asyncio.Event()
+
+        class Worker:
+            async def generate(self, *_args, **_kwargs):
+                try:
+                    yield {"type": "phase", "name": "prefill"}
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+
+        request = SimpleNamespace(app=SimpleNamespace(
+            state=SimpleNamespace(mlxbar=SimpleNamespace(workers=Worker()))))
+        response = await management_generate(request, {"prompt": "hello", "requestId": "r"})
+        iterator = response.body_iterator
+        first = await anext(iterator)
+        self.assertIn("prefill", first.decode() if isinstance(first, bytes) else first)
+
+        await iterator.aclose()
+
+        self.assertTrue(closed.is_set())
+
+    async def test_api_log_stream_wrapper_propagates_disconnect_to_inner_stream(self):
+        closed = asyncio.Event()
+
+        async def inner_stream():
+            try:
+                yield b"first"
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        database = SimpleNamespace(add_api_log=lambda _entry: None)
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=SimpleNamespace(), database=database)
+        app = make_public_app(state)
+        middleware = app.user_middleware[0].kwargs["dispatch"]
+        request = SimpleNamespace(
+            method="POST", url=SimpleNamespace(path="/v1/chat/completions"),
+            client=SimpleNamespace(host="127.0.0.1"), state=SimpleNamespace())
+        response = StreamingResponse(inner_stream())
+        wrapped = await middleware(request, lambda _request: asyncio.sleep(0, result=response))
+
+        self.assertEqual(await anext(wrapped.body_iterator), b"first")
+        await wrapped.body_iterator.aclose()
+
+        self.assertTrue(closed.is_set())
 
     async def test_prompt_cache_management_routes_use_public_worker_methods(self):
         worker = SimpleNamespace(

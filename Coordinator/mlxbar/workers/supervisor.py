@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -21,6 +22,7 @@ from ..errors import MLXBarError
 WORKER_MODULES = {"mlx-lm": "mlx_lm_worker.adapter", "mlx-vlm": "mlx_vlm_worker.adapter"}
 WORKER_LOG_MAX_BYTES = 1_048_576
 WORKER_STARTUP_DETAIL_BYTES = 4000
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,6 +54,8 @@ class WorkerSupervisor:
         self.crashes: list[float] = []
         self.lock = asyncio.Lock()
         self.generation_lock = asyncio.Lock()
+        self.generation_owner: str | None = None
+        self.generation_lock_recoveries = 0
         self.reap_orphan_worker()
 
     @property
@@ -397,6 +401,7 @@ class WorkerSupervisor:
             raise MLXBarError("ENGINE_BUSY", "ランタイム切替中のため新しい生成を開始できません", 409, True)
         prompt, images, options = self._validate_generation(prompt, images, options, image_root)
         request_id = request_id or str(uuid.uuid4())
+        self._recover_orphaned_generation_slot("new_request")
         generation_acquired = False
         queued: QueuedRequest | None = None
         acquire_task: asyncio.Task | None = None
@@ -407,12 +412,13 @@ class WorkerSupervisor:
                 raise MLXBarError("QUEUE_FULL", "生成待ちが上限に達しています。しばらくしてから再実行してください", 429, True)
             queued = QueuedRequest(asyncio.Event(), time.monotonic())
             self.queued_requests[request_id] = queued
-            acquire_task = asyncio.create_task(self.generation_lock.acquire())
+            acquire_task = asyncio.create_task(self._acquire_generation_slot(request_id))
             cancel_task = asyncio.create_task(queued.cancel_requested.wait())
             queue_timeout = limits.get("queueTimeoutSeconds", 3600)
             heartbeat = limits.get("streamHeartbeatSeconds", 10)
             try:
                 while not acquire_task.done():
+                    self._recover_orphaned_generation_slot("queue_wait")
                     remaining = queue_timeout - (time.monotonic() - queued.enqueued_at)
                     if remaining <= 0:
                         raise MLXBarError("QUEUE_TIMEOUT", "生成待ち時間が上限を超えました", 429, True)
@@ -431,18 +437,17 @@ class WorkerSupervisor:
                 await acquire_task
                 generation_acquired = True
             finally:
-                self.queued_requests.pop(request_id, None)
                 if cancel_task:
                     cancel_task.cancel()
                     await asyncio.gather(cancel_task, return_exceptions=True)
                 if acquire_task and not acquire_task.done():
                     acquire_task.cancel()
                     await asyncio.gather(acquire_task, return_exceptions=True)
-                elif (acquire_task and acquire_task.done() and not generation_acquired
-                      and not acquire_task.cancelled() and acquire_task.exception() is None):
-                    self.generation_lock.release()
+                if not generation_acquired:
+                    self._release_generation_slot(request_id)
+                self.queued_requests.pop(request_id, None)
         else:
-            await self.generation_lock.acquire()
+            await self._acquire_generation_slot(request_id)
             generation_acquired = True
         engine = self.loaded.get("engine", "unknown")
         control = ActiveRequest(asyncio.Event(), asyncio.Event(), asyncio.current_task(), engine)
@@ -488,8 +493,43 @@ class WorkerSupervisor:
         finally:
             control.done.set()
             self.active_requests.pop(request_id, None)
-            if generation_acquired and self.generation_lock.locked():
-                self.generation_lock.release()
+            if generation_acquired:
+                self._release_generation_slot(request_id)
+
+    async def _acquire_generation_slot(self, request_id: str) -> None:
+        await self.generation_lock.acquire()
+        # Ownership is assigned before another await can expose the lock.
+        self.generation_owner = request_id
+
+    def _release_generation_slot(self, request_id: str) -> bool:
+        if self.generation_owner != request_id:
+            return False
+        self.generation_owner = None
+        if self.generation_lock.locked():
+            self.generation_lock.release()
+        return True
+
+    def _recover_orphaned_generation_slot(self, source: str) -> bool:
+        """Release a slot whose owner vanished after an interrupted stream."""
+        if not self.generation_lock.locked():
+            if (self.generation_owner is not None
+                    and self.generation_owner not in self.active_requests
+                    and self.generation_owner not in self.queued_requests):
+                self.generation_owner = None
+            return False
+        owner = self.generation_owner
+        if owner in self.active_requests or owner in self.queued_requests:
+            return False
+        # Releasing while an unowned active request exists could allow two MLX
+        # generations to overlap. Preserve serialization in that inconsistent
+        # case and let the active request's normal finalizer finish first.
+        if self.active_requests:
+            return False
+        self.generation_owner = None
+        self.generation_lock.release()
+        self.generation_lock_recoveries += 1
+        LOGGER.error("Recovered orphaned generation lock source=%s", source)
+        return True
 
     async def _lmstudio_generate(self, prompt, options: dict):
         base = self.settings.data["models"]["lmStudio"]["baseUrl"].rstrip("/")
@@ -625,6 +665,7 @@ class WorkerSupervisor:
                     "message": "応答がなかったため生成処理を強制終了しました"}
 
     def raise_if_queue_full(self) -> None:
+        self._recover_orphaned_generation_slot("capacity_check")
         maximum = self.settings.data["generation"].get("maxQueuedRequests", 16)
         if ((self.generation_lock.locked() or self.queued_requests)
                 and len(self.queued_requests) >= maximum):
@@ -793,7 +834,8 @@ class WorkerSupervisor:
     async def wait_until_idle(self, timeout: float = 30) -> bool:
         try:
             async with asyncio.timeout(timeout):
-                while self.active_requests or self.queued_requests:
+                while self.active_requests or self.queued_requests or self.generation_lock.locked():
+                    self._recover_orphaned_generation_slot("wait_until_idle")
                     await asyncio.sleep(0.1)
             return True
         except TimeoutError:
@@ -821,6 +863,7 @@ class WorkerSupervisor:
         self.loaded = None
 
     def status(self) -> dict:
+        self._recover_orphaned_generation_slot("status")
         self._forget_dead_worker()
         loaded = None if not self.loaded else {
             **self.loaded,
@@ -833,7 +876,18 @@ class WorkerSupervisor:
                 "activeRequestCount": len(self.active_requests),
                 "queuedRequestCount": len(self.queued_requests),
                 "oldestQueuedSeconds": self._oldest_queued_seconds(),
+                "generationLockState": self._generation_lock_state(),
+                "generationLockRecoveries": self.generation_lock_recoveries,
                 "maintenanceEngines": sorted(self.maintenance_engines)}
+
+    def _generation_lock_state(self) -> str:
+        if not self.generation_lock.locked():
+            return "inconsistent" if self.active_requests else "idle"
+        if self.generation_owner in self.active_requests:
+            return "active"
+        if self.generation_owner in self.queued_requests:
+            return "handoff"
+        return "inconsistent"
 
     def _queue_position(self, request_id: str) -> int:
         try:

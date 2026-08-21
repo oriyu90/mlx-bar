@@ -143,3 +143,12 @@
 - APC起因の例外はtracebackが`mlx_vlm/apc`を通るか、APC/safetensors/cache snapshotを示す場合だけfallback対象とする。応答送信前ならAPCを閉じ、PromptCacheStateを再作成して一度再試行する。モデルkernel等の無関係な失敗は二重実行しない。
 - 中心シナリオ実測: Qwen3.8-27B、15,852 prompt tokensでcold 56.106秒、Disk APC同一質問1.531秒（15,596 cached）、最初の質問変更1.414秒（15,596 cached）、RAM継続0.262秒（15,862 cached）。モデルload 12.912秒、APC `num_blocks=0` / resident bytes 0 / reject 0。exact snapshot 2境界はclose後約2.37 GBだったため、既定5 GBはこのサイズの巨大prefixを概ね2組保持する容量である。追加stressは`TEST_PLAN_v1.4.0.md`参照。
 - FastAPI 0.141.1／Starlette 1.6.0の`TestClient`は`httpx2`を優先するため、開発依存へ`httpx2>=2,<3`を追加した。本体側は`httpx`のAPIを使用するため置換せず、テスト設定で`StarletteDeprecationWarning`をエラーにして将来の退行を検出する。
+
+### v1.4.1生成ロック自己回復（2026-08-21）
+
+- 実機v1.4.0で、Coordinatorは生存、Workerとモデルも正常、メモリ空き95%以上、`activeRequestCount=0`なのに`queuedRequestCount=1`が10分以上増え続け、Worker CPUがidleという停止状態を確認した。直前のZCode SSE要求は応答tokenを返さず終了していた。モデル計算やPrompt Cacheではなく、切断された要求が生成ロックを残したことが直接原因である。
+- OpenAI API、管理API、APIアクセス記録middlewareの各SSE wrapperは、外側の接続がキャンセル・終了したとき直下のasync generatorを`aclose()`する。Pythonの暗黙的なgenerator終了順序に依存せず、wrapperが重なっていてもSupervisorの`finally`まで終了を伝播させる。
+- 生成ロックに要求IDのownerを持たせる。queue登録はロック取得とowner設定が完了するまで残し、正常なqueue→active handoffを孤立と誤認しない。releaseは同じownerだけが実行でき、遅れて走った古い要求の`finally`が新しい要求のロックを解放することを防ぐ。
+- 自己回復条件は「lockがlocked」「ownerがactiveにもqueuedにも存在しない」「active要求が0」の論理積に限定する。新規要求、queue heartbeat、状態取得、idle待機で評価し、該当時だけロックを解放する。`active`があるのにlockがない状態は`inconsistent`として報告するが、並列生成を招く自動取得はしない。
+- 管理状態へ`generationLockState`と`generationLockRecoveries`を追加する。本文、tool定義、APIキー、要求IDは診断応答へ出さない。
+- 障害注入、正常handoff、別owner release拒否、待機済み要求の回復、重なったSSE wrapperのclose、100並列の約3分の1を切断するstressを含むPythonテスト171件を通過した。詳細は`TEST_PLAN_v1.4.1.md`を参照。

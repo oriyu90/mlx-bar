@@ -115,7 +115,12 @@ def make_public_app(state: AppState) -> FastAPI:
                         async for chunk in original_iterator:
                             yield chunk
                     finally:
-                        record()
+                        try:
+                            closer = getattr(original_iterator, "aclose", None)
+                            if closer is not None:
+                                await closer()
+                        finally:
+                            record()
                 response.body_iterator = logged_body()
             else:
                 record()

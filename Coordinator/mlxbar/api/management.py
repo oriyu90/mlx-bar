@@ -87,15 +87,20 @@ async def unload(request: Request):
 @router.post("/generate")
 async def generate(request: Request, body: dict):
     async def stream():
+        generation = state(request).workers.generate(
+            body.get("prompt", ""), body.get("images", []), body, body.get("requestId"))
         try:
-            async for event in state(request).workers.generate(body.get("prompt", ""), body.get("images", []), body,
-                                                                body.get("requestId")):
+            async for event in generation:
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+        except asyncio.CancelledError:
+            raise
         except MLXBarError as exc:
             yield "data: " + json.dumps({"type": "error", **exc.as_dict()["error"]}, ensure_ascii=False) + "\n\n"
         except Exception as exc:
             yield "data: " + json.dumps({"type": "error", "code": "INTERNAL_ERROR",
                                           "message": str(exc), "retryable": False}, ensure_ascii=False) + "\n\n"
+        finally:
+            await generation.aclose()
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
