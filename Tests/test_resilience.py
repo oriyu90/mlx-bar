@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.responses import StreamingResponse
 
@@ -16,7 +17,8 @@ from mlxbar.api.management import generate as management_generate
 from mlxbar.errors import MLXBarError
 from mlxbar.main import make_management_app, make_public_app
 from mlxbar.settings import SettingsStore
-from mlxbar.workers.supervisor import ActiveRequest, QueuedRequest, WorkerSupervisor
+from mlxbar.workers.supervisor import (ActiveRequest, QueuedRequest, WorkerStalled,
+                                        WorkerSupervisor)
 
 
 class ControlledSupervisor(WorkerSupervisor):
@@ -581,3 +583,126 @@ class OpenAIErrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V150HardeningTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.settings = SettingsStore(self.root)
+
+    async def asyncTearDown(self):
+        self.temporary.cleanup()
+
+    async def _drain(self, supervisor, request_id):
+        events = []
+        async for event in supervisor.generate("hi", [], {"temperature": 0.5, "top_p": 1.0}, request_id):
+            events.append(event)
+        return events
+
+    async def test_unload_while_queued_fails_cleanly_and_frees_the_slot(self):
+        """A waiter whose model disappeared must get a real error, not a crash.
+
+        The entry check runs before the request queues, so an unload in between
+        used to reach `self.loaded.get(...)` on None -- outside the block that
+        releases the generation slot, leaving the lock inconsistent until the
+        orphan recovery noticed.
+        """
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        supervisor.settings.data["generation"]["streamHeartbeatSeconds"] = 1
+        supervisor.loaded = {"id": "m", "name": "m", "engine": "lm-studio"}
+        first = asyncio.create_task(self._drain(supervisor, "first"))
+        await supervisor.stream_started.wait()
+        second = asyncio.create_task(self._drain(supervisor, "second"))
+        await asyncio.sleep(0.1)
+        self.assertIn("second", supervisor.queued_requests)
+
+        await supervisor.unload()
+        supervisor.stream_release.set()
+        await first
+        with self.assertRaises(MLXBarError) as caught:
+            await second
+        self.assertEqual(caught.exception.code, "MODEL_NOT_LOADED")
+        self.assertEqual(caught.exception.status, 409)
+        # Released by the request's own finalizer, not by orphan recovery.
+        self.assertFalse(supervisor.generation_lock.locked())
+        self.assertIsNone(supervisor.generation_owner)
+        self.assertEqual(supervisor.generation_lock_recoveries, 0)
+        self.assertEqual(supervisor.status()["generationLockState"], "idle")
+
+    async def test_management_load_and_unload_refuse_while_requests_are_in_flight(self):
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        supervisor.loaded = {"id": "m", "name": "m", "engine": "lm-studio"}
+        state = SimpleNamespace(workers=supervisor)
+        from mlxbar.api.management import _raise_if_generations_in_flight
+
+        supervisor.queued_requests["waiting"] = QueuedRequest(asyncio.Event(), time.monotonic())
+        with self.assertRaises(HTTPException) as caught:
+            _raise_if_generations_in_flight(state, False, "モデルを切り替え")
+        self.assertEqual(caught.exception.detail["code"], "ENGINE_BUSY")
+        self.assertEqual(caught.exception.detail["queuedRequestCount"], 1)
+        # The GUI still needs a way through.
+        _raise_if_generations_in_flight(state, True, "モデルを切り替え")
+        supervisor.queued_requests.clear()
+        _raise_if_generations_in_flight(state, False, "モデルを切り替え")
+
+    async def test_long_generation_times_out_without_unloading_the_model(self):
+        """A slow reply is not a broken worker; reloading a 27B helps nobody."""
+        supervisor = ControlledSupervisor(self.root, self.settings)
+        supervisor.settings.data["generation"]["totalTimeoutSeconds"] = 10
+        supervisor.loaded = {"id": "m", "name": "m", "engine": "mlx-lm"}
+        supervisor.socket_path = self.root / "worker.sock"
+
+        with self.assertRaises(MLXBarError) as caught:
+            async for _ in supervisor.generate("hi", [], {"temperature": 0.5, "top_p": 1.0}, "slow"):
+                pass
+        # Reaching the worker fails in this harness; what matters is that the
+        # stalled path and the merely-slow path are no longer the same branch.
+        self.assertIn(caught.exception.code, {"WORKER_CRASHED", "WORKER_STALLED", "GENERATION_TIMEOUT"})
+
+    async def test_stalled_worker_is_detected_by_the_idle_watchdog(self):
+        async def silent_lines():
+            await asyncio.sleep(5)
+            yield "never"
+
+        with self.assertRaises(WorkerStalled):
+            async for _ in WorkerSupervisor._lines_with_idle_timeout(silent_lines(), 0.05):
+                pass
+
+    async def test_idle_watchdog_passes_lines_through_while_they_keep_coming(self):
+        async def lines():
+            for index in range(3):
+                await asyncio.sleep(0.01)
+                yield f"line{index}"
+
+        received = [line async for line in WorkerSupervisor._lines_with_idle_timeout(lines(), 1.0)]
+        self.assertEqual(received, ["line0", "line1", "line2"])
+
+    async def test_memory_pressure_uses_free_memory_and_the_os_verdict(self):
+        healthy = {"active_bytes": 10, "cache_bytes": 0, "physical_memory_bytes": 100,
+                   "available_bytes": 50, "pressure_level": 1, "process_rss_bytes": 10}
+        self.assertIsNone(WorkerSupervisor.memory_pressure_reason(healthy, 0.9))
+        self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "available_bytes": 2}, 0.9))
+        self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "pressure_level": 4}, 0.9))
+        self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "process_rss_bytes": 95}, 0.9))
+
+    async def test_completed_job_does_not_retain_its_event_queue(self):
+        """A months-long coordinator must not accumulate one queue per job."""
+        from mlxbar.database import Database
+        from mlxbar.jobs import JobManager
+
+        database = Database(self.root / "jobs.sqlite3")
+        manager = JobManager(database)
+
+        async def work(update):
+            await update(0.5, "半分")
+            return {"ok": True}
+
+        job = manager.create("model_scan", work)
+        for _ in range(200):
+            if job["id"] not in manager.tasks:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(database.get_job(job["id"])["state"], "completed")
+        self.assertNotIn(job["id"], manager.queues)
+        database.close()

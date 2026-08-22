@@ -25,6 +25,14 @@ WORKER_STARTUP_DETAIL_BYTES = 4000
 LOGGER = logging.getLogger(__name__)
 
 
+class WorkerStalled(Exception):
+    """The worker produced neither a token nor a heartbeat for too long."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"worker stalled for {seconds}s")
+        self.seconds = seconds
+
+
 @dataclass
 class ActiveRequest:
     done: asyncio.Event
@@ -56,6 +64,9 @@ class WorkerSupervisor:
         self.generation_lock = asyncio.Lock()
         self.generation_owner: str | None = None
         self.generation_lock_recoveries = 0
+        # Retained so fire-and-forget cancel notifications are not garbage
+        # collected mid-flight.
+        self._background_tasks: set[asyncio.Task] = set()
         self.reap_orphan_worker()
 
     @property
@@ -177,8 +188,11 @@ class WorkerSupervisor:
         env["MLXBAR_PROMPT_CACHE_DISK_ENABLED"] = (
             "1" if cache_settings.get("diskEnabled", True) else "0"
         )
-        max_gb = min(100.0, max(1.0, float(cache_settings.get("diskMaxGB", 5))))
+        max_gb = min(100.0, max(1.0, float(cache_settings.get("diskMaxGB", 10))))
         env["MLXBAR_PROMPT_CACHE_MAX_BYTES"] = str(int(max_gb * (1 << 30)))
+        env["MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS"] = str(
+            min(10, max(1, int(cache_settings.get("keepGenerations", 2)))))
+        env["MLXBAR_PROMPT_CACHE_MEMORY_RATIO"] = str(cache_settings.get("memoryRatio", 0.10))
         # Stable block hashes are required for reuse across Python processes.
         # PromptCacheState owns the RAM tier, so do not duplicate exact hybrid
         # snapshots inside APC's separate in-memory LRU.
@@ -188,6 +202,9 @@ class WorkerSupervisor:
         # 256 tokens cold so a different first user message can still reuse the
         # much larger, stable ZCode system/tools prefix.
         env["APC_EXACT_PREFIX_GUARD_TOKENS"] = "256"
+        generation = self.settings.data["generation"]
+        env["MLXBAR_WIRED_LIMIT_RATIO"] = str(generation.get("wiredLimitRatio", 0.0))
+        env["MLXBAR_CACHE_LIMIT_RATIO"] = str(generation.get("cacheLimitRatio", 0.0))
         module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
         # Worker diagnostics go to a log file rather than a pipe: nothing drains
@@ -449,11 +466,21 @@ class WorkerSupervisor:
         else:
             await self._acquire_generation_slot(request_id)
             generation_acquired = True
-        engine = self.loaded.get("engine", "unknown")
-        control = ActiveRequest(asyncio.Event(), asyncio.Event(), asyncio.current_task(), engine)
-        self.active_requests[request_id] = control
-        total_timeout = self.settings.data["generation"]["totalTimeoutSeconds"]
+        engine = "unknown"
+        control: ActiveRequest | None = None
+        completed_cleanly = False
         try:
+            # The entry check ran before this request waited in the queue. An
+            # unload, a model switch or a worker crash in between leaves
+            # `loaded` empty, and every waiter behind it would otherwise fail
+            # on a None attribute -- outside the try that releases the slot.
+            if not self.loaded:
+                raise MLXBarError("MODEL_NOT_LOADED",
+                                  "待機中にモデルが降ろされました。モデルをロードして再実行してください", 409, True)
+            engine = self.loaded.get("engine", "unknown")
+            control = ActiveRequest(asyncio.Event(), asyncio.Event(), asyncio.current_task(), engine)
+            self.active_requests[request_id] = control
+            total_timeout = self.settings.data["generation"]["totalTimeoutSeconds"]
             async with asyncio.timeout(total_timeout):
                 if engine == "lm-studio":
                     async for event in self._lmstudio_generate(prompt, options):
@@ -461,6 +488,7 @@ class WorkerSupervisor:
                             yield {"type": "completed", "finish_reason": "cancelled"}
                             return
                         yield event
+                    completed_cleanly = True
                     return
                 await self._ensure_memory_capacity()
                 # The Worker emits heartbeats while a long prompt is being tokenized
@@ -470,19 +498,31 @@ class WorkerSupervisor:
                 worker_params = {"prompt": prompt, "images": images, **options}
                 worker_params["heartbeat_interval_seconds"] = self.settings.data["generation"].get(
                     "streamHeartbeatSeconds", 10)
+                worker_params["memory_limit_ratio"] = self.settings.data["generation"].get(
+                    "memoryLimitRatio", 0.9)
                 if isinstance(prompt, list):
                     worker_params["messages"] = prompt
+                idle_timeout = float(self.settings.data["generation"].get("tokenIdleTimeoutSeconds", 60))
                 async with httpx.AsyncClient(transport=transport, base_url="http://worker", timeout=timeout) as client:
                     async with client.stream("POST", "/generate", json={"protocol_version": 1, "request_id": request_id,
                                                "method": "generate", "params": worker_params}) as response:
                         response.raise_for_status()
-                        async for line in response.aiter_lines():
+                        async for line in self._lines_with_idle_timeout(response.aiter_lines(), idle_timeout):
                             if line:
                                 yield json.loads(line)
-        except (httpx.TimeoutException, TimeoutError) as exc:
+                completed_cleanly = True
+        except WorkerStalled as exc:
+            # No token and no heartbeat for the idle budget: the worker itself
+            # is wedged, so only killing the process recovers it.
             if engine != "lm-studio":
                 await self._stop_worker()
                 self.loaded = None
+            raise MLXBarError("WORKER_STALLED",
+                              f"Workerが{exc.seconds:.0f}秒間無応答になったため再起動しました", 504, True) from exc
+        except TimeoutError as exc:
+            # Merely a long generation. Stop this request and keep the model
+            # resident -- reloading a 27B costs minutes and helps nobody. The
+            # finalizer sends the cancel, so this branch must not duplicate it.
             raise MLXBarError("GENERATION_TIMEOUT",
                               f"生成が安全上限の{total_timeout}秒を超えたため停止しました", 504, True) from exc
         except httpx.HTTPError as exc:
@@ -491,10 +531,33 @@ class WorkerSupervisor:
                 self.loaded = None
             raise MLXBarError("WORKER_CRASHED", f"モデルWorkerとの通信が切断されました: {exc}", 503, True) from exc
         finally:
-            control.done.set()
+            if control is not None:
+                control.done.set()
             self.active_requests.pop(request_id, None)
             if generation_acquired:
                 self._release_generation_slot(request_id)
+            if not completed_cleanly and engine not in {"unknown", "lm-studio"}:
+                # The client went away mid-stream. Tell the worker so it stops
+                # at the next token instead of finishing a reply nobody reads.
+                self._notify_worker_cancelled(request_id)
+
+    def _notify_worker_cancelled(self, request_id: str) -> None:
+        """Best-effort cancel RPC for a stream the client abandoned.
+
+        Fire-and-forget: this runs inside a finalizer that may itself be
+        unwinding a cancellation, so it must not await, and a worker that is
+        already gone is not an error worth surfacing."""
+        if not self.socket_path:
+            return
+
+        async def notify() -> None:
+            with contextlib.suppress(Exception):
+                await self._call("cancel", {"request_id": request_id}, timeout=5)
+
+        with contextlib.suppress(RuntimeError):
+            task = asyncio.get_running_loop().create_task(notify())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     async def _acquire_generation_slot(self, request_id: str) -> None:
         await self.generation_lock.acquire()
@@ -580,6 +643,27 @@ class WorkerSupervisor:
                 yield {"type": "error", "code": "LMSTUDIO_UNAVAILABLE", "message": str(exc), "retryable": True}
                 return
         yield {"type": "completed", "finish_reason": "stop"}
+
+    @staticmethod
+    async def _lines_with_idle_timeout(lines, timeout: float):
+        """Yield worker lines, raising WorkerStalled after total silence.
+
+        The worker heartbeats every few seconds even while prefilling, so a gap
+        this long means the worker stopped responding rather than that the
+        model is slow.
+        """
+        iterator = lines.__aiter__()
+        while True:
+            pending = asyncio.create_task(iterator.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=timeout if timeout > 0 else None)
+            if not done:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+                raise WorkerStalled(timeout)
+            try:
+                yield await pending
+            except StopAsyncIteration:
+                return
 
     @staticmethod
     async def _lines_with_heartbeats(lines, interval: float = 10.0):
@@ -792,24 +876,44 @@ class WorkerSupervisor:
                         candidates.append(value)
         return max(candidates) if candidates else None
 
+    @staticmethod
+    def memory_pressure_reason(memory: dict, limit: float) -> str | None:
+        """Short reason why generating now is unsafe, or None.
+
+        Mirrors the worker's in-generation watchdog. A ratio against *total*
+        RAM cannot see the rest of the machine, so free memory and macOS's own
+        pressure verdict both count, and the process's resident size stands in
+        for everything MLX's own counters miss.
+        """
+        if int(memory.get("pressure_level", 0)) >= 4:
+            return "OSがメモリ逼迫を報告しています"
+        physical = int(memory.get("physical_memory_bytes", 0))
+        if physical <= 0:
+            return None
+        used = max(int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0)),
+                   int(memory.get("process_rss_bytes", 0)))
+        if used / physical >= limit:
+            return f"MLX使用量が物理メモリの{used / physical:.0%}に達しています"
+        available = int(memory.get("available_bytes", 0))
+        if available > 0 and available < physical * (1 - limit):
+            return f"空きメモリが{available / physical:.0%}まで低下しています"
+        return None
+
     async def _ensure_memory_capacity(self) -> None:
         try:
-            result = await self._call("memory", {}, timeout=5)
-            memory = result.get("memory", {})
-            used = int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0))
-            physical = int(memory.get("physical_memory_bytes", 0))
             limit = float(self.settings.data["generation"]["memoryLimitRatio"])
-            if physical > 0 and used / physical >= limit:
+            result = await self._call("memory", {}, timeout=5)
+            reason = self.memory_pressure_reason(result.get("memory", {}), limit)
+            if reason:
                 # A retained ZCode prefix is disposable. Drop it once before
                 # rejecting the request so caching cannot turn memory safety
                 # into a persistent failure mode.
                 await self._call("clear_prompt_cache", {}, timeout=5)
                 result = await self._call("memory", {}, timeout=5)
-                memory = result.get("memory", {})
-                used = int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0))
-                physical = int(memory.get("physical_memory_bytes", 0))
-                if physical > 0 and used / physical >= limit:
-                    raise MLXBarError("MEMORY_PRESSURE", "MLXメモリ使用量が安全上限に達しているため生成を中止しました", 503, True)
+                reason = self.memory_pressure_reason(result.get("memory", {}), limit)
+                if reason:
+                    raise MLXBarError("MEMORY_PRESSURE",
+                                      f"メモリ安全上限に達しているため生成を中止しました（{reason}）", 503, True)
         except MLXBarError:
             raise
         except Exception:

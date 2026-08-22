@@ -14,7 +14,16 @@ class IncrementalToolStream:
     split tool marker is never exposed as assistant content.
     """
 
-    TOOL_START = "<tool_call>"
+    # Every opening marker the runtime tool parsers recognise. Detecting only
+    # `<tool_call>` let the other dialects stream to the client as ordinary
+    # assistant text *and* be parsed into tool calls afterwards, so the caller
+    # saw the raw markup and the call.
+    TOOL_START = (
+        "<tool_call>", "<|tool_call>", "<tool_call|>",
+        "<|tool_call_start|>", "<|tool_list_start|>",
+        "<atem:function_calls>", "<longcat_tool_call>", "<minimax:tool_call>",
+        "<start_function_call>", "<|START_ACTION|>",
+    )
     THINK_START = "<think>"
     THINK_END = "</think>"
     ASSISTANT_TAGS = ("<assistant>", "</assistant>")
@@ -33,8 +42,8 @@ class IncrementalToolStream:
         self.pending += text
         events: list[dict] = []
         while self.pending and not self.tool_detected:
-            markers = ((self.THINK_END, self.TOOL_START) if self.in_reasoning else
-                       (self.TOOL_START, self.THINK_START, self.THINK_END, *self.ASSISTANT_TAGS))
+            markers = ((self.THINK_END, *self.TOOL_START) if self.in_reasoning else
+                       (*self.TOOL_START, self.THINK_START, self.THINK_END, *self.ASSISTANT_TAGS))
             match = self._first_marker(self.pending, markers)
             if match is None:
                 safe = self._safe_prefix_length(self.pending, markers)
@@ -48,7 +57,7 @@ class IncrementalToolStream:
                 events.append({"type": "reasoning_delta" if self.in_reasoning else "delta",
                                "text": self.pending[:position]})
             self.pending = self.pending[position + len(marker):]
-            if marker == self.TOOL_START:
+            if marker in self.TOOL_START:
                 self.tool_detected = True
             elif marker == self.THINK_START:
                 self.in_reasoning = True
@@ -80,6 +89,45 @@ class IncrementalToolStream:
                     hold = max(hold, length)
                     break
         return len(text) - hold
+
+
+class StopSequenceFilter:
+    """Cut generated text at an OpenAI `stop` sequence, split-safe.
+
+    A stop string can straddle two deltas, so the same short-suffix holdback
+    `IncrementalToolStream` uses for tool markers applies here: emit everything
+    that cannot still turn into a stop sequence, and keep the rest until the
+    next delta decides it.
+    """
+
+    def __init__(self, sequences):
+        if isinstance(sequences, str):
+            sequences = [sequences]
+        self.sequences = tuple(item for item in (sequences or [])
+                               if isinstance(item, str) and item)
+        self.pending = ""
+        self.hit = False
+
+    def __bool__(self) -> bool:
+        return bool(self.sequences)
+
+    def feed(self, text: str) -> tuple[str, bool]:
+        """Return (text safe to emit, whether a stop sequence ended output)."""
+        if not self.sequences or self.hit:
+            return ("" if self.hit else text), self.hit
+        self.pending += text
+        match = IncrementalToolStream._first_marker(self.pending, self.sequences)
+        if match is not None:
+            position, _ = match
+            visible, self.pending, self.hit = self.pending[:position], "", True
+            return visible, True
+        safe = IncrementalToolStream._safe_prefix_length(self.pending, self.sequences)
+        visible, self.pending = self.pending[:safe], self.pending[safe:]
+        return visible, False
+
+    def finish(self) -> str:
+        visible, self.pending = ("" if self.hit else self.pending), ""
+        return visible
 
 
 def tool_template_kwargs_attempts(params: dict) -> list[dict]:

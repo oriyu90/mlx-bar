@@ -43,6 +43,10 @@ class JobManager:
         await self.queues[job["id"]].put({"state": job["state"], "result": job.get("result"),
                                            "error": job.get("error")})
         self.tasks.pop(job["id"], None)
+        # `events()` re-creates the queue on demand, so dropping it here cannot
+        # lose a subscriber -- but keeping it would retain every progress event
+        # of every job for the life of a coordinator that runs for months.
+        self.queues.pop(job["id"], None)
 
     async def cancel_all(self) -> None:
         """Cancel every still-running job (e.g. an in-flight runtime install)

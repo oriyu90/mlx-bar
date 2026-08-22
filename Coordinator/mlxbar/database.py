@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS api_logs (
   max_tokens INTEGER NOT NULL DEFAULT 0, reasoning_mode TEXT,
   first_token_ms INTEGER, prompt_tokens INTEGER NOT NULL DEFAULT 0,
   cached_tokens INTEGER NOT NULL DEFAULT 0, prompt_tps REAL NOT NULL DEFAULT 0,
-  generation_tps REAL NOT NULL DEFAULT 0, cache_tier TEXT,
+  generation_tps REAL NOT NULL DEFAULT 0, cache_tier TEXT, tool_support TEXT,
   error_code TEXT, client_scope TEXT NOT NULL DEFAULT 'local',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -44,10 +44,17 @@ CREATE TABLE IF NOT EXISTS metadata (
 """
 
 
+# Trimming on every insert made each request pay for an ORDER BY over the
+# whole table. The cap is a retention target, not a hard bound, so drifting a
+# little above it between sweeps is harmless.
+API_LOG_PRUNE_INTERVAL = 100
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.RLock()
+        self._api_log_writes = 0
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
@@ -67,6 +74,7 @@ class Database:
             "prompt_tps": "REAL NOT NULL DEFAULT 0",
             "generation_tps": "REAL NOT NULL DEFAULT 0",
             "cache_tier": "TEXT",
+            "tool_support": "TEXT",
         }
         with self.connection:
             for name, definition in additions.items():
@@ -259,6 +267,8 @@ class Database:
             "generation_tps": max(0.0, float(entry.get("generation_tps") or 0.0)),
             "cache_tier": (str(entry.get("cache_tier"))[:16]
                            if entry.get("cache_tier") in {"cold", "memory", "disk"} else None),
+            "tool_support": (str(entry.get("tool_support"))[:16]
+                             if entry.get("tool_support") in {"none", "full", "degraded"} else None),
             "error_code": str(entry.get("error_code") or "")[:96] or None,
             "client_scope": "lan" if entry.get("client_scope") == "lan" else "local",
         }
@@ -267,16 +277,18 @@ class Database:
                 """INSERT INTO api_logs(request_id,method,path,status,duration_ms,model,stream,
                    message_count,tool_count,message_chars,tool_schema_chars,max_tokens,reasoning_mode,
                    first_token_ms,prompt_tokens,cached_tokens,prompt_tps,generation_tps,cache_tier,
-                   error_code,client_scope)
+                   tool_support,error_code,client_scope)
                    VALUES(:request_id,:method,:path,:status,:duration_ms,:model,:stream,
                    :message_count,:tool_count,:message_chars,:tool_schema_chars,:max_tokens,:reasoning_mode,
                    :first_token_ms,:prompt_tokens,:cached_tokens,:prompt_tps,:generation_tps,:cache_tier,
-                   :error_code,:client_scope)""", safe
+                   :tool_support,:error_code,:client_scope)""", safe
             )
-            self.connection.execute(
-                "DELETE FROM api_logs WHERE id NOT IN (SELECT id FROM api_logs ORDER BY id DESC LIMIT ?)",
-                (max(100, min(int(maximum), 10000)),),
-            )
+            self._api_log_writes += 1
+            if self._api_log_writes % API_LOG_PRUNE_INTERVAL == 0:
+                self.connection.execute(
+                    "DELETE FROM api_logs WHERE id NOT IN (SELECT id FROM api_logs ORDER BY id DESC LIMIT ?)",
+                    (max(100, min(int(maximum), 10000)),),
+                )
 
     def list_api_logs(self, limit: int = 500) -> list[dict]:
         limit = max(1, min(int(limit), 10000))

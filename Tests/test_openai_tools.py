@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).parents[1] / "Workers"))
 
 from common.tool_calls import parse_tool_markup  # noqa: E402
-from mlxbar.database import Database  # noqa: E402
+from mlxbar.database import API_LOG_PRUNE_INTERVAL, Database  # noqa: E402
 from mlxbar.main import make_public_app  # noqa: E402
 from mlxbar.settings import SettingsStore  # noqa: E402
 from mlxbar.workers.supervisor import WorkerSupervisor  # noqa: E402
@@ -277,10 +277,13 @@ def test_api_log_is_bounded_and_does_not_store_request_bodies():
             database.add_api_log({"request_id": str(index), "method": "POST", "path": "/v1/chat/completions",
                                   "status": 200, "model": "model", "message_count": 1, "tool_count": 1})
         logs = database.list_api_logs(10000)
-        assert len(logs) == 2000
+        # Pruning runs every API_LOG_PRUNE_INTERVAL inserts instead of on every
+        # one, so retention is a target the table returns to rather than a hard
+        # per-insert cap. It must still stay bounded.
+        assert 2000 <= len(logs) <= 2000 + API_LOG_PRUNE_INTERVAL
         assert logs[0]["request_id"] == "2049"
         assert not {"messages", "tools", "authorization", "response"}.intersection(logs[0])
-        assert database.clear_api_logs() == 2000
+        assert database.clear_api_logs() == len(logs)
         assert database.list_api_logs() == []
 
 
@@ -623,3 +626,46 @@ def test_stream_log_records_body_duration_and_internal_error_code():
         log = database.list_api_logs(1)[0]
         assert log["duration_ms"] >= 40
         assert log["error_code"] == "SYNTHETIC_TIMEOUT"
+
+
+def test_structured_output_is_refused_rather_than_silently_ignored():
+    """Ignoring an unknown vendor field is right; ignoring JSON mode is not."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        settings = SettingsStore(root)
+        settings.update({"api": {"requireToken": False}})
+        supervisor = WorkerSupervisor(root, settings)
+        supervisor.loaded = {"id": "m", "name": "m", "engine": "lm-studio"}
+        state = SimpleNamespace(settings=settings, workers=supervisor,
+                                database=Database(root / "state.sqlite3"))
+        app = make_public_app(state)
+        with TestClient(app) as client:
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            rejected = client.post("/v1/chat/completions",
+                                   json={**body, "response_format": {"type": "json_object"}})
+            assert rejected.status_code == 400
+            assert rejected.json()["error"]["code"] == "UNSUPPORTED_PARAMETER"
+            assert rejected.json()["error"]["param"] == "response_format"
+
+            logprobs = client.post("/v1/chat/completions", json={**body, "logprobs": True})
+            assert logprobs.status_code == 400
+            assert logprobs.json()["error"]["param"] == "logprobs"
+
+            # The default value is a no-op and must keep working.
+            passthrough = client.post("/v1/chat/completions",
+                                      json={**body, "response_format": {"type": "text"}})
+            assert passthrough.status_code != 400
+        state.database.close()
+
+
+def test_degraded_tool_support_is_recorded_in_the_api_log():
+    with tempfile.TemporaryDirectory() as directory:
+        database = Database(Path(directory) / "state.sqlite3")
+        database.add_api_log({"request_id": "r1", "method": "POST", "path": "/v1/chat/completions",
+                              "status": 200, "model": "m", "tool_support": "degraded"})
+        database.add_api_log({"request_id": "r2", "method": "POST", "path": "/v1/chat/completions",
+                              "status": 200, "model": "m", "tool_support": "nonsense"})
+        rows = database.list_api_logs(10)
+        assert rows[1]["tool_support"] == "degraded"
+        assert rows[0]["tool_support"] is None
+        database.close()

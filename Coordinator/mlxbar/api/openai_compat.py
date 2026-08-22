@@ -84,6 +84,7 @@ async def chat(request: Request, body: dict):
         unknown_stream_options = set(stream_options) - {"include_usage", "include_obfuscation"}
         if unknown_stream_options or any(not isinstance(value, bool) for value in stream_options.values()):
             raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "Invalid stream_options", "param": "stream_options"})
+    _reject_unimplemented(body)
     requested_model = body.get("model")
     if not isinstance(requested_model, str) or not requested_model.strip():
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "modelを指定してください"})
@@ -259,9 +260,12 @@ async def chat(request: Request, body: dict):
                         usage = _usage_from_event(event, usage)
                         request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
                     elif event.get("type") == "metrics":
-                        for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps", "cache_tier"):
+                        for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
+                                    "cache_tier", "tool_support"):
                             if event.get(key) is not None:
                                 request.state.api_log[key] = event[key]
+                    elif event.get("type") == "tool_support":
+                        request.state.api_log["tool_support"] = event.get("state")
                     elif event.get("type") in {"phase", "heartbeat", "queue"}:
                         # SSE comments are ignored by OpenAI clients, but keep the
                         # connection alive during long tokenization/prefill.
@@ -327,9 +331,12 @@ async def chat(request: Request, body: dict):
                 usage = _usage_from_event(event)
                 request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
             elif event.get("type") == "metrics":
-                for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps", "cache_tier"):
+                for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
+                            "cache_tier", "tool_support"):
                     if event.get(key) is not None:
                         request.state.api_log[key] = event[key]
+            elif event.get("type") == "tool_support":
+                request.state.api_log["tool_support"] = event.get("state")
             elif event.get("type") == "error":
                 raise MLXBarError(event.get("code", "GENERATION_FAILED"),
                                   event.get("message", "生成に失敗しました"), 502,
@@ -368,7 +375,11 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
         loaded = state.workers.loaded
         if loaded and _model_matches(loaded, requested, state):
             return loaded
-        if loaded and getattr(state.workers, "active_requests", {}):
+        if loaded and (getattr(state.workers, "active_requests", {})
+                       or getattr(state.workers, "queued_requests", {})):
+            # Queued requests resolve against whatever model is loaded when
+            # their turn comes, so switching under them is as disruptive as
+            # switching under a running one.
             raise MLXBarError("ENGINE_BUSY", "別のモデルが応答中のため、モデルを切り替えられません", 429, True)
         model = _find_model(state, requested)
         if not model:
@@ -466,6 +477,28 @@ def _normalize_extra_body(value) -> dict:
     if reasoning_effort is not None:
         _apply_reasoning_effort(result, reasoning_effort, "extra_body.reasoning_effort")
     return result
+
+
+def _reject_unimplemented(body: dict) -> None:
+    """Fail loudly on known OpenAI options MLXBar cannot honour.
+
+    Ignoring an unknown vendor extension is right -- clients add those over
+    time. Ignoring a *standard* option the caller is relying on is not: a
+    client asking for JSON mode and quietly getting prose has no way to tell.
+    """
+    response_format = body.get("response_format")
+    if response_format is not None:
+        kind = response_format.get("type") if isinstance(response_format, dict) else None
+        if kind != "text":
+            raise HTTPException(400, detail={
+                "code": "UNSUPPORTED_PARAMETER",
+                "message": "response_formatはtextのみ対応しています。"
+                           "構造化出力はプロンプトとtool callingで指定してください",
+                "param": "response_format", "parameters": ["response_format"]})
+    if body.get("logprobs"):
+        raise HTTPException(400, detail={
+            "code": "UNSUPPORTED_PARAMETER", "message": "logprobsには対応していません",
+            "param": "logprobs", "parameters": ["logprobs"]})
 
 
 def _json_size(value) -> int:
