@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import importlib.metadata
 import json
+import linecache
 import logging
 import os
 import shutil
@@ -174,23 +175,32 @@ class MLXVLMAdapter(BaseAdapter):
 
     @staticmethod
     def _is_cache_reuse_failure(exc: Exception) -> bool:
-        """True when the failure came from the runtime's prompt-reuse machinery.
+        """True only when the failure came from rolling a cache back.
 
         mlx-vlm rolls a retained cache back to the shared prefix by calling
         ``trim()`` on every entry, guarded by a retention check rather than by
-        ``is_trimmable()``. Architectures whose cache list contains an entry
-        without a ``trim`` method at all -- hybrid Qwen3.5/3.8 layers use
+        ``is_trimmable()``. Architectures whose cache list holds an entry with
+        no ``trim`` method at all -- hybrid Qwen3.5/3.8 layers use
         ``ArraysCache`` -- therefore raise instead of falling back to a cold
-        prefill. Reuse is an optimisation, so its failures must never be the
-        caller's problem: retry once with a fresh cache.
+        prefill. Reuse is an optimisation, so retry once with a fresh cache.
+
+        The test has to be the failing *call*, not the module it happened in:
+        ``stream_generate`` itself lives in ``generate/dispatch.py``, so every
+        generation error whatsoever passes through a frame there. Matching the
+        module alone would retry genuine model errors -- wasting a prefill and,
+        worse, discarding the warm cache over an unrelated failure.
         """
         trace = exc.__traceback__
         while trace is not None:
-            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/").lower()
-            if "/mlx_vlm/generate/dispatch" in filename or "/mlx_vlm/models/cache" in filename:
-                return True
+            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/")
+            if "/mlx_vlm/" in filename.lower():
+                # Reading the failing source line keeps this independent of
+                # line numbers, which move between runtime versions.
+                if ".trim(" in linecache.getline(filename, trace.tb_lineno):
+                    return True
             trace = trace.tb_next
-        return False
+        # Source may be unavailable; the missing-method shape is unambiguous.
+        return isinstance(exc, AttributeError) and "trim" in str(exc)
 
     @staticmethod
     def _is_apc_failure(exc: Exception) -> bool:

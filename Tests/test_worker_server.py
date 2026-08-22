@@ -1009,6 +1009,48 @@ def test_prompt_cache_rollback_failure_retries_instead_of_failing_the_request():
     assert adapter.prompt_cache_reuse_failures == 1
 
 
+def test_reuse_failure_detection_looks_at_the_failing_call_not_the_module():
+    """`stream_generate` lives in the same module as the rollback.
+
+    An earlier version of this check matched any traceback frame inside
+    `mlx_vlm/generate/dispatch.py`. Because `stream_generate` is defined
+    there, *every* generation error matched, so genuine model failures were
+    retried and -- worse -- discarded the warm prompt cache on the way. The
+    check must key on the failing call itself.
+    """
+    import tempfile
+    import textwrap
+
+    root = Path(tempfile.mkdtemp()) / "site-packages" / "mlx_vlm" / "generate"
+    root.mkdir(parents=True)
+    module = root / "dispatch.py"
+    module.write_text(textwrap.dedent("""
+        def roll_cache_back(cache):
+            for c in cache:
+                c.trim(4)
+
+        def stream_generate(model):
+            return model.config
+    """), encoding="utf-8")
+    namespace: dict = {}
+    exec(compile(module.read_text(encoding="utf-8"), str(module), "exec"), namespace)
+
+    class NoTrim:
+        pass
+
+    try:
+        namespace["roll_cache_back"]([NoTrim()])
+    except AttributeError as exc:
+        assert MLXVLMAdapter._is_cache_reuse_failure(exc), "the rollback must be retried"
+
+    try:
+        namespace["stream_generate"](None)
+    except AttributeError as exc:
+        # Same module, same exception type, different call: not a cache problem.
+        assert not MLXVLMAdapter._is_cache_reuse_failure(exc), \
+            "a genuine model error must not be treated as a cache failure"
+
+
 def test_genuine_model_errors_are_not_retried_as_cache_failures():
     """Only the reuse machinery earns a second attempt."""
     mlx_vlm = ModuleType("mlx_vlm")
