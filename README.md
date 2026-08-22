@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.5.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.5.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -39,7 +39,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.5.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.5.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -131,7 +131,7 @@ GGUFはMLXワーカーへ渡されず、LM Studio Providerだけが選択され�
 - GUIの「停止」は協調停止を要求し、5秒以内に終わらない場合はMLX WorkerまたはLM Studio接続を強制終了します。「すべての生成を停止」では待機中の要求も取り消します。
 - モデルロードは最大10分、生成は最大60分で停止します。長い入力処理中は10秒間隔で生存通知を送ります。生成が上限を超えても、その要求だけを停止してモデルはロードしたまま維持します。Workerが60秒間まったく無応答になった場合だけプロセスを再起動します。
 - `max_tokens`は最大8192、promptは最大100,000文字、画像は最大8件・1件25MBです。
-- MLXのactive/cacheメモリが物理メモリの90%に達した場合は、新しい生成を開始しません。
+- MLX使用量・空きメモリ・macOSのメモリ逼迫レベル・Workerの常駐サイズのいずれかが安全上限に達した場合は、新しい生成を開始しません。生成中も5秒間隔で確認し、上限に達した要求だけを停止します（詳細は「メモリ安全性」）。
 - Worker通信が切断された場合はモデル状態を解除し、再ロード可能な状態へ復帰します。
 
 これらの既定値は`~/Library/Application Support/MLXBar/config.json`の`generation`項目に保存されます。上限を緩和するとメモリ不足や長時間無応答の危険が増えるため、通常は変更しないでください。
@@ -221,6 +221,8 @@ v1.4.0では、mlx-vlm公式の`APCManager` / `DiskBlockStore`をディスク専
 v1.5.0では、これまでmlx-vlm経路にしかなかった仕組みをmlx-lmにも用意しました。RAM層はmlx-lm公式の`LRUPromptCache`で、複数のprefixを木構造で保持して最も長く一致するものを返します。ディスク層は`save_prompt_cache` / `load_prompt_cache`によるprefix snapshotで、mlx-vlm側と同じく末尾256 tokensをcoldに残すため、最初のユーザー文が変わっても大きなsystem/tools prefixを再利用できます。保存するのは常にプロンプト部分までで、モデル自身の応答をprefixとして保存することはありません。
 
 namespaceはモデルとランタイム版から作られるため、モデル切替やランタイム更新のたびに新しい世代が生まれます。容量上限は1世代の中でしか効かないので、`promptCache.keepGenerations`（既定2）を超えた古い世代は自動削除します。RAM層は`promptCache.memoryRatio`（既定0.10、物理メモリ比）で上限を設けます。8,000 token規模のsnapshotは1 GBに達するため、どちらの上限も実測に基づいて設定してください。
+
+v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻き戻せない場合でも要求を失敗させません。Qwen3.5／3.8系のようにhybrid層を持つモデルでは、会話が枝分かれしたターンでランタイムの巻き戻し処理が失敗することがあります。再利用はあくまで最適化なので、応答をまだ送信していなければ新しいキャッシュで一度だけ再試行します。ディスクキャッシュは再試行でも参照されるため、cold prefillではなくdisk hitになります。回復回数は`GET /api/v1/prompt-cache`の`reuseFailures`で確認できます。
 
 「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GB（既定10 GB）の容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
 
@@ -318,7 +320,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.5.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.5.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

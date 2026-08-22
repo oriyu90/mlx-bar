@@ -26,6 +26,7 @@ class MLXVLMAdapter(BaseAdapter):
         self.apc_namespace: str | None = None
         self.apc_disabled_reason: str | None = None
         self.model_path: str | None = None
+        self.prompt_cache_reuse_failures = 0
 
     def capabilities(self) -> dict:
         result = super().capabilities()
@@ -172,6 +173,26 @@ class MLXVLMAdapter(BaseAdapter):
         )
 
     @staticmethod
+    def _is_cache_reuse_failure(exc: Exception) -> bool:
+        """True when the failure came from the runtime's prompt-reuse machinery.
+
+        mlx-vlm rolls a retained cache back to the shared prefix by calling
+        ``trim()`` on every entry, guarded by a retention check rather than by
+        ``is_trimmable()``. Architectures whose cache list contains an entry
+        without a ``trim`` method at all -- hybrid Qwen3.5/3.8 layers use
+        ``ArraysCache`` -- therefore raise instead of falling back to a cold
+        prefill. Reuse is an optimisation, so its failures must never be the
+        caller's problem: retry once with a fresh cache.
+        """
+        trace = exc.__traceback__
+        while trace is not None:
+            filename = trace.tb_frame.f_code.co_filename.replace("\\", "/").lower()
+            if "/mlx_vlm/generate/dispatch" in filename or "/mlx_vlm/models/cache" in filename:
+                return True
+            trace = trace.tb_next
+        return False
+
+    @staticmethod
     def _is_apc_failure(exc: Exception) -> bool:
         """True only when the failure actually came from the APC code.
 
@@ -200,6 +221,7 @@ class MLXVLMAdapter(BaseAdapter):
             "disabledReason": self.apc_disabled_reason,
             "generations": self._namespace_count(),
             "diskBytes": self._namespace_bytes(),
+            "reuseFailures": self.prompt_cache_reuse_failures,
         }
         if self.apc_manager is not None:
             try:
@@ -365,17 +387,25 @@ class MLXVLMAdapter(BaseAdapter):
                 completed = True
             except Exception as exc:
                 apc_failed = kwargs.get("apc_manager") is not None and self._is_apc_failure(exc)
-                if not apc_failed or received_response:
+                reuse_failed = kwargs.get("prompt_cache_state") is not None and self._is_cache_reuse_failure(exc)
+                if not (apc_failed or reuse_failed) or received_response:
                     if apc_failed:
                         self._disable_apc_after_failure(exc)
                     raise
-                # Disk lookup can fail because a runtime or cache format changed.
-                # Before anything was emitted it is safe to retry once through
-                # the already-proven v1.3.7 memory/cold path.
-                self._disable_apc_after_failure(exc)
+                # Reuse can fail because a runtime or cache format changed, or
+                # because the runtime cannot roll a cache back to a shorter
+                # shared prefix for this architecture. Before anything was
+                # emitted it is safe to retry once with a fresh cache, which
+                # skips reuse entirely for this request.
+                if apc_failed:
+                    self._disable_apc_after_failure(exc)
+                    kwargs.pop("apc_manager", None)
+                    kwargs.pop("apc_tenant", None)
+                else:
+                    logging.getLogger(__name__).warning(
+                        "Prompt cache reuse failed; retrying with a fresh cache: %s", exc)
+                    self.prompt_cache_reuse_failures += 1
                 self._reset_prompt_cache()
-                kwargs.pop("apc_manager", None)
-                kwargs.pop("apc_tenant", None)
                 kwargs["prompt_cache_state"] = self.prompt_cache_state
                 last_response = None
                 for response in stream_generate(**kwargs):

@@ -959,3 +959,80 @@ def test_text_after_a_stop_sequence_cannot_produce_a_tool_call():
     assert text == "visible part "
     assert not [event for event in events if event.get("type") == "tool_calls"]
     assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+def test_prompt_cache_rollback_failure_retries_instead_of_failing_the_request():
+    """A runtime that cannot roll its cache back must not lose the answer.
+
+    mlx-vlm rolls a retained cache back to the shared prefix by calling
+    `trim()` on every entry, guarded by a retention check rather than by
+    `is_trimmable()`. Hybrid Qwen3.5/3.8 layers use a cache type with no
+    `trim` at all, so the reuse path raises
+    `'ArraysCache' object has no attribute 'trim'` and the whole generation
+    failed with GENERATION_FAILED. Reuse is an optimisation; its failure has
+    to degrade to a cold prefill.
+    """
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    attempts = {"count": 0}
+    # Compile the raiser against the runtime's own path so the exception carries
+    # a traceback frame inside `mlx_vlm/generate/dispatch.py` -- which is how the
+    # adapter tells reuse failures apart from genuine model errors.
+    code = compile("def raise_from_dispatch():\n"
+                   "    raise AttributeError(\"'ArraysCache' object has no attribute 'trim'\")\n",
+                   "/site-packages/mlx_vlm/generate/dispatch.py", "exec")
+    namespace: dict = {}
+    exec(code, namespace)
+
+    def stream_generate(**kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            assert kwargs.get("prompt_cache_state") is not None
+            namespace["raise_from_dispatch"]()
+        yield SimpleNamespace(text="recovered", prompt_tokens=10, generation_tokens=1,
+                              cached_tokens=0, prompt_tps=1.0, generation_tps=1.0,
+                              finish_reason="stop")
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "templated"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter._reset_prompt_cache = lambda: setattr(adapter, "prompt_cache_state", object())
+    adapter.prompt_cache_state = object()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        events = list(adapter.stream("request", {"prompt": "hello"}))
+    assert attempts["count"] == 2, "the failed attempt was not retried"
+    assert [event for event in events if event.get("type") == "delta"] == [
+        {"type": "delta", "text": "recovered"}]
+    assert adapter.prompt_cache_reuse_failures == 1
+
+
+def test_genuine_model_errors_are_not_retried_as_cache_failures():
+    """Only the reuse machinery earns a second attempt."""
+    mlx_vlm = ModuleType("mlx_vlm")
+    prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    attempts = {"count": 0}
+
+    def stream_generate(**_kwargs):
+        attempts["count"] += 1
+        raise RuntimeError("the model itself is broken")
+        yield
+
+    mlx_vlm.stream_generate = stream_generate
+    prompt_utils.apply_chat_template = lambda *_args, **_kwargs: "templated"
+    adapter = MLXVLMAdapter()
+    adapter.model = SimpleNamespace(config=object())
+    adapter.processor = object()
+    adapter.modalities = ["text"]
+    adapter.prompt_cache_state = object()
+    with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
+        try:
+            list(adapter.stream("request", {"prompt": "hello"}))
+        except RuntimeError as exc:
+            assert "the model itself is broken" in str(exc)
+        else:
+            raise AssertionError("a genuine model error must surface")
+    assert attempts["count"] == 1
+    assert adapter.prompt_cache_reuse_failures == 0
