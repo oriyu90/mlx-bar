@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.5.3 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.6.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -39,7 +39,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.5.3.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -300,6 +300,22 @@ ZCode 3.2.5以降のモデル設定が追加する`extra_body.chat_template_kwar
 
 ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒否せず到着順にキューへ入れます。待機中も同じheartbeatを送るため、subagent接続は生成開始まで維持されます。クライアントが接続を閉じた待機要求は自動削除されます。「設定…」→「モデル」→「並列リクエスト」で最大待機件数と最大待ち時間を変更できます。メニューバーには現在の待機件数を表示します。
 
+### プロンプトの再利用と中断からの再開
+
+同じ会話を続けるかぎり、MLXBarは前のターンで計算済みのプロンプト部分を再利用します。10万トークン級のZCodeセッションでは、再利用が効いたターンの最初のトークンまで数秒、効かなかったターンは数分という差になります。
+
+**中断したあとの再開**: 生成をキャンセルしても、そこまでに計算した分は保持します。**部分的な出力を会話履歴に残したまま送り直すと、再計算はゼロになります。** 部分出力を捨てて送り直す場合は、完了している直前のターンまで復元するため、失うのは最後の1ターン分だけです。
+
+**モデルによって再利用の仕組みが違います。** Qwen3.5・Qwen3.8のように再帰層を含む構成では、キャッシュを途中まで巻き戻すことが原理的にできません。この種のモデルでは完了したターンのスナップショットを保存して復元します。ロード中のモデルがどちらかは、メニューバーと「設定…」→「プロンプトキャッシュ」に表示します。`GET /v1/models`の`prefix_reuse`でも確認できます。
+
+**スナップショットの大きさはモデルが決めます。** 1トークンあたりの必要量は全注意層の数とKVヘッドの幅から決まり、`Qwen3.8-27B-MLX-8bit`では64 KB／トークン、10万トークンで6.4 GBです。「最大ディスク容量」がこれを下回ると1件も保存できないため、MLXBarは書き込みを止めて理由を表示します。手元の全モデルについて必要量を一覧するには、重みをロードせずに次を実行します。
+
+```sh
+python3 scripts/cache-capability-matrix.py ~/.lmstudio/models
+```
+
+**再利用が止まったとき**: プロンプト全体の再計算が2回続くと、メニューバーが理由付きで警告します。APIログには`cache_tier`（`memory`／`disk`／`cold`）と、coldの場合はその理由、直前要求との共通prefix長を記録します。**system promptに時刻を入れている、tool定義の順序が毎回変わるといったクライアント側の原因は、この共通prefix長が急に短くなることで分かります。** 会話本文・ツール定義・APIキーは記録しません。
+
 ### 最近のAPIログ
 
 「設定…」→「詳細」には、公開APIへの最近のアクセスを表示します。SQLiteには最新2,000件を保持し、画面には500件まで表示します。日時、HTTP状態、処理時間、接続元がこのMacかLANか、モデル名、メッセージ数、ツール数、エラー種別を記録します。リクエスト／応答本文、ツール定義の内容、Authorizationヘッダー、APIキーは記録しません。ログは同じ画面からコピーまたは消去できます。
@@ -330,7 +346,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.5.3.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

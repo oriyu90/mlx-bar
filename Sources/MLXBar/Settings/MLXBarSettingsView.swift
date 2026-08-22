@@ -64,6 +64,22 @@ struct PromptCacheSettingsView: View {
                 if let reason = model.promptCacheStatus["disabledReason"] as? String {
                     Text("\(LS("無効理由")): \(reason)").font(.caption).foregroundStyle(.orange)
                 }
+                if let summary = model.cacheSummaryText {
+                    LabeledContent(LS("再利用方式"), value: summary)
+                }
+                if model.cacheAffordableTokens > 0 {
+                    LabeledContent(LS("保存できる長さ"),
+                                   value: "\(model.cacheAffordableTokens.formatted()) tokens")
+                }
+                if let cold = model.cacheLastColdReason {
+                    LabeledContent(LS("直近の再利用なしの理由"),
+                                   value: MenuBarViewModel.cacheReasonText(cold,
+                                                                           japanese: model.guiLanguage == "ja"))
+                }
+                if let warning = model.cacheWarningText {
+                    Text(warning).font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 HStack {
                     Button(LS("更新")) { Task { await model.refreshPromptCache() } }
                     Button(LS("メモリーキャッシュを消去")) {

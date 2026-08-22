@@ -61,10 +61,23 @@ DEFAULTS: dict[str, Any] = {
         "diskMaxGB": 10,
         "keepGenerations": 2,
         "memoryRatio": 0.10,
+        # Snapshots of a completed turn, for architectures whose cache cannot be
+        # rolled back in place. "auto" enables them only where they are the only
+        # way to reuse anything after a branch; "off" keeps the pre-1.6.0
+        # behaviour of a full prefill in that case.
+        "branchCheckpoint": "auto",
+        # Ceiling on snapshot writes per worker lifetime. One snapshot of a long
+        # conversation is measured in gigabytes, so an unbounded disk tier is a
+        # sustained write load rather than a cache.
+        "diskWriteBudgetGB": 32,
+        # APC's own in-memory block pool. Left off because its behaviour on a
+        # 27B-class hybrid has not been measured; see mlx-bar.md.
+        "memoryBlocks": "off",
     },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
-    "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info", "language": "en"},
+    "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info",
+                "language": "en", "preloadLastModel": True},
 }
 
 
@@ -148,6 +161,14 @@ class SettingsStore:
         if (isinstance(memory_ratio, bool) or not isinstance(memory_ratio, (int, float))
                 or not 0 <= float(memory_ratio) <= 0.5):
             raise ValueError("promptCache.memoryRatio must be between 0 and 0.5")
+        if prompt_cache.get("branchCheckpoint", "auto") not in {"auto", "off"}:
+            raise ValueError("promptCache.branchCheckpoint must be auto or off")
+        if prompt_cache.get("memoryBlocks", "off") not in {"auto", "off"}:
+            raise ValueError("promptCache.memoryBlocks must be auto or off")
+        write_budget = prompt_cache.get("diskWriteBudgetGB", 32)
+        if (not isinstance(write_budget, (int, float)) or isinstance(write_budget, bool)
+                or not 0 <= float(write_budget) <= 4096):
+            raise ValueError("promptCache.diskWriteBudgetGB must be between 0 and 4096")
         keep_generations = prompt_cache.get("keepGenerations", 2)
         if (isinstance(keep_generations, bool) or not isinstance(keep_generations, int)
                 or not 1 <= keep_generations <= 10):
@@ -171,6 +192,8 @@ class SettingsStore:
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
         if data.get("general", {}).get("language") not in {"en", "ja"}:
             raise ValueError("general.language must be en or ja")
+        if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):
+            raise ValueError("general.preloadLastModel must be boolean")
         generation = data.get("generation", {})
         integer_ranges = {
             "maxTokens": (1, 2_000_000),

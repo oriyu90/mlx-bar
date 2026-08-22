@@ -116,6 +116,34 @@ class BaseAdapter:
         self.model: Any = None
         self.processor: Any = None
         self.cancelled = CancellationRegistry()
+        # Why a request stopped, when the reason changes what cleanup is right.
+        # A user cancelling wants the work so far kept; a memory watchdog
+        # stopping the same request wants it released. Without the distinction
+        # an adapter can only guess, and guessing wrong is either a wasted
+        # prefill or a worker the OS kills.
+        self._abort_reasons: dict[str, float] = {}
+        self._abort_kinds: dict[str, str] = {}
+
+    def note_abort(self, request_id: str, reason: str) -> None:
+        if not request_id:
+            return
+        self._abort_kinds[request_id] = reason
+        self._abort_reasons[request_id] = time.monotonic()
+        cutoff = time.monotonic() - CANCEL_RETENTION_SECONDS
+        for key in [key for key, stamp in self._abort_reasons.items() if stamp < cutoff]:
+            self._abort_reasons.pop(key, None)
+            self._abort_kinds.pop(key, None)
+        while len(self._abort_kinds) > CANCEL_MAX_ENTRIES:
+            oldest = next(iter(self._abort_kinds))
+            self._abort_kinds.pop(oldest, None)
+            self._abort_reasons.pop(oldest, None)
+
+    def abort_reason(self, request_id: str) -> str | None:
+        return self._abort_kinds.get(request_id)
+
+    def clear_abort(self, request_id: str) -> None:
+        self._abort_kinds.pop(request_id, None)
+        self._abort_reasons.pop(request_id, None)
 
     def capabilities(self) -> dict:
         return {"engine": self.engine, "protocolVersion": 1, "streaming": True,
@@ -359,6 +387,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 live_tps = None
                 first_delta_at = None
                 last_progress = started
+                prefill_estimate = None
                 iterator = adapter.stream(request_id, params)
                 while True:
                     pending = asyncio.create_task(on_mlx_thread(next_event, iterator))
@@ -366,8 +395,16 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         done, _ = await asyncio.wait({pending}, timeout=heartbeat_interval)
                         if done:
                             break
-                        yield json.dumps({"type": "heartbeat", "phase": "prefill",
-                                          "elapsed_seconds": round(time.monotonic() - started, 1)}) + "\n"
+                        elapsed = round(time.monotonic() - started, 1)
+                        beat = {"type": "heartbeat", "phase": "prefill",
+                                "elapsed_seconds": elapsed}
+                        if prefill_estimate:
+                            # A silent eight minutes and a silent eight minutes
+                            # with "about 6 more to go" are the same wait, but
+                            # only one of them is survivable.
+                            beat["estimated_seconds"] = prefill_estimate
+                            beat["remaining_seconds"] = max(0.0, round(prefill_estimate - elapsed, 1))
+                        yield json.dumps(beat) + "\n"
                         last_visible_event = time.monotonic()
                     has_event, event = await pending
                     if not has_event:
@@ -382,12 +419,20 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         exceeded = await on_mlx_thread(memory_pressure_reason,
                                                        adapter, memory_limit_ratio)
                         if exceeded:
+                            # Tell the adapter *why* before the generator is
+                            # closed: its cleanup runs inside that close, and by
+                            # then this frame is gone.
+                            adapter.note_abort(request_id, "memory_pressure")
                             close_on_mlx_thread(iterator)
                             iterator = None
                             yield json.dumps({"type": "error", "code": "MEMORY_PRESSURE",
                                               "message": f"生成中にメモリ安全上限へ達したため停止しました（{exceeded}）",
                                               "retryable": True}, ensure_ascii=False) + "\n"
                             return
+                    if event.get("type") == "prefill_estimate":
+                        value = event.get("estimated_seconds")
+                        if isinstance(value, (int, float)) and value > 0:
+                            prefill_estimate = float(value)
                     if event.get("type") in {"delta", "token_progress"}:
                         # `token_progress` carries the same counters for tokens
                         # that produced no text: a runtime may hold a whole reply
@@ -510,6 +555,10 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 # client disconnects mid-generation.
                 adapter.cancelled.discard(request_id)
                 if iterator is not None:
+                    # Deliberately not awaited (see close_on_mlx_thread), so the
+                    # adapter's own cleanup runs *after* this block returns. The
+                    # abort reason must therefore outlive the request here; the
+                    # registry expires and bounds itself instead.
                     close_on_mlx_thread(iterator)
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")

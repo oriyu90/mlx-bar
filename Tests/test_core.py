@@ -81,6 +81,34 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "keepGenerations"):
                 store.update({"promptCache": {"keepGenerations": 0}})
 
+    def test_branch_checkpoint_and_write_budget_are_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["promptCache"]["branchCheckpoint"], "auto")
+            # Off by default: the block pool's behaviour on a large hybrid model
+            # has not been measured, so it is offered rather than assumed.
+            self.assertEqual(store.data["promptCache"]["memoryBlocks"], "off")
+            self.assertEqual(store.data["promptCache"]["diskWriteBudgetGB"], 32)
+            updated = store.update({"promptCache": {"branchCheckpoint": "off",
+                                                    "memoryBlocks": "auto",
+                                                    "diskWriteBudgetGB": 8}})
+            self.assertEqual(updated["promptCache"]["branchCheckpoint"], "off")
+            self.assertEqual(updated["promptCache"]["memoryBlocks"], "auto")
+            self.assertEqual(updated["promptCache"]["diskWriteBudgetGB"], 8)
+            with self.assertRaisesRegex(ValueError, "branchCheckpoint"):
+                store.update({"promptCache": {"branchCheckpoint": "sometimes"}})
+            with self.assertRaisesRegex(ValueError, "memoryBlocks"):
+                store.update({"promptCache": {"memoryBlocks": "yes"}})
+            with self.assertRaisesRegex(ValueError, "diskWriteBudgetGB"):
+                store.update({"promptCache": {"diskWriteBudgetGB": -1}})
+
+    def test_preloading_the_last_model_is_on_by_default_and_type_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertTrue(store.data["general"]["preloadLastModel"])
+            with self.assertRaisesRegex(ValueError, "preloadLastModel"):
+                store.update({"general": {"preloadLastModel": "yes"}})
+
     def test_lan_access_requires_matching_host_and_api_token(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))

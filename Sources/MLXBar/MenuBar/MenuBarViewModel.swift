@@ -96,6 +96,12 @@ final class MenuBarViewModel: ObservableObject {
     @Published var loadedModelMaxTokens: Int?
     @Published var effectiveMaxTokens = 8192
     @Published var effectiveMaxPromptCharacters = 100000
+    @Published var cacheCapability: String?
+    @Published var cacheColdStreak = 0
+    @Published var cacheLastColdReason: String?
+    @Published var cacheAffordableTokens = 0
+    @Published var cacheDisabledReason: String?
+    @Published var cacheRecentTiers: [String] = []
     @Published var activeRequestCount = 0
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
@@ -251,6 +257,14 @@ final class MenuBarViewModel: ObservableObject {
             } else if !localLoadInProgress {
                 setIfChanged(\.loadingModelName, nil)
                 setIfChanged(\.loadingEngine, nil); setIfChanged(\.loadingPhase, nil); setIfChanged(\.loadingStartedAt, nil)
+            }
+            if let health = json["promptCacheHealth"] as? [String: Any] {
+                setIfChanged(\.cacheCapability, health["capability"] as? String)
+                setIfChanged(\.cacheColdStreak, (health["coldStreak"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.cacheLastColdReason, health["lastColdReason"] as? String)
+                setIfChanged(\.cacheAffordableTokens, (health["affordableTokens"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.cacheDisabledReason, health["disabledReason"] as? String)
+                setIfChanged(\.cacheRecentTiers, health["recentTiers"] as? [String] ?? [])
             }
             if let api = json["api"] as? [String: Any] {
                 setIfChanged(\.apiURL, api["url"] as? String ?? apiURL)
@@ -589,6 +603,71 @@ final class MenuBarViewModel: ObservableObject {
         if activeRequestCount > 0 { return "Model is responding" }
         if loadedName != nil { return "Ready" }
         return "No model loaded"
+    }
+
+    /// What prefix reuse this model gets, stated before it matters.
+    ///
+    /// A hybrid model whose cache cannot be rolled back behaves completely
+    /// differently from one that can — minutes rather than seconds whenever a
+    /// conversation branches — and until v1.6.0 nothing in the interface said
+    /// so. Naming it at a glance is what stops that from being discovered the
+    /// hard way.
+    var cacheSummaryText: String? {
+        guard loadedName != nil, let capability = cacheCapability else { return nil }
+        let japanese = guiLanguage == "ja"
+        switch capability {
+        case "trim":
+            return japanese ? "プロンプト再利用: 巻き戻し可" : "Prompt reuse: rollback supported"
+        case "checkpoint":
+            let tokens = cacheAffordableTokens
+            if tokens > 0 {
+                return japanese
+                    ? "プロンプト再利用: スナップショット方式 · 約\(tokens.formatted())トークンまで保存可"
+                    : "Prompt reuse: snapshots · up to about \(tokens.formatted()) tokens"
+            }
+            return japanese ? "プロンプト再利用: スナップショット方式" : "Prompt reuse: snapshots"
+        default:
+            return japanese ? "プロンプト再利用: 非対応" : "Prompt reuse: unavailable"
+        }
+    }
+
+    /// Set when reuse has actually stopped working, with the reason.
+    var cacheWarningText: String? {
+        guard loadedName != nil else { return nil }
+        let japanese = guiLanguage == "ja"
+        if let disabled = cacheDisabledReason, disabled == "budget_insufficient" {
+            return japanese
+                ? "キャッシュ上限が小さく、スナップショットを1件も保存できません。設定のディスク上限を増やしてください"
+                : "The cache limit cannot hold a single snapshot. Raise the disk limit in Settings."
+        }
+        guard cacheColdStreak >= 2 else { return nil }
+        let reason = Self.cacheReasonText(cacheLastColdReason, japanese: japanese)
+        return japanese
+            ? "直近\(cacheColdStreak)件がプロンプト全体の再計算になっています（\(reason)）"
+            : "The last \(cacheColdStreak) requests re-processed the whole prompt (\(reason))"
+    }
+
+    static func cacheReasonText(_ reason: String?, japanese: Bool) -> String {
+        switch reason {
+        case "reuse_unsupported":
+            return japanese ? "このモデルはキャッシュを巻き戻せません" : "this model cannot roll its cache back"
+        case "budget_insufficient":
+            return japanese ? "キャッシュ上限が不足" : "the cache limit is too small"
+        case "cancelled_previous":
+            return japanese ? "前回の生成が中断されました" : "the previous generation was interrupted"
+        case "runtime_changed":
+            return japanese ? "ランタイムが変わりました" : "the runtime changed"
+        case "memory_pressure":
+            return japanese ? "メモリ逼迫のため解放されました" : "it was released under memory pressure"
+        case "token_ids_unavailable":
+            return japanese ? "ランタイムがトークンIDを返しません" : "the runtime does not report token ids"
+        case "write_budget_reached":
+            return japanese ? "ディスク書き込み上限に達しました" : "the disk write budget is used up"
+        case "first_request":
+            return japanese ? "最初の要求です" : "this is the first request"
+        default:
+            return japanese ? "共通部分がありません" : "no shared prefix"
+        }
     }
 
     func setMaxTokenLimit(_ value: Int) async {

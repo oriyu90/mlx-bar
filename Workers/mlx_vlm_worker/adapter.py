@@ -12,8 +12,13 @@ import time
 import uuid
 from pathlib import Path
 
-from common.server import BaseAdapter, run
+from common import cache_state
+from common.server import BaseAdapter, memory_pressure_reason, run
 from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
+
+from .prompt_cache import CheckpointStore, build_guarded_state
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MLXVLMAdapter(BaseAdapter):
@@ -29,12 +34,25 @@ class MLXVLMAdapter(BaseAdapter):
         self.apc_disabled_reason: str | None = None
         self.model_path: str | None = None
         self.prompt_cache_reuse_failures = 0
+        self.checkpoints: CheckpointStore | None = None
+        self.cache_budget: dict = {"known": False}
+        self.rollback_capability: str = cache_state.ROLLBACK_NONE
+        self.last_cold_reason: str | None = None
+        self._pending_cold_reason: str | None = None
+        self.prompt_growth = 0
+        self._pending_prompt_ids: list[int] | None = None
+        self._previous_prompt_tokens = 0
+        self._persisted_tokens = 0
+        self._chars_per_token = 0.0
+        self._cold_prompt_tps = 0.0
 
     def capabilities(self) -> dict:
         result = super().capabilities()
         result["modalities"] = self.modalities
         result["promptCaching"] = self.prompt_cache_state is not None
         result["promptCache"] = self.prompt_cache_stats()
+        result["cacheBudget"] = dict(self.cache_budget)
+        result["rollbackCapability"] = self.rollback_capability
         return result
 
     @staticmethod
@@ -116,8 +134,11 @@ class MLXVLMAdapter(BaseAdapter):
             )
             # PromptCacheState remains the warm-memory tier. A zero-block APC
             # manager adds only persistent disk reuse and avoids duplicating a
-            # large Qwen hybrid cache in unified memory.
-            self.apc_manager = APCManager(num_blocks=0, disk=disk)
+            # large Qwen hybrid cache in unified memory. The pool can be turned
+            # on from settings, but it stays off by default: nobody has measured
+            # what it does to a 27B-class hybrid, and an unmeasured default is
+            # not a default worth shipping.
+            self.apc_manager = APCManager(num_blocks=self._apc_block_count(), disk=disk)
             os.chmod(disk.dir, 0o700)
             try:
                 keep = int(os.environ.get("MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS", "2"))
@@ -128,6 +149,56 @@ class MLXVLMAdapter(BaseAdapter):
             self._close_apc()
             self.apc_disabled_reason = f"initialization_failed:{type(exc).__name__}"
             logging.getLogger(__name__).warning("Disk APC disabled: %s", exc)
+
+    def _tune_apc_guard(self) -> None:
+        """Keep APC's exact-prefix guard wider than one turn of growth.
+
+        APC stores a snapshot of everything but the last `guard` tokens, so the
+        guard has to be at least as large as the amount a client adds between
+        turns -- otherwise the stored prefix ends inside the previous turn and
+        never matches again. A fixed 256 fits a chat client and does not fit an
+        agent that appends tool results, so it is measured instead of assumed.
+        """
+        manager = self.apc_manager
+        if manager is None or not hasattr(manager, "exact_cache_guard_tokens"):
+            return
+        if self.prompt_growth <= 0:
+            return
+        with contextlib.suppress(Exception):
+            manager.exact_cache_guard_tokens = max(256, min(16384, self.prompt_growth * 2))
+
+    def _apc_block_count(self) -> int:
+        """How many APC blocks the memory budget can pay for.
+
+        Derived rather than fixed: a block holds a fixed number of *tokens*, and
+        what a token costs is a property of the model, not of MLXBar.
+        """
+        setting = str(os.environ.get("MLXBAR_APC_MEMORY_BLOCKS", "0")).strip().lower()
+        if setting != "auto":
+            try:
+                return max(0, int(setting))
+            except (TypeError, ValueError):
+                return 0
+        budget = self.cache_budget
+        if not budget.get("known"):
+            return 0
+        try:
+            ratio = float(os.environ.get("MLXBAR_PROMPT_CACHE_MEMORY_RATIO", "0.10"))
+        except (TypeError, ValueError):
+            ratio = 0.10
+        try:
+            physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            return 0
+        try:
+            from mlx_vlm.apc import DEFAULT_BLOCK_SIZE
+            block_size = int(DEFAULT_BLOCK_SIZE)
+        except Exception:
+            return 0
+        if block_size <= 0 or ratio <= 0:
+            return 0
+        tokens = cache_state.affordable_tokens(budget, int(physical * ratio))
+        return max(0, min(65536, tokens // block_size))
 
     def _sweep_stale_namespaces(self, keep: int) -> list[str]:
         """Delete cache generations this model/runtime can no longer read.
@@ -233,7 +304,13 @@ class MLXVLMAdapter(BaseAdapter):
             "generations": self._namespace_count(),
             "diskBytes": self._namespace_bytes(),
             "reuseFailures": self.prompt_cache_reuse_failures,
+            "rollbackCapability": self.rollback_capability,
+            "budget": dict(self.cache_budget),
+            "lastColdReason": self.last_cold_reason,
+            "promptGrowthTokens": self.prompt_growth,
         }
+        if self.checkpoints is not None:
+            result["checkpoint"] = self.checkpoints.stats()
         if self.apc_manager is not None:
             try:
                 result.update(self.apc_manager.stats_snapshot())
@@ -274,10 +351,114 @@ class MLXVLMAdapter(BaseAdapter):
     def _reset_prompt_cache(self) -> None:
         try:
             from mlx_vlm.generate import PromptCacheState
-            self.prompt_cache_state = PromptCacheState()
         except (ImportError, AttributeError):
             # Older runtime slots remain usable without the optimization.
             self.prompt_cache_state = None
+            return
+        self._pending_prompt_ids = None
+        try:
+            self.prompt_cache_state = build_guarded_state(PromptCacheState, self)
+        except Exception as exc:
+            # A runtime whose PromptCacheState cannot be subclassed still works;
+            # it just loses the rollback guard and keeps the old behaviour.
+            LOGGER.warning("Falling back to the runtime prompt cache state: %s", exc)
+            self.prompt_cache_state = PromptCacheState()
+
+    def _make_cache(self):
+        """Build an empty cache shaped like the one the runtime uses.
+
+        mlx-vlm builds its cache from `model.language_model`, so a snapshot
+        captured during generation only restores into a cache made the same
+        way. Mirroring the runtime's own call keeps the component classes and
+        their order identical without copying its internals.
+        """
+        from mlx_vlm.models import cache as runtime_cache
+        target = getattr(self.model, "language_model", self.model)
+        return runtime_cache.make_prompt_cache(target)
+
+    def _probe_rollback_capability(self) -> str:
+        """Ask an empty cache what kind of rollback this architecture supports.
+
+        Done once at load, on an empty cache, so it costs nothing and the answer
+        is available before the first request rather than after the first
+        failure. An architecture that gains `trim` in a later runtime is picked
+        up here automatically.
+        """
+        self.rollback_capability = cache_state.ROLLBACK_NONE
+        try:
+            probe = self._make_cache()
+        except Exception as exc:
+            LOGGER.warning("Could not probe cache rollback support: %s", exc)
+            return self.rollback_capability
+        self.rollback_capability = cache_state.rollback_capability(probe)
+        return self.rollback_capability
+
+    def _init_checkpoints(self, model_path: str) -> None:
+        """Prepare the boundary snapshot store for architectures that need it.
+
+        Only an architecture that cannot trim needs snapshots: one that can roll
+        its cache back in place already has a cheaper route to the same result,
+        and capturing for it would double the cache in memory for nothing.
+        """
+        self.checkpoints = None
+        if self.rollback_capability != cache_state.ROLLBACK_CHECKPOINT:
+            return
+        if not self._truthy(os.environ.get("MLXBAR_PROMPT_CACHE_CHECKPOINT", "1")):
+            return
+        root_value = os.environ.get("MLXBAR_PROMPT_CACHE_ROOT")
+        try:
+            maximum = int(os.environ.get("MLXBAR_PROMPT_CACHE_MAX_BYTES", str(5 << 30)))
+        except (TypeError, ValueError):
+            maximum = 5 << 30
+        try:
+            keep = int(os.environ.get("MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS", "2"))
+        except (TypeError, ValueError):
+            keep = 2
+        try:
+            write_budget = int(os.environ.get("MLXBAR_PROMPT_CACHE_WRITE_BUDGET_BYTES",
+                                              str(32 << 30)))
+        except (TypeError, ValueError):
+            write_budget = 32 << 30
+        try:
+            runtime_version = importlib.metadata.version("mlx-vlm")
+        except Exception:
+            runtime_version = "unknown"
+        namespace = f"mlxbar-vlm-ckpt-v1-{self._model_fingerprint(Path(model_path), runtime_version)}"
+        disk_enabled = self._truthy(os.environ.get("MLXBAR_PROMPT_CACHE_DISK_ENABLED", "1"))
+        self.checkpoints = CheckpointStore(
+            root=(Path(root_value) / "checkpoints") if root_value else None,
+            namespace=namespace,
+            budget=self.cache_budget,
+            max_bytes=maximum,
+            keep_generations=min(10, max(1, keep)),
+            write_budget_bytes=write_budget,
+            disk_enabled=disk_enabled,
+        )
+
+    # ------------------------------------------------- guarded state hooks
+
+    def observe_prompt(self, token_ids: list[int]) -> None:
+        """Record the prompt the runtime actually tokenised.
+
+        This is the only place the exact token ids of the current prompt are
+        available: the runtime tokenises inside `stream_generate`, and it only
+        writes them back into the cache state when a generation completes. A
+        cancelled turn therefore has no other source for them, and re-encoding
+        the prompt text would not do -- a tokenizer does not guarantee that
+        decode/encode round-trips to the same ids.
+        """
+        self.prompt_growth = max(0, len(token_ids) - self._previous_prompt_tokens)
+        self._previous_prompt_tokens = len(token_ids)
+        self._pending_prompt_ids = list(token_ids)
+
+    def restore_for(self, token_ids: list[int]):
+        if self.checkpoints is None:
+            return None
+        try:
+            return self.checkpoints.restore_best(token_ids, self._make_cache)
+        except Exception as exc:
+            LOGGER.warning("Checkpoint restore failed; continuing cold: %s", exc)
+            return None
 
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         if not path:
@@ -292,17 +473,55 @@ class MLXVLMAdapter(BaseAdapter):
         self.model_path = path
         self.apply_memory_limits()
         self._reset_prompt_cache()
+        # Order matters: the cache budget and the rollback probe are inputs to
+        # how the APC pool and the checkpoint store are sized.
+        self.cache_budget = cache_state.model_cache_budget(config)
+        self._probe_rollback_capability()
         self._init_apc(path)
+        self._init_checkpoints(path)
+        self._log_cache_plan()
         return self.capabilities()
+
+    def _log_cache_plan(self) -> None:
+        """Say up front what reuse this model will get, and what it will cost.
+
+        The failure this exists to prevent is silent: before v1.6.0 a model
+        whose snapshots did not fit the disk budget kept writing and evicting
+        them, so the cache looked enabled while never returning more than its
+        first small prefix. Stating the arithmetic at load turns that into
+        something visible in one line.
+        """
+        budget = self.cache_budget
+        if not budget.get("known"):
+            LOGGER.info("Prompt cache: rollback=%s, size per token unknown for this config",
+                        self.rollback_capability)
+            return
+        per_token = int(budget.get("perTokenBytes", 0))
+        affordable = self.checkpoints.affordable_tokens() if self.checkpoints else 0
+        LOGGER.info(
+            "Prompt cache: rollback=%s, %.1f KB/token, snapshots affordable up to %d tokens",
+            self.rollback_capability, per_token / 1024.0, affordable)
 
     def unload(self) -> None:
         self._close_apc()
+        if self.checkpoints is not None:
+            self.checkpoints.forget()
+        self.checkpoints = None
         self.prompt_cache_state = None
         self.model_path = None
+        self.cache_budget = {"known": False}
+        self.rollback_capability = cache_state.ROLLBACK_NONE
+        self._previous_prompt_tokens = 0
+        self._persisted_tokens = 0
         super().unload()
 
     def clear_prompt_cache(self) -> None:
         self.prompt_cache_state = None
+        if self.checkpoints is not None:
+            # The in-memory snapshot is a second full copy of the cache, so it
+            # has to go when the caller is asking for memory back. The disk tier
+            # survives: it costs no RAM and is what avoids a cold start later.
+            self.checkpoints.forget()
         super().clear_prompt_cache()
         self._reset_prompt_cache()
 
@@ -314,8 +533,12 @@ class MLXVLMAdapter(BaseAdapter):
         cache_directory = root / namespace if root is not None and namespace else None
         if cache_directory is not None and cache_directory.exists():
             shutil.rmtree(cache_directory)
+        if self.checkpoints is not None:
+            self.checkpoints.forget()
+            self.checkpoints.clear_disk()
         if model_path is not None:
             self._init_apc(model_path)
+            self._init_checkpoints(model_path)
 
     def stream(self, request_id: str, params: dict):
         if self.model is None:
@@ -373,9 +596,17 @@ class MLXVLMAdapter(BaseAdapter):
             # placeholder tokens do not prove that the underlying pixels match.
             if self.prompt_cache_state is not None:
                 kwargs["prompt_cache_state"] = self.prompt_cache_state
+                self._pending_prompt_ids = None
+                begin = getattr(self.prompt_cache_state, "begin_request", None)
+                if callable(begin):
+                    begin()
             if self.apc_manager is not None:
+                self._tune_apc_guard()
                 kwargs["apc_manager"] = self.apc_manager
                 kwargs["apc_tenant"] = "mlxbar-local"
+        estimate = self._prefill_estimate(prompt)
+        if estimate is not None:
+            yield {"type": "prefill_estimate", **estimate}
         tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
         if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
@@ -384,10 +615,18 @@ class MLXVLMAdapter(BaseAdapter):
         apc_before = self._apc_stats_snapshot()
         received_response = False
         generated = 0
+        generated_ids: list[int] = []
         ticker = _ProgressTicker(params)
         try:
             try:
                 for response in stream_generate(**kwargs):
+                    # Counted before the cancellation check, and deliberately.
+                    # The runtime advanced the cache to produce this response, so
+                    # the token belongs to the cache whether or not its text ever
+                    # reaches the client. Checking first would leave the cache one
+                    # token ahead of its own labels, and the settling check would
+                    # then -- correctly -- refuse to keep it.
+                    _collect_token(generated_ids, response)
                     if request_id in self.cancelled:
                         return
                     received_response = True
@@ -422,7 +661,9 @@ class MLXVLMAdapter(BaseAdapter):
                 self._reset_prompt_cache()
                 kwargs["prompt_cache_state"] = self.prompt_cache_state
                 last_response = None
+                generated_ids = []
                 for response in stream_generate(**kwargs):
+                    _collect_token(generated_ids, response)
                     if request_id in self.cancelled:
                         return
                     generated += 1
@@ -435,20 +676,31 @@ class MLXVLMAdapter(BaseAdapter):
                 completed = True
         finally:
             if not completed and kwargs.get("prompt_cache_state") is not None:
-                # stream_generate mutates a reused cache in place. A cancelled
-                # or failed iteration cannot leave token_ids paired with a
-                # partially advanced cache.
-                self._reset_prompt_cache()
+                # stream_generate mutates a reused cache in place, and it only
+                # writes the matching token ids back when a generation runs to
+                # the end. An interrupted turn therefore leaves the cache one
+                # step ahead of its own labels; settling re-pairs them so the
+                # work already done survives, and discards only when the pairing
+                # cannot be proven.
+                self._settle_interrupted_cache(request_id, generated_ids)
+        if completed and kwargs.get("prompt_cache_state") is not None:
+            self._remember_boundary()
         if (last_response is not None and not isinstance(last_response, str)
                 and hasattr(last_response, "prompt_tokens")):
             apc_after = self._apc_stats_snapshot()
             cached_tokens = int(getattr(last_response, "cached_tokens", 0) or 0)
-            if int(apc_after.get("disk_hits", 0)) > int(apc_before.get("disk_hits", 0)):
+            probe = getattr(self.prompt_cache_state, "last_probe", None) or {}
+            if probe.get("action") == "restore":
+                # A restored snapshot is the reuse, whichever tier it came from.
+                cache_tier = "disk" if probe.get("restoredFrom") == "disk" else "memory"
+            elif int(apc_after.get("disk_hits", 0)) > int(apc_before.get("disk_hits", 0)):
                 cache_tier = "disk"
             elif cached_tokens > 0:
                 cache_tier = "memory"
             else:
                 cache_tier = "cold"
+            cold_reason = self._cold_reason(cache_tier, probe)
+            self._learn_prefill_rate(prompt, last_response, cached_tokens)
             yield {"type": "usage",
                    "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
                    "completion_tokens": int(getattr(last_response, "generation_tokens", 0) or 0)}
@@ -459,10 +711,154 @@ class MLXVLMAdapter(BaseAdapter):
                    "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
                    "cached_tokens": cached_tokens,
                    "cache_tier": cache_tier,
+                   "cold_reason": cold_reason,
+                   "shared_prefix_tokens": int(probe.get("sharedPrefix", 0) or 0),
+                   "held_prefix_tokens": int(probe.get("heldTokens", 0) or 0),
                    "finish_reason": finish_reason if finish_reason in {"stop", "length"} else None,
                    "tool_support": tool_support,
                    "prompt_tps": float(getattr(last_response, "prompt_tps", 0.0) or 0.0),
                    "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
+
+    def _cold_reason(self, cache_tier: str, probe: dict) -> str | None:
+        """Why this request had to prefill from scratch, if it did."""
+        if cache_tier != "cold":
+            self.last_cold_reason = None
+            self._pending_cold_reason = None
+            return None
+        reason = probe.get("reason") or cache_state.COLD_NO_PREFIX
+        pending, self._pending_cold_reason = self._pending_cold_reason, None
+        if pending and reason in {cache_state.COLD_NO_PREFIX, cache_state.COLD_FIRST_REQUEST}:
+            # The previous turn explains this one better than "no shared prefix"
+            # does: the prefix is missing *because* that turn was thrown away.
+            reason = pending
+        if (reason == cache_state.COLD_REUSE_UNSUPPORTED
+                and self.checkpoints is not None
+                and self.checkpoints.disabled_reason in cache_state.COLD_REASONS):
+            reason = self.checkpoints.disabled_reason
+        self.last_cold_reason = reason
+        return reason
+
+    def _settle_interrupted_cache(self, request_id: str, generated_ids: list[int]) -> None:
+        """Re-pair an interrupted cache with its token ids, or discard it.
+
+        The rewrite is only allowed when the cache can be shown to hold exactly
+        the tokens being claimed for it. Where the runtime cold-prefilled into a
+        cache of its own, the retained one never moved and the check fails on
+        its own, which is why no separate "was it reused" flag is needed.
+        """
+        state = self.prompt_cache_state
+        prompt_ids = self._pending_prompt_ids
+        self._pending_prompt_ids = None
+        if self.abort_reason(request_id) == cache_state.COLD_MEMORY_PRESSURE:
+            # Keeping a cache alive is the opposite of what this interruption
+            # asked for: it stopped the generation to give memory back.
+            self._pending_cold_reason = cache_state.COLD_MEMORY_PRESSURE
+            if self.checkpoints is not None:
+                self.checkpoints.forget()
+            self._reset_prompt_cache()
+            return
+        if state is None or prompt_ids is None or getattr(state, "cache", None) is None:
+            self._pending_cold_reason = cache_state.COLD_CANCELLED_PREVIOUS
+            self._reset_prompt_cache()
+            return
+        expected = len(prompt_ids) + len(generated_ids)
+        observed = cache_state.cached_length(state.cache)
+        if observed is None or observed != expected:
+            # Either the runtime does not report an offset, or the cache is not
+            # where the token ids say it is. Both mean the pairing cannot be
+            # proven, and an unprovable pairing is silent corruption.
+            self._pending_cold_reason = (cache_state.COLD_TOKEN_IDS_UNAVAILABLE
+                                         if observed is None
+                                         else cache_state.COLD_CANCELLED_PREVIOUS)
+            self._reset_prompt_cache()
+            return
+        state.token_ids = list(prompt_ids) + list(generated_ids)
+
+    def _remember_boundary(self) -> None:
+        """Snapshot the end of a completed turn for architectures that need it.
+
+        The end of a completed turn is the last point every later prompt in a
+        linear conversation still shares: the next one is this one plus a reply
+        and a new message. Capturing here -- rather than at the end of a prompt
+        mid-generation -- means the snapshot is taken from a cache the runtime
+        has already labelled, so there is no timing subtlety to get wrong.
+        """
+        store = self.checkpoints
+        state = self.prompt_cache_state
+        if store is None or state is None:
+            return
+        ids = list(getattr(state, "token_ids", None) or [])
+        cache = getattr(state, "cache", None)
+        if not ids or cache is None:
+            return
+        observed = cache_state.cached_length(cache)
+        if observed is not None and observed != len(ids):
+            return
+        limit = self._memory_limit_ratio()
+        if limit > 0 and memory_pressure_reason(self, limit) is not None:
+            # A snapshot is a second copy of the cache. Under pressure the
+            # cheapest correct action is to keep the model answering.
+            store.forget()
+            return
+        if not store.remember(ids, cache):
+            return
+        if self._should_persist(len(ids)):
+            reason = store.persist(ids)
+            if reason is None:
+                self._persisted_tokens = len(ids)
+
+    def _should_persist(self, tokens: int) -> bool:
+        """Whether this boundary is worth a write.
+
+        Every write is roughly `perTokenBytes * tokens` of SSD traffic, so
+        persisting each turn of a long conversation would cost gigabytes per
+        turn for a snapshot the next write supersedes minutes later. Growth
+        thresholds keep the number of writes logarithmic in conversation length
+        while still leaving something recent to resume from.
+        """
+        if tokens < 256:
+            return False
+        previous = self._persisted_tokens
+        if previous <= 0:
+            return True
+        return tokens >= previous * 1.25 or tokens - previous >= 8192
+
+    def _prefill_estimate(self, prompt) -> dict | None:
+        """How long a cold prefill of this prompt would take, if it is knowable.
+
+        Both terms are measured from this worker's own completed requests
+        rather than assumed: characters per token varies by tokenizer and by
+        language, and the prefill rate varies by model, quantisation and
+        machine. Until one request has finished there is no estimate, which is
+        the honest answer rather than a fabricated one.
+        """
+        if not isinstance(prompt, str) or not prompt:
+            return None
+        if self._chars_per_token <= 0 or self._cold_prompt_tps <= 0:
+            return None
+        tokens = int(len(prompt) / self._chars_per_token)
+        if tokens < 1024:
+            return None
+        seconds = tokens / self._cold_prompt_tps
+        return {"estimated_prompt_tokens": tokens, "estimated_seconds": round(seconds, 1)}
+
+    def _learn_prefill_rate(self, prompt, response, cached_tokens: int) -> None:
+        prompt_tokens = int(getattr(response, "prompt_tokens", 0) or 0)
+        if prompt_tokens > 0 and isinstance(prompt, str) and prompt:
+            self._chars_per_token = len(prompt) / prompt_tokens
+        rate = float(getattr(response, "prompt_tps", 0.0) or 0.0)
+        # Only a request that actually prefilled measures the prefill rate. A
+        # cached one reports tens of thousands of tokens per second because it
+        # processed almost nothing, and predicting from that would promise a
+        # two-second wait before an eight-minute one.
+        if cached_tokens <= 0 and rate > 0:
+            self._cold_prompt_tps = rate
+
+    def _memory_limit_ratio(self) -> float:
+        try:
+            return float(os.environ.get("MLXBAR_MEMORY_LIMIT_RATIO", "0") or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def finalize(self, text: str, params: dict) -> dict:
         tools = params.get("tools") or []
@@ -540,6 +936,19 @@ def _live_progress(response) -> dict:
     if isinstance(tps, (int, float)) and tps > 0:
         result["tps"] = float(tps)
     return result
+
+
+def _collect_token(collected: list[int], response) -> None:
+    """Record the id of a streamed token, when the runtime reports one.
+
+    The ids are needed to re-label an interrupted cache. Decoding the text back
+    into ids is not an option: tokenizers do not guarantee that a decode/encode
+    round-trip reproduces the original ids, and a single wrong id would pair the
+    cache with a sequence the model never saw.
+    """
+    token = getattr(response, "token", None)
+    if isinstance(token, int) and not isinstance(token, bool):
+        collected.append(token)
 
 
 def _tool_support(params: dict, rendered_kwargs: dict) -> str:

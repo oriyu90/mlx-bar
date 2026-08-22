@@ -49,6 +49,21 @@ struct MenuBarView: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
+                if let summary = model.cacheSummaryText {
+                    Text(summary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let warning = model.cacheWarningText {
+                    // Wrapping is done with `frame(maxWidth:alignment:)` rather
+                    // than `.fixedSize`, which blanks the Settings sidebar (see
+                    // mlx-bar.md).
+                    Label(warning, systemImage: "clock.badge.exclamationmark")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
 
             if let error = model.errorMessage {

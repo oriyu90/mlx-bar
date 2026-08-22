@@ -4,6 +4,7 @@ import importlib.metadata
 import os
 import time
 
+from common import cache_state
 from common.server import BaseAdapter, run
 from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
 
@@ -17,11 +18,17 @@ class MLXLMAdapter(BaseAdapter):
         super().__init__()
         self.prompt_cache: PromptCacheStore | None = None
         self.model_path: str | None = None
+        self.cache_budget: dict = {"known": False}
+        self.last_cold_reason: str | None = None
+        self._pending_cold_reason: str | None = None
+        self._cold_prompt_tps = 0.0
 
     def capabilities(self) -> dict:
         result = super().capabilities()
         result["promptCaching"] = self.prompt_cache is not None
         result["promptCache"] = self.prompt_cache_stats()
+        result["cacheBudget"] = dict(self.cache_budget)
+        result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
         return result
 
     @staticmethod
@@ -60,6 +67,7 @@ class MLXLMAdapter(BaseAdapter):
         self.model_path = path
         self.apply_memory_limits()
         self._init_prompt_cache(path)
+        self.cache_budget = _read_cache_budget(path)
         return self.capabilities()
 
     def unload(self) -> None:
@@ -78,8 +86,13 @@ class MLXLMAdapter(BaseAdapter):
 
     def prompt_cache_stats(self) -> dict:
         if self.prompt_cache is None:
-            return {"enabled": False, "engine": self.engine}
-        return self.prompt_cache.stats()
+            return {"enabled": False, "engine": self.engine,
+                    "budget": dict(self.cache_budget), "lastColdReason": self.last_cold_reason}
+        result = self.prompt_cache.stats()
+        result["budget"] = dict(self.cache_budget)
+        result["lastColdReason"] = self.last_cold_reason
+        result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
+        return result
 
     def _encode(self, text: str) -> list[int]:
         """Tokenize exactly as `stream_generate` would for the same string."""
@@ -162,6 +175,12 @@ class MLXLMAdapter(BaseAdapter):
         else:
             kwargs["prompt"] = prompt
 
+        if prompt_tokens and self._cold_prompt_tps > 0 and len(prompt_tokens) >= 1024:
+            # The exact prompt length is already known here, so this estimate
+            # only has to guess the rate.
+            yield {"type": "prefill_estimate",
+                   "estimated_prompt_tokens": len(prompt_tokens),
+                   "estimated_seconds": round(len(prompt_tokens) / self._cold_prompt_tps, 1)}
         tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
         if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
@@ -172,12 +191,14 @@ class MLXLMAdapter(BaseAdapter):
         ticker = _ProgressTicker(params)
         try:
             for response in stream_generate(self.model, self.processor, **kwargs):
+                # Counted first: the cache already holds this token, so leaving it
+                # out of the list would describe a cache that does not exist.
+                token = getattr(response, "token", None)
+                if isinstance(token, int) and not isinstance(token, bool):
+                    generated.append(token)
                 if request_id in self.cancelled:
                     return
                 last_response = response
-                token = getattr(response, "token", None)
-                if isinstance(token, int):
-                    generated.append(token)
                 finish_reason = getattr(response, "finish_reason", None) or finish_reason
                 text = getattr(response, "text", response if isinstance(response, str) else "")
                 if text:
@@ -186,13 +207,13 @@ class MLXLMAdapter(BaseAdapter):
                     yield {"type": "token_progress", **_live_progress(response)}
             completed = True
         finally:
-            # A completed generation is the only safe thing to remember: an
-            # aborted one has a cache that no longer matches its token list.
-            # The warm tier hands out copies, so an abandoned cache simply goes
-            # away rather than corrupting the stored one.
-            if completed and cache is not None and prompt_tokens and self.prompt_cache is not None:
-                self.prompt_cache.store(self.model, prompt_tokens + generated, cache,
-                                        prompt_length=len(prompt_tokens))
+            # The warm tier hands out copies, so an abandoned cache can never
+            # corrupt a stored one. That makes an interrupted turn worth keeping
+            # too: its cache holds a real prefix of the conversation, and
+            # throwing it away is what used to make the next request pay for the
+            # whole prompt again. Only the pairing has to be proven first.
+            if cache is not None and prompt_tokens and self.prompt_cache is not None:
+                self._remember(cache, prompt_tokens, generated, completed, request_id)
 
         if len(generated) >= max_tokens:
             # The runtime reports this only on some versions; the token count is
@@ -206,16 +227,60 @@ class MLXLMAdapter(BaseAdapter):
             cached = max(0, total_prompt - processed) if prompt_tokens else 0
             yield {"type": "usage", "prompt_tokens": total_prompt,
                    "completion_tokens": int(getattr(last_response, "generation_tokens", 0) or 0)}
+            effective_tier = cache_tier if cached else "cold"
+            rate = float(getattr(last_response, "prompt_tps", 0.0) or 0.0)
+            if not cached and rate > 0:
+                self._cold_prompt_tps = rate
             yield {"type": "metrics",
                    "prompt_tokens": total_prompt,
                    "cached_tokens": cached,
-                   "cache_tier": cache_tier if cached else "cold",
+                   "cache_tier": effective_tier,
+                   "cold_reason": self._cold_reason(effective_tier),
+                   "shared_prefix_tokens": cached,
+                   "held_prefix_tokens": total_prompt,
                    "finish_reason": finish_reason,
                    "tool_support": tool_support,
                    "prompt_tps": float(getattr(last_response, "prompt_tps", 0.0) or 0.0),
                    "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
         elif finish_reason:
             yield {"type": "metrics", "finish_reason": finish_reason}
+
+    def _remember(self, cache, prompt_tokens: list[int], generated: list[int],
+                  completed: bool, request_id: str) -> None:
+        if completed:
+            self.prompt_cache.store(self.model, prompt_tokens + generated, cache,
+                                    prompt_length=len(prompt_tokens))
+            return
+        if self.abort_reason(request_id) == cache_state.COLD_MEMORY_PRESSURE:
+            # This interruption exists to release memory, so retaining a cache
+            # would undo it.
+            self._pending_cold_reason = cache_state.COLD_MEMORY_PRESSURE
+            return
+        expected = len(prompt_tokens) + len(generated)
+        observed = cache_state.cached_length(cache)
+        if observed is None or observed != expected:
+            self._pending_cold_reason = (cache_state.COLD_TOKEN_IDS_UNAVAILABLE
+                                         if observed is None
+                                         else cache_state.COLD_CANCELLED_PREVIOUS)
+            return
+        # Persisting stops at the prompt, as it does for a completed turn: only
+        # a prefix a later request can share is worth a gigabyte of disk.
+        self.prompt_cache.store(self.model, prompt_tokens + generated, cache,
+                                prompt_length=len(prompt_tokens))
+
+    def _cold_reason(self, cache_tier: str) -> str | None:
+        if cache_tier != "cold":
+            self.last_cold_reason = None
+            self._pending_cold_reason = None
+            return None
+        pending, self._pending_cold_reason = self._pending_cold_reason, None
+        reason = pending or cache_state.COLD_NO_PREFIX
+        if not pending and self.prompt_cache is not None:
+            disabled = getattr(self.prompt_cache, "disabled_reason", None)
+            if disabled in cache_state.COLD_REASONS:
+                reason = disabled
+        self.last_cold_reason = reason
+        return reason
 
     def finalize(self, text: str, params: dict) -> dict:
         tools = params.get("tools") or []
@@ -231,6 +296,17 @@ class MLXLMAdapter(BaseAdapter):
         except Exception:
             pass
         return parse_tool_markup(text)
+
+
+def _read_cache_budget(path: str) -> dict:
+    """Cache size arithmetic for this model, read from its own config."""
+    import json
+    from pathlib import Path
+    try:
+        config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"known": False}
+    return cache_state.model_cache_budget(config)
 
 
 class _ProgressTicker:

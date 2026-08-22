@@ -261,7 +261,8 @@ async def chat(request: Request, body: dict):
                         request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
                     elif event.get("type") == "metrics":
                         for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
-                                    "cache_tier", "tool_support"):
+                                    "cache_tier", "tool_support", "cold_reason",
+                                    "shared_prefix_tokens", "held_prefix_tokens"):
                             if event.get(key) is not None:
                                 request.state.api_log[key] = event[key]
                     elif event.get("type") == "tool_support":
@@ -332,7 +333,8 @@ async def chat(request: Request, body: dict):
                 request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
             elif event.get("type") == "metrics":
                 for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
-                            "cache_tier", "tool_support"):
+                            "cache_tier", "tool_support", "cold_reason",
+                            "shared_prefix_tokens", "held_prefix_tokens"):
                     if event.get(key) is not None:
                         request.state.api_log[key] = event[key]
             elif event.get("type") == "tool_support":
@@ -387,7 +389,14 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
         result = await state.workers.load(model)
         state.database.set_metadata_value("last_loaded_model_id", model["id"])
         state.database.set_metadata_value("api_autoload_suspended", "0")
+        _record_cache_capability(state, result)
         return result
+
+
+def _record_cache_capability(state, loaded: dict) -> None:
+    """Mirror of the management route's record, for models loaded by an API call."""
+    from .management import _record_cache_capability as record
+    record(state, loaded)
 
 
 def _model_matches(model: dict, requested: str, state) -> bool:
@@ -427,9 +436,19 @@ def _model_descriptor(state, model: dict, loaded: dict | None) -> dict:
     maximum = None
     if is_loaded and hasattr(state.workers, "effective_max_tokens"):
         maximum = state.workers.effective_max_tokens()
-    return {"id": model.get("name") or model.get("id"), "object": "model", "created": 0,
-            "owned_by": "mlxbar", "loaded": is_loaded, "max_tokens": maximum,
-            "context_window": capabilities.get("modelMaxTokens")}
+    descriptor = {"id": model.get("name") or model.get("id"), "object": "model", "created": 0,
+                  "owned_by": "mlxbar", "loaded": is_loaded, "max_tokens": maximum,
+                  "context_window": capabilities.get("modelMaxTokens")}
+    if is_loaded:
+        # What a client needs in order to keep its own prompt inside the range
+        # where reuse actually happens. Advertising it here is cheaper for
+        # everyone than having the client discover the cliff by falling off it.
+        cache = capabilities.get("promptCache") or {}
+        descriptor["prefix_reuse"] = capabilities.get("rollbackCapability")
+        affordable = (cache.get("checkpoint") or {}).get("affordableTokens")
+        if isinstance(affordable, int) and affordable > 0:
+            descriptor["recommended_max_prompt_tokens"] = affordable
+    return descriptor
 
 
 def _usage(messages: list[dict], text: str) -> dict:

@@ -372,6 +372,42 @@ def configure_logging(root: Path) -> None:
         os.chmod(path, 0o600)
 
 
+def _preload_last_model(state) -> "asyncio.Task | None":
+    """Reload the model that was in use before the last shutdown.
+
+    Deliberately skipped when the user unloaded the model themselves: that flag
+    is the difference between "MLXBar restarted" and "I turned this off", and
+    only the first is an invitation to load 27 GB of weights unasked.
+    """
+    if not state.settings.data.get("general", {}).get("preloadLastModel", True):
+        return None
+    if state.database.metadata_value("api_autoload_suspended") == "1":
+        return None
+    model_id = state.database.metadata_value("last_loaded_model_id")
+    if not model_id:
+        return None
+
+    async def work() -> None:
+        try:
+            async with state.model_autoload_lock:
+                if state.workers.loaded:
+                    return
+                model = next((item for item in state.database.list_models()
+                              if item.get("id") == model_id), None)
+                if model is None:
+                    return
+                await state.workers.load(model)
+                logging.getLogger(__name__).info("Preloaded %s", model.get("name") or model_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A preload is a convenience. Failing it must not stop the
+            # coordinator from serving, and the next request can still autoload.
+            logging.getLogger(__name__).warning("Could not preload the last model: %s", exc)
+
+    return asyncio.create_task(work())
+
+
 async def serve(root: Path | None = None) -> None:
     state = AppState(root)
     configure_logging(state.root)
@@ -403,6 +439,12 @@ async def serve(root: Path | None = None) -> None:
                                                 timeout_graceful_shutdown=10, lifespan="off"))
     state.management_server = management
     management_task = asyncio.create_task(management.serve())
+    # Started only after the management API is serving, for the same reason the
+    # runtime install is: a long synchronous step before the socket is live is a
+    # window in which a client can reach half-built state. Loading a 27B model
+    # takes tens of seconds, and the first request after a restart should not be
+    # the thing that pays for it.
+    preload_task = _preload_last_model(state)
     # launchd sends SIGTERM on logout, restart and `launchctl bootout`. Without
     # a handler the process dies before `finally` runs, stranding the worker
     # subprocess with its model still resident.
@@ -418,6 +460,8 @@ async def serve(root: Path | None = None) -> None:
     try:
         await management_task
     finally:
+        if preload_task is not None:
+            preload_task.cancel()
         # A runtime install (e.g. the automatic first-launch install above)
         # spawns `uv` in its own session so it can be killed by process
         # group; left alone, it survives this coordinator as an orphan still

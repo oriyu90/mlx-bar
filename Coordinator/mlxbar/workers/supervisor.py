@@ -209,9 +209,23 @@ class WorkerSupervisor:
         # 256 tokens cold so a different first user message can still reuse the
         # much larger, stable ZCode system/tools prefix.
         env["APC_EXACT_PREFIX_GUARD_TOKENS"] = "256"
+        env["MLXBAR_PROMPT_CACHE_CHECKPOINT"] = (
+            "1" if cache_settings.get("branchCheckpoint", "auto") == "auto" else "0"
+        )
+        write_budget_gb = max(0.0, float(cache_settings.get("diskWriteBudgetGB", 32)))
+        env["MLXBAR_PROMPT_CACHE_WRITE_BUDGET_BYTES"] = str(int(write_budget_gb * (1 << 30)))
+        # APC's in-memory block pool stays off unless asked for: its behaviour on
+        # a 27B-class hybrid has not been measured, and a default that has not
+        # been measured is a default that cannot be defended.
+        env["MLXBAR_APC_MEMORY_BLOCKS"] = (
+            "auto" if cache_settings.get("memoryBlocks", "off") == "auto" else "0"
+        )
         generation = self.settings.data["generation"]
         env["MLXBAR_WIRED_LIMIT_RATIO"] = str(generation.get("wiredLimitRatio", 0.0))
         env["MLXBAR_CACHE_LIMIT_RATIO"] = str(generation.get("cacheLimitRatio", 0.0))
+        # The worker decides on its own whether a snapshot is affordable, and it
+        # has to judge pressure the same way the watchdog does.
+        env["MLXBAR_MEMORY_LIMIT_RATIO"] = str(generation.get("memoryLimitRatio", 0.0))
         module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
         # Worker diagnostics go to a log file rather than a pipe: nothing drains
