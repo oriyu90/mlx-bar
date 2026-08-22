@@ -5,6 +5,51 @@
 
 ## 未解決の課題
 
+### 中断後の再開とtrim非依存の再利用（v1.6.0対応）
+
+**当初の想定が外れた点から書く。** v1.5.0の「次にやるなら」には「部分ロールバック（prefill完了時点へのtrim）ができれば」と書いたが、**この方向は原理的に行き止まりだった。** `Qwen3.8-27B`は64層中48層が`linear_attention`で、その状態は`ArraysCache`＝固定サイズの漸化式状態。「末尾Nトークンを削る」という操作が数学的に存在しないので、`trim`相当のAPIをどこに足しても解けない。**巻き戻しではなく複製と復元（checkpoint）が唯一の解**である。
+
+**依拠したランタイム事実（mlx-vlm 0.6.15で確認、いずれも`getattr`/`hasattr`で存在確認してから使う）**
+
+| 事実 | 位置 |
+|---|---|
+| `GenerationResult.token`がトークンIDを持つ | `generate/common.py:207` |
+| `ArraysCache.state`にgetterとsetterがある（＝trim不可でも複製・復元は可能） | `models/cache.py:638` |
+| `find_prefix_length()`は`.cache`読み出しより**前**に呼ばれる | `generate/dispatch.py:845-846` |
+| `update(all_ids, tracked_cache)`は**完走時のみ** | `generate/dispatch.py:1062` |
+| `all_ids = full_input_ids_list + generated_tokens` | `generate/dispatch.py:1063` |
+| キャッシュは`model.language_model`から作る | `generate/dispatch.py:934` |
+
+最後から2番目が中断時破棄の直接の原因である。中断するとキャッシュだけが進み、`token_ids`は前ターンのまま取り残される。
+
+**プロンプトのトークンIDを取る唯一の方法**: ランタイムは`stream_generate`の内部でトークナイズするので、外からは見えない。**出力テキストの再エンコードは絶対にやらないこと**（トークナイザは往復同一性を保証しない）。`PromptCacheState`を継承して`find_prefix_length(new_ids)`を上書きすると、ランタイムが計算した`full_input_ids_list`がそのまま渡ってくる。ここが唯一の入手経路。
+
+**書き換えてよい条件は「証明できるとき」だけ**: `max(getattr(c, "offset", 0))`が`len(prompt_ids) + len(generated_ids)`と一致することを必ず確認する。cold経路ではランタイムが別のキャッシュを作るため保持キャッシュは動いておらず、この検査だけで自動的に弾ける（「再利用されたか」の別フラグは不要）。
+
+**トークンIDはキャンセル検査より先に集める**: 実装中に一度踏んだ。`for response in stream_generate(...)`で「キャンセル検査 → トークン収集」の順にすると、キャンセルが見えたイテレーションの応答を数え損ねる。ランタイムはその応答を作るためにキャッシュを進めているので、**キャッシュは1手先**になり、上の検査が（正しく）拒否して機能しなくなる。テキストがクライアントへ届いたかは無関係で、モデルが処理したかだけが問題。
+
+**`trim`到達を防ぐ方法**: `find_prefix_length()`が**0を返す**と、dispatch側の`0 < prefix_len`が偽になり再利用分岐ごと飛ばされる。巻き戻しが必要（`prefix_len < 保持長`）かつ`hasattr(c, "trim")`が偽のときに0を返せば、例外そのものが起きなくなる。v1.5.2の例外検出は安全網として残してある。
+
+**`.cache`差し替えの安全策**: スナップショット復元は`find_prefix_length`の中で`.cache`と`.token_ids`を差し替えて実現している。dispatchが`.cache`を後に読むという**呼び出し順に依存する**ので、`.cache`をpropertyにして「今回の要求で既に読まれたか」を数え、読まれた後は差し替えない。将来dispatchが先に読む実装になっても、返すprefix長とcacheが食い違わない。
+
+**容量は必ずconfigから算出する**: `Qwen3.8-27B-MLX-8bit`は`16層 × 2(K,V) × 4 kvヘッド × 256 × 2byte = 64 KB/トークン`。10万トークンで6.4 GB。**`diskMaxGB: 5`では1件も入らず、書いては捨てるだけになる**（実機で4.2 GBの残骸を確認）。既定の10 GBなら約161,000トークンまで入る。固定GB値は次のアーキで必ず破綻する。`scripts/cache-capability-matrix.py`で重みをロードせずに全モデル分を一覧できる。
+
+**スナップショットは完了ターン末で取る**: prefill完了の瞬間（＝キャッシュがプロンプト末尾と一致する点）にはフックが無い。最初の応答が来た時点でキャッシュは既に`prompt+1`まで進んでいる。一方、**完了ターン末の状態は、線形な会話における以降すべてのプロンプトのprefixになる**（次のプロンプト＝このターン＋新しいメッセージ）ので、そこで取れば十分かつタイミングの機微が無い。
+
+**メモリのピークに注意**: `remember()`は新しいpayloadを作る前に古いpayloadを解放すること。両方持つとライブのキャッシュと合わせて3倍になり、長い会話では十数GBになる。
+
+**書き込み量**: 1スナップショット6.4 GBを毎ターン書くと1日で数百GB。増分（前回比1.25倍または+8192トークン）でしきい値を設け、`promptCache.diskWriteBudgetGB`（既定32）で上限も持つ。
+
+**中断の種類で扱いを変える**: キャンセルは保持、`MEMORY_PRESSURE`は解放。同じ「未完了」でも目的が逆。Worker側は`BaseAdapter.note_abort()`で理由を受け取る。**`close_on_mlx_thread()`は投げっぱなしなので、リクエストの`finally`で理由を消してはいけない**（adapterの`finally`はその後に走る）。registryは期限と件数で自分を縛る。
+
+**`maxPromptCharacters`は上限ではなく下限だった（誤解の記録）**: 実測で設定100,000に対し968,524文字の要求が200で通っていたので疑ったが、`effective_max_prompt_characters()`が`max(configured, min(model_max_tokens * 4, 10_000_000))`を返す仕様。`max_position_embeddings: 262144`のモデルでは約1,048,576文字になる。**バグではない。** 名前が実態と合っていないので、次にUIを触るときに説明を足すこと。
+
+**上流**: `mlx_vlm/generate/dispatch.py:849`の`_prefix_cache_trim_amount()`が`_cache_fully_retained()`だけで守っており、`trim`を定義しない型を通す。`hasattr(c, "trim")`を足せば全ハイブリッドが一度に直る。**MLXBarはもう依存していないが、直れば能力プローブが自動的に安い経路へ戻す。**
+
+**実装しなかったもの（理由つき）**
+- **モデル別のwarm保持** — supervisorの単一モデル前提を崩す必要があり、中断復帰という目的に対して割に合わない。
+- **`promptCache.memoryBlocks`の既定有効化** — APCのブロックプールは27B級ハイブリッドでの計測が無い。設定と算出だけ用意し、既定はoffのまま。有効化を検討するなら、`APC_NUM_BLOCKS`を変えた状態で2-2のJとKを回して、first tokenとピークメモリの両方を見ること。
+
 ### 公開APIの認証前リソース消費（v1.5.3で対応）
 
 **実測の推移**: 認証なし40MB×24並列で、RSS 60→1,822 MB（v1.5.2）が 60→69 MB（v1.5.3）になった。
@@ -68,7 +113,7 @@
 
 **次にやるなら**
 
-- mlx-vlmの中断時プロンプトキャッシュは今も全体破棄。部分ロールバック（prefill完了時点へのtrim）ができれば、キャンセルの多いZCode運用でRAM hitを維持できる。`PromptCacheState`にtrim相当のAPIがないため今回は見送った。ディスク層が残るのでcoldには戻らない。
+- ~~mlx-vlmの中断時プロンプトキャッシュは今も全体破棄~~ → **v1.6.0で対応。** ただし当時の想定（「prefill完了時点へのtrim」）は実現不能だった。理由と実際の解法は下の「中断後の再開」節を参照。
 - 新設定（`wiredLimitRatio`、`cacheLimitRatio`、`promptCache.keepGenerations`、`promptCache.memoryRatio`）はまだGUIに露出していない。`config.json`直接編集か`mlxbarctl`のみ。
 - 27B実機でのメモリ上限到達と長時間連続運転は未実施。
 
@@ -178,7 +223,8 @@
 - `README.md`（先頭のVersion表記、DMGファイル名2箇所）
 - `CHANGELOG.md`（新バージョンの節を先頭に追加）
 - `RELEASE_NOTES_v{version}.md`（新規作成、SHA-256は実ビルド後に追記）
-- `website/index.html`（`softwareVersion`のJSON-LD、kicker、ダウンロード手順のDMGファイル名、動作環境テーブルの最新版）
+- `TEST_PLAN_v{version}.md`（新規作成）
+- **紹介サイトはこのリポジトリに無い。** `oriyu90/studio-rizi`の`website/projects/mlx-bar/`で、`softwareVersion`のJSON-LD、kicker、ダウンロード手順のDMGファイル名、動作環境テーブルの最新版、`sitemap.xml`の`lastmod`を更新する。共通ルール「htmlの更新は実装後の最終作業」に従い、DMGを公開してから行うこと。
 
 ## ウェブサイトの多言語対応について
 

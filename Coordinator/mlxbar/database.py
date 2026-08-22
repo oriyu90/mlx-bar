@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS api_logs (
   first_token_ms INTEGER, prompt_tokens INTEGER NOT NULL DEFAULT 0,
   cached_tokens INTEGER NOT NULL DEFAULT 0, prompt_tps REAL NOT NULL DEFAULT 0,
   generation_tps REAL NOT NULL DEFAULT 0, cache_tier TEXT, tool_support TEXT,
+  cold_reason TEXT, shared_prefix_tokens INTEGER NOT NULL DEFAULT 0,
+  held_prefix_tokens INTEGER NOT NULL DEFAULT 0,
   error_code TEXT, client_scope TEXT NOT NULL DEFAULT 'local',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -48,6 +50,16 @@ CREATE TABLE IF NOT EXISTS metadata (
 # whole table. The cap is a retention target, not a hard bound, so drifting a
 # little above it between sweeps is harmless.
 API_LOG_PRUNE_INTERVAL = 100
+
+# Mirrors Workers/common/cache_state.py. The workers run in their own runtime
+# venv and are not importable from here, so the vocabulary is restated rather
+# than shared -- and restating it is also what keeps this column closed: an
+# unrecognised value is stored as NULL instead of being written through.
+COLD_REASONS = frozenset({
+    "no_prefix", "reuse_unsupported", "budget_insufficient", "cancelled_previous",
+    "runtime_changed", "memory_pressure", "token_ids_unavailable",
+    "write_budget_reached", "first_request",
+})
 
 
 class Database:
@@ -75,6 +87,9 @@ class Database:
             "generation_tps": "REAL NOT NULL DEFAULT 0",
             "cache_tier": "TEXT",
             "tool_support": "TEXT",
+            "cold_reason": "TEXT",
+            "shared_prefix_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "held_prefix_tokens": "INTEGER NOT NULL DEFAULT 0",
         }
         with self.connection:
             for name, definition in additions.items():
@@ -269,6 +284,12 @@ class Database:
                            if entry.get("cache_tier") in {"cold", "memory", "disk"} else None),
             "tool_support": (str(entry.get("tool_support"))[:16]
                              if entry.get("tool_support") in {"none", "full", "degraded"} else None),
+            # A closed vocabulary, so a future worker cannot turn this column
+            # into free-form text that leaks anything about the conversation.
+            "cold_reason": (str(entry.get("cold_reason"))[:32]
+                            if entry.get("cold_reason") in COLD_REASONS else None),
+            "shared_prefix_tokens": max(0, int(entry.get("shared_prefix_tokens") or 0)),
+            "held_prefix_tokens": max(0, int(entry.get("held_prefix_tokens") or 0)),
             "error_code": str(entry.get("error_code") or "")[:96] or None,
             "client_scope": "lan" if entry.get("client_scope") == "lan" else "local",
         }
@@ -277,11 +298,13 @@ class Database:
                 """INSERT INTO api_logs(request_id,method,path,status,duration_ms,model,stream,
                    message_count,tool_count,message_chars,tool_schema_chars,max_tokens,reasoning_mode,
                    first_token_ms,prompt_tokens,cached_tokens,prompt_tps,generation_tps,cache_tier,
-                   tool_support,error_code,client_scope)
+                   tool_support,cold_reason,shared_prefix_tokens,held_prefix_tokens,
+                   error_code,client_scope)
                    VALUES(:request_id,:method,:path,:status,:duration_ms,:model,:stream,
                    :message_count,:tool_count,:message_chars,:tool_schema_chars,:max_tokens,:reasoning_mode,
                    :first_token_ms,:prompt_tokens,:cached_tokens,:prompt_tps,:generation_tps,:cache_tier,
-                   :tool_support,:error_code,:client_scope)""", safe
+                   :tool_support,:cold_reason,:shared_prefix_tokens,:held_prefix_tokens,
+                   :error_code,:client_scope)""", safe
             )
             self._api_log_writes += 1
             if self._api_log_writes % API_LOG_PRUNE_INTERVAL == 0:
@@ -289,6 +312,32 @@ class Database:
                     "DELETE FROM api_logs WHERE id NOT IN (SELECT id FROM api_logs ORDER BY id DESC LIMIT ?)",
                     (max(100, min(int(maximum), 10000)),),
                 )
+
+    def recent_cache_tiers(self, limit: int = 12, model: str | None = None) -> list[dict]:
+        """The reuse outcome of the last few generations, newest first.
+
+        Enough to answer "is this conversation still warm?" without reading the
+        conversation: only the tier, the reason and the timings are stored.
+
+        Scoped to one model when a name is given. A streak of cold requests
+        against the model that was loaded an hour ago says nothing about the one
+        loaded now, and a warning drawn from it would be wrong in the direction
+        that teaches people to ignore warnings.
+        """
+        limit = max(1, min(int(limit), 200))
+        query = ("""SELECT cache_tier, cold_reason, first_token_ms, prompt_tokens, cached_tokens,
+                           created_at
+                    FROM api_logs
+                    WHERE cache_tier IS NOT NULL AND status = 200""")
+        parameters: list = []
+        if model:
+            query += " AND model = ?"
+            parameters.append(str(model))
+        query += " ORDER BY id DESC LIMIT ?"
+        parameters.append(limit)
+        with self.lock:
+            rows = self.connection.execute(query, tuple(parameters)).fetchall()
+        return [dict(row) for row in rows]
 
     def list_api_logs(self, limit: int = 500) -> list[dict]:
         limit = max(1, min(int(limit), 10000))

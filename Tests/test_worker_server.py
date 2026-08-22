@@ -479,6 +479,8 @@ def test_mlx_vlm_reports_runtime_usage_and_cache_metrics():
     assert events[-1] == {"type": "metrics", "prompt_tokens": 4096,
                           "cached_tokens": 3900, "prompt_tps": 850.5,
                           "generation_tps": 12.25, "cache_tier": "memory",
+                          "cold_reason": None, "shared_prefix_tokens": 0,
+                          "held_prefix_tokens": 0,
                           "finish_reason": None, "tool_support": "none"}
 
 

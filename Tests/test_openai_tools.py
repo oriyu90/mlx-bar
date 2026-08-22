@@ -304,7 +304,46 @@ def test_legacy_api_log_schema_is_migrated_with_performance_columns():
         columns = {row[1] for row in database.connection.execute("PRAGMA table_info(api_logs)")}
         assert {"message_chars", "tool_schema_chars", "first_token_ms", "prompt_tokens",
                 "cached_tokens", "prompt_tps", "generation_tps", "reasoning_mode",
-                "cache_tier"} <= columns
+                "cache_tier", "cold_reason", "shared_prefix_tokens",
+                "held_prefix_tokens"} <= columns
+
+
+def test_cold_reason_is_a_closed_vocabulary():
+    """An unknown reason is stored as NULL rather than written through.
+
+    The column exists to explain a slow request, not to carry text from a
+    worker into the database. Keeping it closed is what guarantees a future
+    runtime cannot turn it into a channel for anything else.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        database = Database(Path(directory) / "state.sqlite3")
+        database.add_api_log({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+                              "cache_tier": "cold", "cold_reason": "cancelled_previous",
+                              "shared_prefix_tokens": 120, "held_prefix_tokens": 400})
+        database.add_api_log({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+                              "cache_tier": "cold", "cold_reason": "the prompt said hello"})
+        logs = database.list_api_logs(10)
+        assert logs[1]["cold_reason"] == "cancelled_previous"
+        assert logs[1]["shared_prefix_tokens"] == 120
+        assert logs[0]["cold_reason"] is None
+
+
+def test_recent_cache_tiers_expose_a_cold_streak_without_the_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        database = Database(Path(directory) / "state.sqlite3")
+        for tier in ("memory", "memory", "cold", "cold"):
+            database.add_api_log({"method": "POST", "path": "/v1/chat/completions",
+                                  "status": 200, "cache_tier": tier,
+                                  "cold_reason": "reuse_unsupported" if tier == "cold" else None})
+        rows = database.recent_cache_tiers()
+        assert [row["cache_tier"] for row in rows] == ["cold", "cold", "memory", "memory"]
+        assert not {"messages", "tools"}.intersection(rows[0])
+        # Scoping to a model keeps another model's streak from being read as
+        # this one's.
+        database.add_api_log({"method": "POST", "path": "/v1/chat/completions", "status": 200,
+                              "model": "other", "cache_tier": "memory"})
+        assert [row["cache_tier"] for row in database.recent_cache_tiers(model="other")] == ["memory"]
+        assert database.recent_cache_tiers(model="absent") == []
 
 
 def test_stream_log_records_privacy_safe_prefill_and_cache_metrics():

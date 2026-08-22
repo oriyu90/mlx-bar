@@ -34,13 +34,50 @@ async def status(request: Request):
     lan_enabled = app.settings.data["security"].get("allowLan", False)
     local_url = f"http://127.0.0.1:{api['port']}"
     lan_urls = [f"http://{address}:{api['port']}" for address in app.lan_ipv4_addresses()]
-    return {"service": "running", **app.workers.status(),
+    worker_status = app.workers.status()
+    return {"service": "running", **worker_status,
             "api": {"enabled": api["enabled"], "host": api["host"],
                     "url": lan_urls[0] if lan_enabled and lan_urls else local_url,
                     "localUrl": local_url, "lanUrls": lan_urls if lan_enabled else [],
                     "lanEnabled": lan_enabled,
                     "error": app.public_listener_error},
+            "promptCacheHealth": _prompt_cache_health(app, worker_status),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
+
+
+def _prompt_cache_health(app, worker_status: dict) -> dict:
+    """What the user needs to know about reuse, before they have to ask.
+
+    The failure this exists for is quiet: reuse stops working and every request
+    simply takes minutes instead of seconds, with nothing in the interface
+    saying so. A streak of cold requests and the reason for the most recent one
+    are the two facts that turn that into something noticeable.
+    """
+    loaded = (worker_status or {}).get("loadedModel") or {}
+    capabilities = loaded.get("capabilities") or {}
+    cache = capabilities.get("promptCache") or {}
+    budget = capabilities.get("cacheBudget") or {}
+    try:
+        recent = app.database.recent_cache_tiers(model=loaded.get("name") or loaded.get("id"))
+    except Exception:
+        recent = []
+    streak = 0
+    for row in recent:
+        if row.get("cache_tier") != "cold":
+            break
+        streak += 1
+    checkpoint = cache.get("checkpoint") or {}
+    return {
+        "capability": capabilities.get("rollbackCapability"),
+        "perTokenBytes": budget.get("perTokenBytes", 0),
+        "budgetKnown": bool(budget.get("known")),
+        "affordableTokens": checkpoint.get("affordableTokens", 0),
+        "disabledReason": cache.get("disabledReason") or checkpoint.get("disabledReason"),
+        "lastColdReason": cache.get("lastColdReason") or (recent[0].get("cold_reason") if recent else None),
+        "coldStreak": streak,
+        "reuseFailures": cache.get("reuseFailures", 0),
+        "recentTiers": [row.get("cache_tier") for row in recent],
+    }
 
 
 @router.get("/models")
@@ -60,6 +97,29 @@ async def probe(model_id: str, request: Request):
         raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND"})
     return {"compatible": model["format"] != "unknown", "model": model,
             "requiresRemoteCode": False}
+
+
+def _record_cache_capability(app, loaded: dict) -> None:
+    """Note what prefix reuse this model/runtime pair turned out to support.
+
+    Written only when the answer changes, so the history is a record of real
+    transitions -- a runtime update that finally lets a hybrid roll its cache
+    back in place shows up here as one line, without anyone having to know in
+    advance that it was coming.
+    """
+    capabilities = (loaded or {}).get("capabilities") or {}
+    capability = capabilities.get("rollbackCapability")
+    if not capability:
+        return
+    engine = (loaded or {}).get("engine") or "unknown"
+    key = f"cache_capability:{engine}"
+    previous = app.database.metadata_value(key)
+    record = json.dumps({"model": (loaded or {}).get("id"), "capability": capability,
+                         "budget": capabilities.get("cacheBudget")}, ensure_ascii=False)
+    if previous == record:
+        return
+    app.database.set_metadata_value(key, record)
+    app.database.add_runtime_history(engine, "", "cache_probe", json.loads(record))
 
 
 def _raise_if_generations_in_flight(app, force: bool, action: str) -> None:
@@ -93,6 +153,7 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
         loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None)
         app.database.set_metadata_value("last_loaded_model_id", model["id"])
         app.database.set_metadata_value("api_autoload_suspended", "0")
+        _record_cache_capability(app, loaded)
         return loaded
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
@@ -228,6 +289,10 @@ async def runtime_cancel_job(engine: str, job_id: str, request: Request):
 @router.post("/runtimes/{engine}/activate")
 async def runtime_activate(engine: str, request: Request, body: dict):
     app = state(request)
+    # Activating a slot unloads the model, so it is exactly as disruptive to an
+    # in-flight generation as an explicit unload is, and has to ask the same
+    # question first.
+    _raise_if_generations_in_flight(app, bool(body.get("force")), "ランタイムを切り替え")
     await app.workers.unload()
     try:
         return app.slots.activate(engine, body["slotId"])
@@ -236,8 +301,9 @@ async def runtime_activate(engine: str, request: Request, body: dict):
 
 
 @router.post("/runtimes/{engine}/rollback")
-async def runtime_rollback(engine: str, request: Request):
+async def runtime_rollback(engine: str, request: Request, force: bool = False):
     app = state(request)
+    _raise_if_generations_in_flight(app, force, "ランタイムを切り戻し")
     await app.workers.unload()
     try:
         return app.slots.rollback(engine)

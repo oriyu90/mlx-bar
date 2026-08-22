@@ -255,3 +255,8 @@
 "設定は次にモデルWorkerを起動したときに反映されます" = "The setting applies the next time the model worker starts";
 "メモリーキャッシュを消去しました" = "Memory prompt cache cleared";
 "ディスクキャッシュを消去しました" = "Disk prompt cache cleared";
+
+/* v1.6.0 -- prompt reuse visibility */
+"再利用方式" = "Reuse method";
+"保存できる長さ" = "Snapshot capacity";
+"直近の再利用なしの理由" = "Last cold reason";
