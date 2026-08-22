@@ -5,6 +5,22 @@
 
 ## 未解決の課題
 
+### mlx-vlmのプロンプトキャッシュ巻き戻し失敗（2026-08-22対応・v1.5.1）
+
+**症状**: Qwen3.8-27B等で、会話が枝分かれしたターンだけ`GENERATION_FAILED` / `'ArraysCache' object has no attribute 'trim'`。
+
+**原因はMLXBarではなくmlx-vlm 0.6.15。** `generate/dispatch.py:859`が保持キャッシュを共通prefixまで巻き戻す際、`c.trim(n_drop)`を`is_trimmable()`ではなく`_cache_fully_retained()`で守っている。後者は`caches` / `start_position` / `max_size`のどれも持たない型に対して最後の`return True`へ落ちるため、`trim`メソッド自体を持たない`ArraysCache`（qwen3_5のlinear_attention層）を通してしまう。`is_trimmable()`は正しく`False`を返している。
+
+**再現条件**: (1)`prompt_cache_state`を渡している（v1.3.7以降のMLXBarは常に渡す）、(2)前要求のキャッシュ長 > 新要求の共通prefix長、つまり**会話の枝分かれ**、(3)モデルのキャッシュ配列に`ArraysCache`が含まれる。前ターンをそのまま続ける要求では起きないので断続的に見える。
+
+**MLXBar側の対処**: `_is_cache_reuse_failure()`でtracebackに`mlx_vlm/generate/dispatch`か`mlx_vlm/models/cache`があるかを見て、応答未送信なら新しいキャッシュで一度だけ再試行する。失敗はprefill前なのでコストはほぼゼロ。APC由来の失敗と違い`apc_manager`は落とさないので、再試行はdisk hitを拾える（実測1,174 tokens再利用）。
+
+**調査時の教訓**: 「v1.5.0を出した直後に出たエラー＝v1.5.0が原因」ではない。API logsに同じ`model` / `error_code` / `prompt_tokens=0`の組み合わせが前日にも記録されていたのが最初の手がかりで、最終的にv1.4.1のcheckoutに対して同じ3要求を流して再現させ、退行ではないことを確定させた。**バージョン間の切り分けは、旧versionのWorkersディレクトリを`sys.path`へ入れて同じスクリプトを走らせるのが速い。**
+
+**小さいモデルで再現できる**: 27B（27 GB）を待つ必要はない。`Qwen3.5-9B-MLX-8bit`が同じ`qwen3_5` hybrid構成（`layer_types`に`linear_attention`）なので9 GBで再現する。`config.json`の`text_config.layer_types`を見て同系統を選ぶこと。
+
+**上流**: `_cache_fully_retained()`と併せて`is_trimmable()`を確認すれば直る。未報告。
+
 ### v1.5.0 設計精査（2026-08-22対応）
 
 27BクラスをZCodeから常用する前提で全体を精査し、17件を修正した。以下は次回以降に効く判断と、精査中に判明した誤認の記録。
