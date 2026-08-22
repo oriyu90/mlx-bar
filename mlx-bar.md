@@ -224,7 +224,7 @@
 - `CHANGELOG.md`（新バージョンの節を先頭に追加）
 - `RELEASE_NOTES_v{version}.md`（新規作成、SHA-256は実ビルド後に追記）
 - `TEST_PLAN_v{version}.md`（新規作成）
-- **紹介サイトはこのリポジトリに無い。** `oriyu90/studio-rizi`の`website/projects/mlx-bar/`で、`softwareVersion`のJSON-LD、kicker、ダウンロード手順のDMGファイル名、動作環境テーブルの最新版、`sitemap.xml`の`lastmod`を更新する。共通ルール「htmlの更新は実装後の最終作業」に従い、DMGを公開してから行うこと。
+- **紹介サイトはこのリポジトリに無い。** `oriyu90/studio-rizi`の`website/projects/mlx-bar/`で更新する（`softwareVersion`のJSON-LD、kicker、動作環境表の「最新版」、手順のDMG名、`content.js`のリリース版数と日付）。**4言語ぶんあるので箇所数が多い。正確な一覧は非公開メモ側にある。** 共通ルール「htmlの更新は実装後の最終作業」に従い、DMGを公開してから行うこと。
 
 ## ウェブサイトの多言語対応について
 
