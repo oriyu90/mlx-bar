@@ -56,9 +56,9 @@ v1.5.0は、27BクラスのモデルをZCodeから常用する前提での設計
 - 古いキャッシュ世代3件に対し`keepGenerations=2`で、現行世代と直近1件だけが残った。
 - `mmap`で400 MBを確保・解放し、`ru_maxrss`が高水位のまま、`process_rss_bytes`が実際に低下することを確認した。
 - Xcode 26.6でSwift Debug／Release buildが成功した。
-- DMGを読み取り専用でマウントし、アプリ版1.5.0、arm64、ad-hoc署名、`__pycache__`非収録、v1.5.0テスト計画と新規`prompt_cache.py`の収録を確認した。ビルドスクリプトがテスト計画のファイル名をv1.4.1で固定していたため、`$VERSION`連動へ修正した。
+- DMGを読み取り専用でマウントし、アプリ版1.5.0（build 19）、arm64、ad-hoc署名、`__pycache__`非収録、v1.5.0テスト計画と新規`prompt_cache.py`の収録を確認した。ビルドスクリプトがテスト計画のファイル名をv1.4.1で固定していたため、`$VERSION`連動へ修正した。また`CFBundleVersion`の更新漏れ（18のまま）を保守メモのチェックリスト照合で検出し、19へ修正して再ビルドした。
 - 同梱Coordinatorを公開API・自動runtime install無効の隔離HOMEで起動し、同梱CLIから`service=running`、active 0、queued 0、`generationLockState=idle`、回復0、`settingsRecoveredFrom=null`を確認して正常終了した。
-- ローカルDMGのSHA-256を`cfb10c341404a38eff1e3be7820d11dd7e4ad829e262b5d90428bbeb56d77517`としてrelease notesへ記録し、公開assetとの一致はrelease upload後に確認する。
+- ローカルDMGのSHA-256を`8bf212103ba2be3d4fbd83066cb250a4e41c60041105fd374aff0390348b1831`としてrelease notesへ記録し、公開assetとの一致はrelease upload後に確認する。
 
 ## 未実施・既知の範囲
 

@@ -90,7 +90,7 @@ MLXBar v1.5.0は、大規模モデルを常用するための強化リリース�
 
 SHA-256 (`MLXBar-1.5.0.dmg`):
 
-`cfb10c341404a38eff1e3be7820d11dd7e4ad829e262b5d90428bbeb56d77517`
+`8bf212103ba2be3d4fbd83066cb250a4e41c60041105fd374aff0390348b1831`
 
 The included build is ad-hoc signed. On first launch, macOS may require approval in System Settings > Privacy & Security.
 
