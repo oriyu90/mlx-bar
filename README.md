@@ -19,7 +19,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
-- mlx-vlmの長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
+- mlx-lm・mlx-vlm両方で長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
 - ZCode等のOpenAI Chat Completionsクライアント向けtool calling（履歴、`tools`、`tool_choice`、ストリーミング差分）
 - 本文とAPIキーを含めない、最大2,000件の最近のAPIログ
 - モデルから検出したトークン上限の表示、ユーザー上限設定、超過要求の自動調整
@@ -75,7 +75,7 @@ Developer ID署名・公証済みの正式配布版では、手順3は通常不�
 - 「APIサーバー」: URL確認、コピー、ポート変更
 - 「詳細」: 最近のAPIアクセスを最大500件表示、コピー、消去
 - 「ランタイム」設定: 自動インストール状況の確認、最新版または指定版への更新、検証後の切替・復元・旧版削除
-- 「キャッシュ」設定: 永続プロンプトキャッシュの有効化、容量上限、使用量確認、RAM／ディスクキャッシュの個別消去
+- 「キャッシュ」設定: 永続プロンプトキャッシュの有効化、容量上限、使用量確認、RAM／ディスクキャッシュの個別消去、古いキャッシュ世代の自動回収
 
 モデルのロード中は、対象モデル名、エンジン、現在段階、経過秒数をモデル画面とメニューバーに表示します。完了後は「モデル名をコピー」またはメニューバーのコピーボタンから、読み込み済みモデル名をクリップボードへコピーできます。
 
@@ -104,9 +104,9 @@ ZCodeのシステム指示、会話履歴、ツール結果が従来の100,000�
 
 mlx-lmとmlx-vlmでは4項目すべてをランタイムへ渡します。LM Studio経由ではOpenAI互換性が確認できる温度とTop Pを渡します。クイックチャットは保存した温度から開始し、Top Pと繰り返しペナルティは保存値を使用します。ZCode、LibreChatなどが`temperature`、`top_p`、`repetition_penalty`、`repetition_context_size`を要求ごとに指定した場合は、その要求値を優先します。不正な範囲はモデルを実行せず入力エラーとして返します。
 
-### MLXランタイムの自動更新
+### MLXランタイムの更新
 
-「設定…」→「ランタイム」では、`mlx-lm`と`mlx-vlm`を個別に更新できます。未インストールのランタイムはアプリ起動時に自動インストールされます。「最新版へ自動更新」を押すと、以降は次の処理を自動で行います。
+「設定…」→「ランタイム」では、`mlx-lm`と`mlx-vlm`を個別に更新できます。未インストールのランタイムはアプリ起動時に自動インストールされますが、**インストール済みランタイムが自動で更新されることはありません**。ランタイムが変わると永続プロンプトキャッシュのnamespaceが無効化され、動作中の構成に影響しうるため、更新は明示的な操作に限っています。「最新版へ更新」を押すと、次の処理を自動で行います。
 
 1. 公式PyPIから最新安定版を確認
 2. 現在の環境を変更せず、新しい保存領域へダウンロード
@@ -129,7 +129,7 @@ GGUFはMLXワーカーへ渡されず、LM Studio Providerだけが選択され�
 - 生成本体はメモリ保護のため同時に1件だけ実行し、並列要求は最大16件までFIFOキューで待機します。
 - 待機中は10秒間隔で接続を維持し、既定の最大待ち時間は3,600秒です。満杯時だけ再試行可能なHTTP 429を返します。
 - GUIの「停止」は協調停止を要求し、5秒以内に終わらない場合はMLX WorkerまたはLM Studio接続を強制終了します。「すべての生成を停止」では待機中の要求も取り消します。
-- モデルロードは最大10分、生成は最大15分で停止します。長い入力処理中は10秒間隔で生存通知を送ります。
+- モデルロードは最大10分、生成は最大60分で停止します。長い入力処理中は10秒間隔で生存通知を送ります。生成が上限を超えても、その要求だけを停止してモデルはロードしたまま維持します。Workerが60秒間まったく無応答になった場合だけプロセスを再起動します。
 - `max_tokens`は最大8192、promptは最大100,000文字、画像は最大8件・1件25MBです。
 - MLXのactive/cacheメモリが物理メモリの90%に達した場合は、新しい生成を開始しません。
 - Worker通信が切断された場合はモデル状態を解除し、再ロード可能な状態へ復帰します。
@@ -206,7 +206,7 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 APIのモデル指定には、`GET /v1/models`が返す表示名または内部IDを利用できます。モデルが未ロードでも、既定では最初の要求時にカタログから探してロード完了を待ち、その後に生成します。アプリやモデルWorkerの再起動後も同様に復元します。「設定…」→「モデル」で自動ロードを無効にできます。メニューバーから明示的にアンロードした場合は、意図しない再起動を防ぐためGUIで再ロードするまで自動ロードしません。
 
-OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`seed`、`response_format`、`metadata`、`store`なども受理します。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。複数候補生成（`n > 1`）とテキスト以外の出力は未対応で、フリーズせず入力エラーとして終了します。
+OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。`response_format`は`text`のみ対応で、`json_object`・`json_schema`と`logprobs`は黙って無視せずHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。複数候補生成（`n > 1`）とテキスト以外の出力は未対応で、フリーズせず入力エラーとして終了します。
 
 ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルまたは`extra_body`内の`thinking`と`reasoning_effort`も受理し、mlx-lm・mlx-vlmのチャットテンプレートへ渡します。`thinking.type`の`enabled` / `disabled`は`enable_thinking`へ、`budget_tokens`は`thinking_budget`へ、`clear_thinking`は逆値の`preserve_thinking`へ、`thinking.effort`は`reasoning_effort`へ変換します。将来のZCodeやOpenAI互換クライアントが追加する未知の拡張項目は生成へ渡さず安全に無視するため、項目追加だけでHTTP 400になりません。同じ値が`extra_body.chat_template_kwargs`に明示された場合はそちらを優先します。`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`はMLXBarが管理するため、`chat_template_kwargs`内での上書きは受け付けません。
 
@@ -214,13 +214,27 @@ tool calling有効時も通常本文を生成中に逐次配信します。Qwen�
 
 v1.4.1では、ZCodeやGUIがSSE接続を途中で閉じても内側の生成処理を明示的に終了します。生成ロックは要求ID付きで所有され、所有者が実行中にも待機中にも存在しない孤立状態だけをGUI状態更新やキューheartbeatが自動回復します。正常なキュー移行や別要求のロックは解放しないため、モデル生成の直列性を維持します。診断情報の`generationLockState`と`generationLockRecoveries`で回復状態を確認できます。
 
-mlx-vlmのテキスト要求では、直前要求との最長共通token prefixを安全に再利用します。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
+mlx-lm・mlx-vlmのテキスト要求では、過去の要求との最長共通token prefixを安全に再利用します。mlx-lmではmlx-lm公式の`LRUPromptCache`をRAM層、prefix snapshotをディスク層として使います。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
 
 v1.4.0では、mlx-vlm公式の`APCManager` / `DiskBlockStore`をディスク専用の下位層として追加しました。現在の`PromptCacheState`は高速なRAM層として維持され、Worker再起動後は`~/Library/Application Support/MLXBar/prompt-cache/`から共通prefixを復元します。モデル、tokenizer/chat template、重み、mlx-vlmランタイム版が変わると別namespaceになるため、互換性のないcacheを読みません。hybrid exact-cacheでは末尾256 tokensを毎回再計算し、その前の長いsystem/tools prefixを異なる最初のユーザー文でも再利用できるようにします。画像要求は引き続き共有対象外です。
 
-「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GBの容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
+v1.5.0では、これまでmlx-vlm経路にしかなかった仕組みをmlx-lmにも用意しました。RAM層はmlx-lm公式の`LRUPromptCache`で、複数のprefixを木構造で保持して最も長く一致するものを返します。ディスク層は`save_prompt_cache` / `load_prompt_cache`によるprefix snapshotで、mlx-vlm側と同じく末尾256 tokensをcoldに残すため、最初のユーザー文が変わっても大きなsystem/tools prefixを再利用できます。保存するのは常にプロンプト部分までで、モデル自身の応答をprefixとして保存することはありません。
 
-APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、`cache_tier`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
+namespaceはモデルとランタイム版から作られるため、モデル切替やランタイム更新のたびに新しい世代が生まれます。容量上限は1世代の中でしか効かないので、`promptCache.keepGenerations`（既定2）を超えた古い世代は自動削除します。RAM層は`promptCache.memoryRatio`（既定0.10、物理メモリ比）で上限を設けます。8,000 token規模のsnapshotは1 GBに達するため、どちらの上限も実測に基づいて設定してください。
+
+「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GB（既定10 GB）の容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
+
+### メモリ安全性
+
+大きなモデルをメモリに載せたまま長時間動かすため、v1.5.0では3段階で保護します。
+
+1. **ロード時の上限設定。** MLXの`wired limit`（`generation.wiredLimitRatio`、既定0.80）と`cache limit`（`generation.cacheLimitRatio`、既定0.10）を物理メモリ比で設定します。wired limitを設定しないと、大きなモデルの重みがmacOSにページアウトされて生成速度が桁で落ちます。どちらも0にするとランタイム既定に任せます。
+2. **生成前の確認。** 上限に達していれば、まずプロンプトキャッシュだけを解放して再判定します。キャッシュ保持がメモリ不足の恒久的な原因にならないようにするためです。
+3. **生成中の監視。** 長い入力と長い応答ではKVキャッシュが生成中に伸びるため、5秒間隔で再確認し、上限に達した要求だけを`MEMORY_PRESSURE`で停止します。Workerごとプロセスが強制終了されるより、要求1件の失敗の方が安全です。
+
+判定には物理メモリ総量比（`generation.memoryLimitRatio`、既定0.90）だけでなく、空きメモリ、macOS自身のメモリ逼迫レベル、Workerプロセスの現在の常駐サイズを使います。総量比だけでは他のアプリの使用量が見えないため、MLX単体では上限未満でもマシン全体はスワップしている状態を検出できないからです。
+
+APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、`cache_tier`、`tool_support`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
 
 OpenAI系クライアントの`reasoning_effort=high` / `minimal`は最初に原値でテンプレートへ渡し、Qwenが拒否した場合だけ同等の`xhigh` / `low`へ再試行します。汎用テンプレートのOpenAI表記を優先しながらQwenのdialectにも対応します。
 
@@ -266,11 +280,11 @@ ZCode 3.2.5以降のモデル設定が追加する`extra_body.chat_template_kwar
 
 `POST /v1/chat/completions`は、`system`、`developer`、`user`、`assistant`、`tool`の会話履歴を順序どおりランタイムへ渡します。assistantの`tool_calls`とtoolの`tool_call_id`も次のターンまで保持します。`tools`、`tool_choice`（`none`、`auto`、`required`、特定function）、`parallel_tool_calls`を受理します。
 
-モデルがツールを選んだ場合、非ストリーミング応答は`message.tool_calls`と`finish_reason: "tool_calls"`を返します。ストリーミング応答は`delta.tool_calls[].index/id/function.name/function.arguments`を差分で返し、最後に`finish_reason: "tool_calls"`と`[DONE]`を送ります。Lagunaの`<tool_call>...<arg_key>...`形式、JSON形式、Qwen系function/parameter形式をOpenAI形式へ変換します。
+応答が`max_tokens`で切り詰められた場合は`finish_reason: "length"`を返すため、クライアントは継続が必要かどうかを判定できます。モデルがツールを選んだ場合、非ストリーミング応答は`message.tool_calls`と`finish_reason: "tool_calls"`を返します。ストリーミング応答は`delta.tool_calls[].index/id/function.name/function.arguments`を差分で返し、最後に`finish_reason: "tool_calls"`と`[DONE]`を送ります。Lagunaの`<tool_call>...<arg_key>...`形式、JSON形式、Qwen系function/parameter形式に加え、`<|tool_call_start|>`、`<minimax:tool_call>`、`<atem:function_calls>`などランタイムのtool parserが解釈する記法をOpenAI形式へ変換します。これらの記法は本文としては配信しません。チャットテンプレートが`tools`を受け付けずツール定義を落として描画した場合は、APIログへ`tool_support: degraded`を記録します。
 
 ツール付きリクエストでは、モデル固有のツール制御文字をクライアントへ途中表示しないため、ツール呼び出し部分を生成完了時に解析してからストリーム差分として送ります。通常のテキスト応答は従来どおり生成中に逐次送信します。
 
-長い会話履歴のtokenize／prefillや、ツール呼び出し候補を内部解析している間は、10秒間隔でSSEコメント形式のheartbeatを送ります。これはOpenAI互換クライアントでは表示されませんが、ZCodeや中間プロキシが処理中の接続を無通信として切断することを防ぎます。ストリーム開始時にはOpenAI形式のassistant roleチャンクを即時送信します。生成全体の安全上限（既定15分）は引き続き有効です。
+長い会話履歴のtokenize／prefillや、ツール呼び出し候補を内部解析している間は、10秒間隔でSSEコメント形式のheartbeatを送ります。これはOpenAI互換クライアントでは表示されませんが、ZCodeや中間プロキシが処理中の接続を無通信として切断することを防ぎます。ストリーム開始時にはOpenAI形式のassistant roleチャンクを即時送信します。生成全体の安全上限（既定60分）は引き続き有効です。
 
 ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒否せず到着順にキューへ入れます。待機中も同じheartbeatを送るため、subagent接続は生成開始まで維持されます。クライアントが接続を閉じた待機要求は自動削除されます。「設定…」→「モデル」→「並列リクエスト」で最大待機件数と最大待ち時間を変更できます。メニューバーには現在の待機件数を表示します。
 

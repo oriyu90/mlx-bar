@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -115,10 +116,53 @@ class MLXVLMAdapter(BaseAdapter):
             # large Qwen hybrid cache in unified memory.
             self.apc_manager = APCManager(num_blocks=0, disk=disk)
             os.chmod(disk.dir, 0o700)
+            try:
+                keep = int(os.environ.get("MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS", "2"))
+            except (TypeError, ValueError):
+                keep = 2
+            self._sweep_stale_namespaces(min(10, max(1, keep)))
         except Exception as exc:
             self._close_apc()
             self.apc_disabled_reason = f"initialization_failed:{type(exc).__name__}"
             logging.getLogger(__name__).warning("Disk APC disabled: %s", exc)
+
+    def _sweep_stale_namespaces(self, keep: int) -> list[str]:
+        """Delete cache generations this model/runtime can no longer read.
+
+        The namespace fingerprints the model files *and* the mlx-vlm version,
+        so every model switch and every runtime update starts a fresh one. The
+        `max_bytes` budget only bounds a single namespace, so without this the
+        directory grows by that budget per generation and nothing ever reclaims
+        it. The current namespace is always kept; older ones survive only up to
+        `keep` so returning to a previous model can still hit its cache.
+        """
+        if self.apc_root is None or not self.apc_namespace:
+            return []
+        try:
+            entries = [item for item in self.apc_root.iterdir()
+                       if item.is_dir() and item.name != self.apc_namespace]
+        except OSError:
+            return []
+
+        def modified(item: Path) -> float:
+            try:
+                return item.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        entries.sort(key=modified, reverse=True)
+        removed = []
+        for stale in entries[max(0, keep - 1):]:
+            try:
+                shutil.rmtree(stale)
+                removed.append(stale.name)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("Stale cache sweep failed for %s: %s",
+                                                    stale.name, exc)
+        if removed:
+            logging.getLogger(__name__).info("Removed %d stale prompt-cache generation(s)",
+                                             len(removed))
+        return removed
 
     def _disable_apc_after_failure(self, exc: Exception) -> None:
         self._close_apc()
@@ -129,6 +173,14 @@ class MLXVLMAdapter(BaseAdapter):
 
     @staticmethod
     def _is_apc_failure(exc: Exception) -> bool:
+        """True only when the failure actually came from the APC code.
+
+        The traceback is the strongest evidence, but an APC error re-raised
+        from outside the module loses those frames, so unambiguous message
+        markers still count. "safetensors" is no longer one of them: ordinary
+        weight-loading errors mention it too, and a false positive here
+        disables the disk cache for the rest of the session.
+        """
         trace = exc.__traceback__
         while trace is not None:
             filename = trace.tb_frame.f_code.co_filename.replace("\\", "/").lower()
@@ -136,9 +188,7 @@ class MLXVLMAdapter(BaseAdapter):
                 return True
             trace = trace.tb_next
         message = str(exc).lower()
-        return any(marker in message for marker in (
-            " apc", "apc ", "safetensors", "prefix cache", "cache snapshot",
-        ))
+        return any(marker in message for marker in (" apc", "apc ", "prefix cache", "cache snapshot"))
 
     def prompt_cache_stats(self) -> dict:
         result = {
@@ -148,6 +198,8 @@ class MLXVLMAdapter(BaseAdapter):
             "disk": self.apc_manager is not None,
             "namespace": self.apc_namespace,
             "disabledReason": self.apc_disabled_reason,
+            "generations": self._namespace_count(),
+            "diskBytes": self._namespace_bytes(),
         }
         if self.apc_manager is not None:
             try:
@@ -155,6 +207,27 @@ class MLXVLMAdapter(BaseAdapter):
             except Exception as exc:
                 result["statsError"] = type(exc).__name__
         return result
+
+    def _namespace_count(self) -> int:
+        if self.apc_root is None:
+            return 0
+        try:
+            return sum(1 for item in self.apc_root.iterdir() if item.is_dir())
+        except OSError:
+            return 0
+
+    def _namespace_bytes(self) -> int:
+        total = 0
+        if self.apc_root is None:
+            return total
+        try:
+            for item in self.apc_root.rglob("*"):
+                with contextlib.suppress(OSError):
+                    if item.is_file():
+                        total += item.stat().st_size
+        except OSError:
+            return total
+        return total
 
     def _apc_stats_snapshot(self) -> dict:
         """Keep optional diagnostics from becoming a generation dependency."""
@@ -184,6 +257,7 @@ class MLXVLMAdapter(BaseAdapter):
         from mlx_vlm import load
         self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
         self.model_path = path
+        self.apply_memory_limits()
         self._reset_prompt_cache()
         self._init_apc(path)
         return self.capabilities()
@@ -221,22 +295,36 @@ class MLXVLMAdapter(BaseAdapter):
         from mlx_vlm.prompt_utils import apply_chat_template
         config = getattr(self.model, "config", None)
         last_error: Exception | None = None
+        tool_support = "none"
         for extra_kwargs in tool_template_kwargs_attempts(params):
             try:
                 prompt = apply_chat_template(
                     self.processor, config, prompt, num_images=len(images), **extra_kwargs
                 )
                 last_error = None
+                tool_support = _tool_support(params, extra_kwargs)
                 break
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
             raise last_error
+        if tool_support == "degraded":
+            # The template could not be rendered with `tools`, so the model was
+            # never told the tools exist. Without this the caller only sees a
+            # model that mysteriously refuses to call anything.
+            yield {"type": "tool_support", "state": "degraded"}
         kwargs = {"model": self.model, "processor": self.processor, "prompt": prompt,
                   "max_tokens": int(params.get("max_tokens", 512)),
                   "temperature": float(params.get("temperature", 0.7)),
                   "top_p": float(params.get("top_p", 1.0)),
                   "repetition_context_size": int(params.get("repetition_context_size", 20))}
+        seed = params.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            try:
+                import mlx.core as mx
+                mx.random.seed(seed)
+            except Exception:
+                pass
         repetition_penalty = float(params.get("repetition_penalty", 1.0))
         if repetition_penalty != 1.0:
             kwargs["repetition_penalty"] = repetition_penalty
@@ -262,10 +350,14 @@ class MLXVLMAdapter(BaseAdapter):
         completed = False
         apc_before = self._apc_stats_snapshot()
         received_response = False
+        generated = 0
         try:
             try:
                 for response in stream_generate(**kwargs):
+                    if request_id in self.cancelled:
+                        return
                     received_response = True
+                    generated += 1
                     last_response = response
                     text = getattr(response, "text", response if isinstance(response, str) else "")
                     if text:
@@ -287,6 +379,9 @@ class MLXVLMAdapter(BaseAdapter):
                 kwargs["prompt_cache_state"] = self.prompt_cache_state
                 last_response = None
                 for response in stream_generate(**kwargs):
+                    if request_id in self.cancelled:
+                        return
+                    generated += 1
                     last_response = response
                     text = getattr(response, "text", response if isinstance(response, str) else "")
                     if text:
@@ -311,10 +406,15 @@ class MLXVLMAdapter(BaseAdapter):
             yield {"type": "usage",
                    "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
                    "completion_tokens": int(getattr(last_response, "generation_tokens", 0) or 0)}
+            finish_reason = getattr(last_response, "finish_reason", None)
+            if generated >= int(params.get("max_tokens", 512)):
+                finish_reason = "length"
             yield {"type": "metrics",
                    "prompt_tokens": int(getattr(last_response, "prompt_tokens", 0) or 0),
                    "cached_tokens": cached_tokens,
                    "cache_tier": cache_tier,
+                   "finish_reason": finish_reason if finish_reason in {"stop", "length"} else None,
+                   "tool_support": tool_support,
                    "prompt_tps": float(getattr(last_response, "prompt_tps", 0.0) or 0.0),
                    "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
 
@@ -350,6 +450,13 @@ class MLXVLMAdapter(BaseAdapter):
 
     def _fallback_tool_calls(self, text: str, tools: list) -> dict:
         return parse_tool_markup(text)
+
+
+def _tool_support(params: dict, rendered_kwargs: dict) -> str:
+    """Whether the rendered template actually carried the requested tools."""
+    if not params.get("tools") or params.get("tool_choice") == "none":
+        return "none"
+    return "full" if rendered_kwargs.get("tools") else "degraded"
 
 
 if __name__ == "__main__":

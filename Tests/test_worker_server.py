@@ -368,7 +368,11 @@ def test_mlx_vlm_retries_without_tools_when_template_rejects_them_entirely():
             "messages": [{"role": "user", "content": "hello"}],
             "tools": [{"type": "function", "function": {"name": "get_weather"}}],
         }))
-    assert events == [{"type": "delta", "text": "ok"}]
+    # Dropping `tools` keeps the generation alive but leaves the model unable
+    # to call anything, so it must be reported rather than look like a model
+    # that simply chose not to.
+    assert events == [{"type": "tool_support", "state": "degraded"},
+                      {"type": "delta", "text": "ok"}]
     assert captured["prompt"] == "templated prompt"
 
 
@@ -470,7 +474,8 @@ def test_mlx_vlm_reports_runtime_usage_and_cache_metrics():
     assert events[-2] == {"type": "usage", "prompt_tokens": 4096, "completion_tokens": 7}
     assert events[-1] == {"type": "metrics", "prompt_tokens": 4096,
                           "cached_tokens": 3900, "prompt_tps": 850.5,
-                          "generation_tps": 12.25, "cache_tier": "memory"}
+                          "generation_tps": 12.25, "cache_tier": "memory",
+                          "finish_reason": None, "tool_support": "none"}
 
 
 def test_mlx_vlm_cancelled_stream_discards_mutated_prompt_cache():
@@ -703,3 +708,254 @@ def test_mlx_vlm_initializes_disk_only_apc_with_bounded_private_store(tmp_path):
     assert captured["disk"].dir.stat().st_mode & 0o777 == 0o700
     adapter._close_apc()
     assert captured["closed"] is True
+
+
+# --------------------------------------------------------------------------
+# v1.5.0 regressions
+# --------------------------------------------------------------------------
+
+
+class AbandonedGenerationAdapter(ThreadBoundAdapter):
+    """Records whether its generator was ever closed, and how far it ran."""
+
+    def __init__(self, total: int = 24):
+        super().__init__()
+        self.total = total
+        self.produced = 0
+        self.closed_on: str | None = None
+
+    def stream(self, request_id: str, params: dict):
+        try:
+            for index in range(self.total):
+                self.produced += 1
+                yield {"type": "delta", "text": f"t{index} "}
+        finally:
+            self.closed_on = threading.current_thread().name
+
+
+def test_disconnected_stream_closes_the_adapter_generator_on_the_mlx_thread():
+    """A client that goes away must not leave the generator un-finalised.
+
+    Without an explicit close the adapter's `finally` only ran whenever the
+    garbage collector got around to it -- on an arbitrary thread -- so the
+    prompt-cache discard that protects a cancelled generation never happened
+    in time, and the next request could reuse a half-advanced cache.
+    """
+    adapter = AbandonedGenerationAdapter()
+    with TestClient(create_app(adapter)) as client:
+        with client.stream("POST", "/generate", json={
+            "protocol_version": 1, "request_id": "abandoned",
+            "method": "generate", "params": {"prompt": "hi"},
+        }) as response:
+            for count, line in enumerate(response.iter_lines()):
+                if count >= 3:
+                    break
+    deadline = time.monotonic() + 5
+    while adapter.closed_on is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert adapter.closed_on is not None, "generator was never closed"
+    # Closing on the MLX thread matters as much as closing at all: the adapter
+    # generator's teardown touches MLX state, which is thread-bound.
+    assert adapter.closed_on.startswith(adapter.engine), adapter.closed_on
+
+
+class StopSequenceAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        for text in ("Answer: 42", " <<E", "ND>> trailing noise"):
+            yield {"type": "delta", "text": text}
+
+
+def test_stop_sequence_truncates_output_even_when_split_across_deltas():
+    adapter = StopSequenceAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "stop", "params": {
+            "prompt": "hi", "stop": ["<<END>>"]}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    text = "".join(event["text"] for event in events if event.get("type") == "delta")
+    assert text == "Answer: 42 "
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+class LengthLimitedAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "delta", "text": "cut off here"}
+        yield {"type": "metrics", "finish_reason": "length"}
+
+
+def test_length_finish_reason_reaches_the_client():
+    """A truncated reply must not be reported as a completed one."""
+    adapter = LengthLimitedAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "len", "params": {"prompt": "hi"}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert events[-1] == {"type": "completed", "finish_reason": "length"}
+
+
+class MemoryHogAdapter(ThreadBoundAdapter):
+    def memory_stats(self) -> dict:
+        return {"active_bytes": 95, "cache_bytes": 0, "peak_bytes": 95,
+                "physical_memory_bytes": 100, "available_bytes": 2,
+                "pressure_level": 1, "process_rss_bytes": 95}
+
+    def stream(self, request_id: str, params: dict):
+        for index in range(200):
+            time.sleep(0.01)
+            yield {"type": "delta", "text": f"t{index}"}
+
+
+def test_generation_is_stopped_when_memory_crosses_the_limit_mid_stream():
+    """The pre-flight check cannot see a KV cache that grows while generating."""
+    previous = worker_server.MEMORY_CHECK_INTERVAL_SECONDS
+    worker_server.MEMORY_CHECK_INTERVAL_SECONDS = 0.0
+    try:
+        adapter = MemoryHogAdapter()
+        with TestClient(create_app(adapter)) as client:
+            generated = client.post("/generate", json={"request_id": "mem", "params": {
+                "prompt": "hi", "memory_limit_ratio": 0.9}})
+    finally:
+        worker_server.MEMORY_CHECK_INTERVAL_SECONDS = previous
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == "MEMORY_PRESSURE"
+    assert events[-1]["retryable"] is True
+
+
+def test_memory_pressure_reason_uses_free_memory_and_the_os_verdict():
+    from common.server import memory_pressure_reason
+
+    class Stub(BaseAdapter):
+        def __init__(self, stats):
+            super().__init__()
+            self.stats = stats
+
+        def memory_stats(self):
+            return self.stats
+
+    healthy = {"active_bytes": 10, "cache_bytes": 0, "physical_memory_bytes": 100,
+               "available_bytes": 50, "pressure_level": 1, "process_rss_bytes": 10}
+    assert memory_pressure_reason(Stub(healthy), 0.9) is None
+    # MLX itself is idle, but the machine as a whole has nothing left.
+    assert memory_pressure_reason(Stub({**healthy, "available_bytes": 2}), 0.9)
+    # macOS says it is in trouble, whatever the ratios say.
+    assert memory_pressure_reason(Stub({**healthy, "pressure_level": 4}), 0.9)
+    # Resident size counts even when MLX's own counters look small.
+    assert memory_pressure_reason(Stub({**healthy, "process_rss_bytes": 95}), 0.9)
+
+
+def test_every_runtime_tool_marker_is_withheld_from_visible_output():
+    """Detection must cover the same dialects the runtime parsers accept."""
+    from common.tool_calls import IncrementalToolStream
+
+    for marker in ("<tool_call>", "<|tool_call_start|>", "<minimax:tool_call>",
+                   "<atem:function_calls>", "<longcat_tool_call>", "<start_function_call>"):
+        stream = IncrementalToolStream()
+        visible = stream.feed("here you go " + marker + '{"name": "read"}')
+        assert stream.tool_detected, marker
+        assert "".join(event["text"] for event in visible) == "here you go ", marker
+
+
+def test_disconnect_over_a_real_socket_stops_generation():
+    """The end-to-end shape: uvicorn over a UDS, as the coordinator speaks to it.
+
+    TestClient buffers the whole response before the caller can stop reading,
+    so only a real server and a real disconnect can show that the worker stops
+    producing tokens instead of running on for a client that has gone.
+    """
+    import asyncio
+    import tempfile
+
+    import httpx
+    import uvicorn
+
+    state = {"produced": 0}
+
+    class SlowAdapter(BaseAdapter):
+        engine = "slow-test"
+
+        def stream(self, request_id: str, params: dict):
+            for index in range(40):
+                time.sleep(0.05)
+                state["produced"] = index + 1
+                yield {"type": "delta", "text": f"t{index} "}
+
+    socket_path = str(Path(tempfile.mkdtemp()) / "worker.sock")
+    server = uvicorn.Server(uvicorn.Config(create_app(SlowAdapter()), uds=socket_path,
+                                           log_level="error", access_log=False))
+
+    async def scenario():
+        serving = asyncio.create_task(server.serve())
+        while not server.started:
+            await asyncio.sleep(0.02)
+        transport = httpx.AsyncHTTPTransport(uds=socket_path)
+        async with httpx.AsyncClient(transport=transport, base_url="http://worker",
+                                     timeout=httpx.Timeout(connect=5, read=None,
+                                                           write=5, pool=5)) as client:
+            async with client.stream("POST", "/generate", json={
+                "protocol_version": 1, "request_id": "disconnect",
+                "method": "generate", "params": {"heartbeat_interval_seconds": 5},
+            }) as response:
+                seen = 0
+                async for line in response.aiter_lines():
+                    if line:
+                        seen += 1
+                    if seen >= 4:
+                        break
+        at_disconnect = state["produced"]
+        await asyncio.sleep(1.0)
+        server.should_exit = True
+        await serving
+        return at_disconnect, state["produced"]
+
+    at_disconnect, after = asyncio.run(scenario())
+    # One token may still be in flight on the MLX thread when the close lands.
+    assert after <= at_disconnect + 1, (at_disconnect, after)
+    assert after < 40
+
+
+def test_memory_check_uses_current_resident_size_not_the_high_water_mark():
+    """A transient spike must not lock the worker out for the rest of its life.
+
+    `ru_maxrss` never falls, so using it as "in use" meant one huge prefill
+    kept every later request above the limit until the worker restarted.
+    """
+    from common.server import host_memory
+
+    stats = BaseAdapter().memory_stats()
+    # Current size drives the decision; the high-water mark is reported
+    # separately as a diagnostic and must never stand in for it.
+    assert stats["process_rss_bytes"] > 0
+    assert stats["process_rss_bytes"] == host_memory()["process_rss_bytes"]
+    assert "peak_rss_bytes" in stats
+
+    import resource
+    peak_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    import mmap
+    block = mmap.mmap(-1, 400_000_000)
+    block.write(b"x" * 400_000_000)
+    block.close()
+    worker_server._HOST_MEMORY_CACHE.clear()
+    after = BaseAdapter().memory_stats()
+    # The peak rose and stays risen; the reading the limit uses came back down.
+    assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss > peak_before
+    assert after["process_rss_bytes"] < after["peak_rss_bytes"]
+
+
+class StopThenToolAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "delta", "text": "visible part <<END>> hidden "}
+        yield {"type": "delta", "text": '<tool_call>{"name": "rm", "arguments": {}}</tool_call>'}
+
+
+def test_text_after_a_stop_sequence_cannot_produce_a_tool_call():
+    """The client never saw it, so it must not act on it either."""
+    adapter = StopThenToolAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "stop-tool", "params": {
+            "prompt": "hi", "stop": ["<<END>>"],
+            "tools": [{"type": "function", "function": {"name": "rm"}}],
+            "tool_choice": "auto"}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    text = "".join(event["text"] for event in events if event.get("type") == "delta")
+    assert text == "visible part "
+    assert not [event for event in events if event.get("type") == "tool_calls"]
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}

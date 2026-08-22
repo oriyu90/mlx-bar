@@ -5,6 +5,31 @@
 
 ## 未解決の課題
 
+### v1.5.0 設計精査（2026-08-22対応）
+
+27BクラスをZCodeから常用する前提で全体を精査し、17件を修正した。以下は次回以降に効く判断と、精査中に判明した誤認の記録。
+
+**精査中に覆った仮説（同じ間違いを繰り返さないため）**
+
+- 「切断してもWorkerが最大13分生成を続ける」は誤り。`httpx.ASGITransport`では`break`してもアプリ側タスクが走り続けるため完走するが、実uvicornはクライアント切断でレスポンスタスクをcancelするので生成自体は止まる。**Worker側の切断挙動をASGITransportで測ってはいけない。** 実際に残っていた欠陥は「adapterの生成器が閉じられず`finally`が走らない」＝中断時のプロンプトキャッシュ破棄が実行されないことで、性能ではなくキャッシュ整合性の問題だった。
+- 「テキスト専用Qwen3はmlx-lmへ分類されプロンプトキャッシュが効かない」は、`Qwen3.8-27B-MLX-8bit`には当てはまらない。同モデルは`vision_config`と`image_token_id`とprocessor設定を持つ真のVLMで、正しくmlx-vlmへ分類される。mlx-lmのキャッシュ欠落は実在の欠陥だが、27B常用への影響はなかった。**モデルの経路はカタログの分類結果か`/api/v1/status`の`loadedModel.engine`で確認すること。**
+- 「`<function=`形式がストリームへ漏れる」は誤り。`parse_tool_markup`は`<tool_call>`ブロックの内側しか見ないため、その記法単体では解析されない。実際に漏れていたのは`<|tool_call_start|>`、`<minimax:tool_call>`、`<atem:function_calls>`など**mlx-vlmの`tool_parsers`が解釈する別dialect**で、`IncrementalToolStream.TOOL_START`が`<tool_call>`単体だった。ランタイムのtool parser一覧は`mlx_vlm/tool_parsers/`を直接見て同期させること。
+
+**設計判断のメモ**
+
+- `resource.getrusage().ru_maxrss`は**高水位で、下がらない**。メモリ判定に使うと一度の大きなprefillで以後の要求が恒久的に拒否される。現在値は`/bin/ps -o rss=`から取る（2秒キャッシュ）。macOSに`SC_AVPHYS_PAGES`はないため空きメモリも`vm_stat`から取る。`kern.memorystatus_vm_pressure_level`（1/2/4）はOS自身の判定なので最優先で見る。
+- mlx-lmの`LRUPromptCache.fetch_nearest_cache(model, tokens)`の第1引数は**モデルオブジェクトではなくハッシュ可能なキー**。`nn.Module`を渡すと`unhashable type: 'Model'`で毎回失敗し、RAM層が黙って無効になる（実際に一度踏んだ）。mlx-lm本体の`server.py`も`model_key`を渡している。
+- ディスクへ保存するprefixは必ず**プロンプト長で頭打ちにする**。`prompt + generated - guard`で計算すると、`max_tokens`が大きいときモデル自身の応答までprefixに入り、以後どの要求とも一致しない1 GB級のsnapshotを書き続ける。
+- adapterから`{"type": "completed"}`を出してはいけない。`server.py`の`lines()`がtool_callsとmetricsを出す**前**に転送されるため、クライアントは`finish_reason: stop`を受けてからtool callを受け取ることになる。finish_reasonは`metrics`イベント経由で`lines()`へ渡し、`lines()`が最終的な`completed`を組み立てる。
+- 切断時の`iterator.close()`は`await`せず`mlx_executor.submit()`で**投げっぱなしにする**。`finally`がCancelledErrorを巻き戻している最中の`await`は次のawaitで再度CancelledErrorになり、closeがスキップされうる。submitならキューに載ることが保証され、単一ワーカーが実行中の`next_event`の直後に走る。
+- APIログの剪定を毎回のINSERTで行うと、全要求が`ORDER BY`つきのDELETEを踏む。100回に1回へ間引き、保持件数は「上限」ではなく「目標」として扱う（テストもその前提で書き直した）。
+
+**次にやるなら**
+
+- mlx-vlmの中断時プロンプトキャッシュは今も全体破棄。部分ロールバック（prefill完了時点へのtrim）ができれば、キャンセルの多いZCode運用でRAM hitを維持できる。`PromptCacheState`にtrim相当のAPIがないため今回は見送った。ディスク層が残るのでcoldには戻らない。
+- 新設定（`wiredLimitRatio`、`cacheLimitRatio`、`promptCache.keepGenerations`、`promptCache.memoryRatio`）はまだGUIに露出していない。`config.json`直接編集か`mlxbarctl`のみ。
+- 27B実機でのメモリ上限到達と長時間連続運転は未実施。
+
 ### ZCodeのlarge tool prefixによるcold prefill遅延（2026-08-21対応）
 - 実機証拠: v1.3.6の直近ZCode要求は`stream=true`、messages 4件、tools 23件、HTTP 200で33.124秒。制御実験では同じQwenをthinking無効・toolsなしでfirst content 0.946秒、23 tools付きで7.506秒となり、thinking強度ではなくtool promptのprefillが差の中心だった。
 - 根本原因: v1.3.6は生成開始後の全量バッファを解消したが、各OpenAI Chat Completions要求を独立生成として`mlx_vlm.stream_generate`へ渡し、ZCodeが毎ターン再送するsystem prompt・tools schema・履歴の同一prefixも毎回先頭から計算していた。27B 8bitの実tool schemaは大きく、first token前のcold prefill中はSSE keep-aliveしか返せない。

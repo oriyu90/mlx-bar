@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import gc
 import json
 import os
+import re
+import resource
+import subprocess
 import threading
 import time
 from collections.abc import Iterator
@@ -15,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
-from .tool_calls import IncrementalToolStream
+from .tool_calls import IncrementalToolStream, StopSequenceFilter
 
 
 GENERATION_HEARTBEAT_SECONDS = 10.0
@@ -24,6 +28,50 @@ GENERATION_HEARTBEAT_SECONDS = 10.0
 # of the worker process.
 CANCEL_RETENTION_SECONDS = 900.0
 CANCEL_MAX_ENTRIES = 256
+# Re-measuring host memory on every token would cost more than it protects
+# against; the pages this reads change on a far slower timescale.
+HOST_MEMORY_CACHE_SECONDS = 2.0
+MEMORY_CHECK_INTERVAL_SECONDS = 5.0
+VM_STAT_PATTERN = re.compile(r"^Pages\s+(free|inactive|speculative|purgeable):\s+(\d+)\.", re.MULTILINE)
+_HOST_MEMORY_CACHE: dict[str, float] = {}
+
+
+def host_memory() -> dict:
+    """Available RAM and the OS's own memory-pressure verdict.
+
+    `SC_AVPHYS_PAGES` does not exist on macOS, so free memory comes from
+    `vm_stat`. `kern.memorystatus_vm_pressure_level` is what macOS itself uses
+    to decide the machine is in trouble (1 normal, 2 warning, 4 critical) and
+    accounts for everything else running, which a ratio against total RAM
+    cannot.
+    """
+    now = time.monotonic()
+    cached = _HOST_MEMORY_CACHE.get("at")
+    if cached is not None and now - cached < HOST_MEMORY_CACHE_SECONDS:
+        return dict(_HOST_MEMORY_CACHE["value"])
+    result = {"available_bytes": 0, "pressure_level": 0, "process_rss_bytes": 0}
+    try:
+        output = subprocess.run(["/bin/ps", "-o", "rss=", "-p", str(os.getpid())],
+                                capture_output=True, text=True, timeout=5).stdout
+        result["process_rss_bytes"] = int(output.strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        output = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True,
+                                timeout=5).stdout
+        pages = sum(int(value) for _, value in VM_STAT_PATTERN.findall(output))
+        result["available_bytes"] = pages * page_size
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        output = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                                capture_output=True, text=True, timeout=5).stdout
+        result["pressure_level"] = int(output.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    _HOST_MEMORY_CACHE.update(at=now, value=dict(result))
+    return result
 
 
 class CancellationRegistry:
@@ -115,7 +163,51 @@ class BaseAdapter:
             result["physical_memory_bytes"] = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
         except (AttributeError, OSError, ValueError):
             result["physical_memory_bytes"] = 0
+        # MLX's own counters miss everything else this process holds, so the
+        # resident size is what bounds the real risk of being killed. It has to
+        # be the *current* size: `ru_maxrss` is a high-water mark that never
+        # falls, so one large prefill would keep every later request above the
+        # limit for the life of the worker.
+        with contextlib.suppress(Exception):
+            result["peak_rss_bytes"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        result.update(host_memory())
         return result
+
+    def apply_memory_limits(self) -> dict:
+        """Pin the weights and cap MLX's allocator cache.
+
+        Without an explicit wired limit macOS will page a large model's weights
+        out under pressure, which turns a fast local model into a swap-bound
+        one. Without a cache limit MLX's reuse pool grows against whatever is
+        free, leaving nothing for the rest of the machine.
+        """
+        applied = {}
+        try:
+            import mlx.core as mx
+        except Exception:
+            return applied
+        physical = 0
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            physical = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        if physical <= 0:
+            return applied
+        for name, variable, default in (("set_wired_limit", "MLXBAR_WIRED_LIMIT_RATIO", 0.0),
+                                        ("set_cache_limit", "MLXBAR_CACHE_LIMIT_RATIO", 0.0)):
+            try:
+                ratio = float(os.environ.get(variable, default))
+            except (TypeError, ValueError):
+                continue
+            if ratio <= 0:
+                continue
+            function = getattr(mx, name, None)
+            if not callable(function):
+                continue
+            # Older MLX builds raise when asked for a limit the kernel refuses;
+            # the model still runs without it, so never fail the load over this.
+            with contextlib.suppress(Exception):
+                function(int(physical * ratio))
+                applied[name] = int(physical * ratio)
+        return applied
 
     def stream(self, request_id: str, params: dict) -> Iterator[dict]:
         raise NotImplementedError
@@ -123,6 +215,28 @@ class BaseAdapter:
     def finalize(self, text: str, params: dict) -> dict:
         """Convert buffered model output into public content/tool calls."""
         return {"text": text, "tool_calls": []}
+
+
+def memory_pressure_reason(adapter: BaseAdapter, limit_ratio: float) -> str | None:
+    """Return a short reason when it is unsafe to keep generating.
+
+    Shared by the worker's in-generation watchdog and the coordinator's
+    pre-flight check so both judge pressure the same way.
+    """
+    memory = adapter.memory_stats()
+    physical = int(memory.get("physical_memory_bytes", 0))
+    if int(memory.get("pressure_level", 0)) >= 4:
+        return "OSがメモリ逼迫を報告"
+    if physical <= 0:
+        return None
+    used = max(int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0)),
+               int(memory.get("process_rss_bytes", 0)))
+    if used / physical >= limit_ratio:
+        return f"MLX使用量が物理メモリの{used / physical:.0%}"
+    available = int(memory.get("available_bytes", 0))
+    if available > 0 and available < physical * (1 - limit_ratio):
+        return f"空きメモリが{available / physical:.0%}"
+    return None
 
 
 def create_app(adapter: BaseAdapter) -> FastAPI:
@@ -143,6 +257,29 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             return True, next(iterator)
         except StopIteration:
             return False, None
+
+    def close_on_mlx_thread(iterator) -> None:
+        """Queue `iterator.close()` on the MLX thread without awaiting it.
+
+        A disconnected client tears `lines()` down with GeneratorExit or
+        CancelledError, and awaiting inside that teardown is unreliable -- the
+        very next await can re-raise CancelledError and skip the close. The
+        adapter generator must still be closed, or `stream_generate` keeps
+        producing tokens for a client that is already gone and occupies the
+        single MLX thread that every later request needs. Submitting the close
+        instead of awaiting it guarantees it is queued; the executor's single
+        worker runs it as soon as the in-flight `next_event` returns.
+        """
+        close = getattr(iterator, "close", None)
+        if not callable(close):
+            return
+
+        def run() -> None:
+            with contextlib.suppress(Exception):
+                close()
+
+        with contextlib.suppress(RuntimeError):
+            mlx_executor.submit(run)
 
     @app.post("/rpc")
     async def rpc(message: dict):
@@ -192,6 +329,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
         params = message.get("params") or {}
 
         async def lines():
+            iterator = None
             try:
                 try:
                     heartbeat_interval = min(30.0, max(0.01, float(
@@ -201,11 +339,18 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 yield json.dumps({"type": "phase", "name": "prefill", "message": "入力を処理中"}, ensure_ascii=False) + "\n"
                 started = time.monotonic()
                 last_visible_event = started
+                try:
+                    memory_limit_ratio = float(params.get("memory_limit_ratio", 0) or 0)
+                except (TypeError, ValueError):
+                    memory_limit_ratio = 0.0
+                last_memory_check = started
                 count = 0
                 upstream_metrics = {}
                 buffered = ""
                 tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
                 tool_stream = IncrementalToolStream() if tool_mode else None
+                stop_filter = StopSequenceFilter(params.get("stop"))
+                stopped = False
                 iterator = adapter.stream(request_id, params)
                 while True:
                     pending = asyncio.create_task(on_mlx_thread(next_event, iterator))
@@ -219,6 +364,22 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     has_event, event = await pending
                     if not has_event:
                         break
+                    # A long prompt plus a long reply grows the KV cache while
+                    # this loop runs, so the coordinator's pre-flight check
+                    # cannot be the only guard. Failing one request beats
+                    # having the OS kill the whole worker.
+                    if (memory_limit_ratio > 0
+                            and time.monotonic() - last_memory_check >= MEMORY_CHECK_INTERVAL_SECONDS):
+                        last_memory_check = time.monotonic()
+                        exceeded = await on_mlx_thread(memory_pressure_reason,
+                                                       adapter, memory_limit_ratio)
+                        if exceeded:
+                            close_on_mlx_thread(iterator)
+                            iterator = None
+                            yield json.dumps({"type": "error", "code": "MEMORY_PRESSURE",
+                                              "message": f"生成中にメモリ安全上限へ達したため停止しました（{exceeded}）",
+                                              "retryable": True}, ensure_ascii=False) + "\n"
+                            return
                     if request_id in adapter.cancelled:
                         adapter.cancelled.discard(request_id)
                         close = getattr(iterator, "close", None)
@@ -230,17 +391,38 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         tool_stream.start_reasoning()
                     elif tool_mode and event.get("type") == "delta":
                         count += 1
-                        buffered += str(event.get("text", ""))
+                        if not stopped:
+                            # Anything past the stop sequence was never sent to
+                            # the client, so it must not produce a tool call
+                            # either.
+                            buffered += str(event.get("text", ""))
                         visible_events = tool_stream.feed(str(event.get("text", "")))
                         for visible in visible_events:
+                            if stop_filter and visible.get("type") == "delta":
+                                text, stopped = stop_filter.feed(str(visible.get("text", "")))
+                                if not text:
+                                    if stopped:
+                                        break
+                                    continue
+                                visible = {**visible, "text": text}
                             yield json.dumps(visible, ensure_ascii=False) + "\n"
                             last_visible_event = time.monotonic()
+                        if stopped:
+                            break
                         if not visible_events and time.monotonic() - last_visible_event >= heartbeat_interval:
                             yield json.dumps({"type": "heartbeat", "phase": "tool_parse",
                                               "elapsed_seconds": round(time.monotonic() - started, 1)}) + "\n"
                             last_visible_event = time.monotonic()
                     elif event.get("type") == "delta":
                         count += 1
+                        if stop_filter:
+                            text, stopped = stop_filter.feed(str(event.get("text", "")))
+                            if text:
+                                yield json.dumps({**event, "text": text}, ensure_ascii=False) + "\n"
+                                last_visible_event = time.monotonic()
+                            if stopped:
+                                break
+                            continue
                         yield json.dumps(event, ensure_ascii=False) + "\n"
                         last_visible_event = time.monotonic()
                     elif event.get("type") == "metrics":
@@ -249,7 +431,16 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         yield json.dumps(event, ensure_ascii=False) + "\n"
                         last_visible_event = time.monotonic()
                 elapsed = max(time.monotonic() - started, 0.001)
-                finish_reason = "stop"
+                # `length` matters to clients deciding whether to continue, so
+                # take the runtime's verdict rather than always claiming "stop".
+                reported = upstream_metrics.get("finish_reason")
+                finish_reason = reported if reported in {"stop", "length"} else "stop"
+                if stopped:
+                    finish_reason = "stop"
+                if stop_filter and not stopped:
+                    trailing = stop_filter.finish()
+                    if trailing:
+                        yield json.dumps({"type": "delta", "text": trailing}, ensure_ascii=False) + "\n"
                 if tool_mode:
                     for visible in tool_stream.finish():
                         yield json.dumps(visible, ensure_ascii=False) + "\n"
@@ -263,12 +454,19 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                                           "retryable": False}, ensure_ascii=False) + "\n"
                         return
                 metrics = {"type": "metrics", "generation_tps": count / elapsed,
-                           **upstream_metrics}
+                           **upstream_metrics, "finish_reason": finish_reason}
                 yield json.dumps(metrics) + "\n"
                 yield json.dumps({"type": "completed", "finish_reason": finish_reason}) + "\n"
             except Exception as exc:
                 yield json.dumps({"type": "error", "code": "GENERATION_FAILED", "message": str(exc)[-1000:],
                                   "retryable": False}, ensure_ascii=False) + "\n"
+            finally:
+                # Reached on normal completion, on error, and -- the case that
+                # matters -- on the GeneratorExit/CancelledError raised when the
+                # client disconnects mid-generation.
+                adapter.cancelled.discard(request_id)
+                if iterator is not None:
+                    close_on_mlx_thread(iterator)
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 

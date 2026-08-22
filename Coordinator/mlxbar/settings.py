@@ -25,8 +25,11 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "runtimes": {
-        "mlx-lm": {"channel": "stable", "autoCheck": True},
-        "mlx-vlm": {"channel": "stable", "autoCheck": True},
+        # Off by default: a runtime that changes underneath a working large
+        # model invalidates the persistent prompt cache and can break a setup
+        # that was fine a moment earlier. Updating stays an explicit action.
+        "mlx-lm": {"channel": "stable", "autoCheck": False},
+        "mlx-vlm": {"channel": "stable", "autoCheck": False},
         "autoInstallMissing": True,
         "checkIntervalHours": 168,
         "keepSlots": 3,
@@ -45,13 +48,17 @@ DEFAULTS: dict[str, Any] = {
         "streamHeartbeatSeconds": 10,
         "maxQueuedRequests": 16,
         "queueTimeoutSeconds": 3600,
-        "totalTimeoutSeconds": 900,
+        "totalTimeoutSeconds": 3600,
         "cancelGraceSeconds": 5,
         "memoryLimitRatio": 0.90,
+        "wiredLimitRatio": 0.80,
+        "cacheLimitRatio": 0.10,
     },
     "promptCache": {
         "diskEnabled": True,
-        "diskMaxGB": 5,
+        "diskMaxGB": 10,
+        "keepGenerations": 2,
+        "memoryRatio": 0.10,
     },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
@@ -85,6 +92,7 @@ class SettingsStore:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "control").mkdir(mode=0o700, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
+        self.recovered_from: str | None = None
         self.data = self._load()
         self._ensure_token()
 
@@ -102,7 +110,12 @@ class SettingsStore:
             return data
         except Exception:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            shutil.copy2(self.path, self.root / f"config.invalid-{stamp}.json")
+            backup = self.root / f"config.invalid-{stamp}.json"
+            shutil.copy2(self.path, backup)
+            # Every setting silently returns to its default here -- LAN access,
+            # port, token limits. Record it so status can say so instead of
+            # leaving the user to discover it through changed behaviour.
+            self.recovered_from = backup.name
             data = deepcopy(DEFAULTS)
             self._atomic_write(data)
             return data
@@ -125,10 +138,18 @@ class SettingsStore:
         prompt_cache = data.get("promptCache", {})
         if not isinstance(prompt_cache.get("diskEnabled", True), bool):
             raise ValueError("promptCache.diskEnabled must be boolean")
-        disk_max_gb = prompt_cache.get("diskMaxGB", 5)
+        disk_max_gb = prompt_cache.get("diskMaxGB", 10)
         if (isinstance(disk_max_gb, bool) or not isinstance(disk_max_gb, (int, float))
                 or not 1 <= float(disk_max_gb) <= 100):
             raise ValueError("promptCache.diskMaxGB must be between 1 and 100")
+        memory_ratio = prompt_cache.get("memoryRatio", 0.10)
+        if (isinstance(memory_ratio, bool) or not isinstance(memory_ratio, (int, float))
+                or not 0 <= float(memory_ratio) <= 0.5):
+            raise ValueError("promptCache.memoryRatio must be between 0 and 0.5")
+        keep_generations = prompt_cache.get("keepGenerations", 2)
+        if (isinstance(keep_generations, bool) or not isinstance(keep_generations, int)
+                or not 1 <= keep_generations <= 10):
+            raise ValueError("promptCache.keepGenerations must be between 1 and 10")
         if allow_lan and not api.get("requireToken", True):
             raise ValueError("LAN公開中はAPIキーを無効にできません")
         if not isinstance(data.get("security", {}).get("allowRemoteImageUrls", False), bool):
@@ -171,6 +192,14 @@ class SettingsStore:
         memory_ratio = generation.get("memoryLimitRatio")
         if not isinstance(memory_ratio, (int, float)) or not 0.5 <= memory_ratio <= 0.99:
             raise ValueError("generation.memoryLimitRatio must be between 0.5 and 0.99")
+        # 0 disables the corresponding MLX limit and keeps the runtime default.
+        for key, maximum in (("wiredLimitRatio", 0.95), ("cacheLimitRatio", 0.5)):
+            value = generation.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not 0 <= float(value) <= maximum):
+                raise ValueError(f"generation.{key} must be between 0 and {maximum}")
+        if float(generation.get("wiredLimitRatio", 0)) > float(memory_ratio):
+            raise ValueError("generation.wiredLimitRatio must not exceed generation.memoryLimitRatio")
 
     def update(self, patch: dict) -> dict:
         merged = deep_merge(self.data, patch)
@@ -195,7 +224,23 @@ class SettingsStore:
 
     @property
     def api_token(self) -> str:
-        return self.token_path.read_text(encoding="utf-8").strip()
+        """Cached token, re-read only when the file actually changes.
+
+        `authorize()` runs on every API request, including each one that then
+        streams tokens, so this used to be a disk read in the event loop on the
+        hot path.
+        """
+        try:
+            stamp = self.token_path.stat().st_mtime_ns
+        except OSError:
+            self._token_cache = None
+            raise
+        cached = getattr(self, "_token_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        value = self.token_path.read_text(encoding="utf-8").strip()
+        self._token_cache = (stamp, value)
+        return value
 
     def regenerate_token(self) -> str:
         token = secrets.token_urlsafe(32)

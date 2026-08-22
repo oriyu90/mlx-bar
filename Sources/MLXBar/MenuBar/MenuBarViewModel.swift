@@ -295,8 +295,13 @@ final class MenuBarViewModel: ObservableObject {
         loadingModelName = nil; loadingEngine = nil; loadingPhase = nil; loadingStartedAt = nil
     }
 
-    func unload() async {
-        await perform { _ = try await self.json("DELETE", "/api/v1/models/loaded"); await self.refreshStatus() }
+    func unload(force: Bool = false) async {
+        // The coordinator refuses while generations are in flight so a ZCode
+        // request is never failed by a stray click. The GUI is the one caller
+        // that can ask a person, so it offers the override rather than
+        // bypassing the guard by default.
+        let path = force ? "/api/v1/models/loaded?force=true" : "/api/v1/models/loaded"
+        await perform { _ = try await self.json("DELETE", path); await self.refreshStatus() }
     }
 
     func generate(prompt: String, images: [URL], temperature: Double = 0.7, maxTokens: Int = 512) async {

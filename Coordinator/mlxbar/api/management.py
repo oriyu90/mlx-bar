@@ -39,7 +39,8 @@ async def status(request: Request):
                     "url": lan_urls[0] if lan_enabled and lan_urls else local_url,
                     "localUrl": local_url, "lanUrls": lan_urls if lan_enabled else [],
                     "lanEnabled": lan_enabled,
-                    "error": app.public_listener_error}}
+                    "error": app.public_listener_error},
+            "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
 
 
 @router.get("/models")
@@ -61,12 +62,33 @@ async def probe(model_id: str, request: Request):
             "requiresRemoteCode": False}
 
 
+def _raise_if_generations_in_flight(app, force: bool, action: str) -> None:
+    """Refuse to swap the model out from under requests that need it.
+
+    Both a running generation and a queued one resolve against the model that
+    is loaded now; replacing it mid-flight fails them with an error the caller
+    never asked for. `force` is the GUI's explicit "do it anyway" path."""
+    if force:
+        return
+    active = len(getattr(app.workers, "active_requests", {}) or {})
+    queued = len(getattr(app.workers, "queued_requests", {}) or {})
+    if active or queued:
+        raise HTTPException(409, detail={
+            "code": "ENGINE_BUSY",
+            "message": f"実行中{active}件、待機中{queued}件の生成があるため{action}できません。"
+                       "完了を待つか、強制実行を指定してください",
+            "retryable": True,
+            "activeRequestCount": active, "queuedRequestCount": queued,
+        })
+
+
 @router.post("/models/{model_id:path}/load")
 async def load(model_id: str, request: Request, body: dict = Body(default_factory=dict)):
     app = state(request)
     model = app.database.get_model(model_id)
     if not model:
         raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND"})
+    _raise_if_generations_in_flight(app, bool(body.get("force", False)), "モデルを切り替え")
     try:
         loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None)
         app.database.set_metadata_value("last_loaded_model_id", model["id"])
@@ -77,8 +99,9 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
 
 
 @router.delete("/models/loaded")
-async def unload(request: Request):
+async def unload(request: Request, force: bool = False):
     app = state(request)
+    _raise_if_generations_in_flight(app, force, "モデルを解放")
     result = await app.workers.unload()
     app.database.set_metadata_value("api_autoload_suspended", "1")
     return result

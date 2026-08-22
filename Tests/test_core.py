@@ -71,12 +71,15 @@ class SettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))
             self.assertTrue(store.data["promptCache"]["diskEnabled"])
-            self.assertEqual(store.data["promptCache"]["diskMaxGB"], 5)
-            updated = store.update({"promptCache": {"diskEnabled": False, "diskMaxGB": 10}})
+            self.assertEqual(store.data["promptCache"]["diskMaxGB"], 10)
+            self.assertEqual(store.data["promptCache"]["keepGenerations"], 2)
+            updated = store.update({"promptCache": {"diskEnabled": False, "diskMaxGB": 20}})
             self.assertFalse(updated["promptCache"]["diskEnabled"])
-            self.assertEqual(updated["promptCache"]["diskMaxGB"], 10)
+            self.assertEqual(updated["promptCache"]["diskMaxGB"], 20)
             with self.assertRaisesRegex(ValueError, "diskMaxGB"):
                 store.update({"promptCache": {"diskMaxGB": 0}})
+            with self.assertRaisesRegex(ValueError, "keepGenerations"):
+                store.update({"promptCache": {"keepGenerations": 0}})
 
     def test_lan_access_requires_matching_host_and_api_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -157,3 +160,41 @@ class CLITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V150SettingsTests(unittest.TestCase):
+    def test_runtime_auto_check_is_off_by_default(self):
+        """A runtime that changes under a working large model is not a feature."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertFalse(store.data["runtimes"]["mlx-lm"]["autoCheck"])
+            self.assertFalse(store.data["runtimes"]["mlx-vlm"]["autoCheck"])
+
+    def test_memory_limit_ratios_are_validated_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["generation"]["wiredLimitRatio"], 0.80)
+            self.assertEqual(store.data["generation"]["cacheLimitRatio"], 0.10)
+            # 0 keeps the runtime default rather than being rejected.
+            store.update({"generation": {"wiredLimitRatio": 0, "cacheLimitRatio": 0}})
+            with self.assertRaisesRegex(ValueError, "wiredLimitRatio"):
+                store.update({"generation": {"wiredLimitRatio": 0.99}})
+            # Pinning more than the safety limit allows would defeat the limit.
+            with self.assertRaisesRegex(ValueError, "wiredLimitRatio"):
+                store.update({"generation": {"wiredLimitRatio": 0.95, "memoryLimitRatio": 0.9}})
+
+    def test_total_timeout_default_fits_a_long_local_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["generation"]["totalTimeoutSeconds"], 3600)
+
+    def test_corrupt_settings_recovery_is_recorded_not_silent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            SettingsStore(root)
+            (root / "config.json").write_text("{ this is not json", encoding="utf-8")
+            store = SettingsStore(root)
+            self.assertIsNotNone(store.recovered_from)
+            self.assertTrue(store.recovered_from.startswith("config.invalid-"))
+            self.assertTrue((root / store.recovered_from).exists())
+            self.assertEqual(store.data["api"]["port"], 11435)
