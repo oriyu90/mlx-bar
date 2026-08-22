@@ -12,7 +12,9 @@ from typing import Any
 
 DEFAULTS: dict[str, Any] = {
     "schemaVersion": 1,
-    "api": {"enabled": True, "host": "127.0.0.1", "port": 11435, "requireToken": True},
+    "api": {"enabled": True, "host": "127.0.0.1", "port": 11435, "requireToken": True,
+            # 0 derives the ceiling from the generation limits below.
+            "maxRequestBytes": 0, "maxConcurrentConnections": 64},
     "models": {
         "watchFolders": True,
         "autoLoadOnAPIRequest": True,
@@ -157,6 +159,14 @@ class SettingsStore:
         port = api.get("port")
         if not isinstance(port, int) or not 1024 <= port <= 65535:
             raise ValueError("port must be between 1024 and 65535")
+        max_request_bytes = api.get("maxRequestBytes", 0)
+        if (isinstance(max_request_bytes, bool) or not isinstance(max_request_bytes, int)
+                or not 0 <= max_request_bytes <= 4_294_967_296):
+            raise ValueError("api.maxRequestBytes must be between 0 and 4294967296")
+        connections = api.get("maxConcurrentConnections", 64)
+        if (isinstance(connections, bool) or not isinstance(connections, int)
+                or not 1 <= connections <= 1024):
+            raise ValueError("api.maxConcurrentConnections must be between 1 and 1024")
         if not isinstance(data.get("models", {}).get("autoLoadOnAPIRequest"), bool):
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
         if data.get("general", {}).get("language") not in {"en", "ja"}:

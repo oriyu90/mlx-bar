@@ -706,3 +706,46 @@ class V150HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.get_job(job["id"])["state"], "completed")
         self.assertNotIn(job["id"], manager.queues)
         database.close()
+
+
+class LiveGenerationRateTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.settings = SettingsStore(self.root)
+
+    async def asyncTearDown(self):
+        self.temporary.cleanup()
+
+    def _supervisor_with_active_request(self):
+        supervisor = WorkerSupervisor(self.root, self.settings)
+        supervisor.loaded = {"id": "m", "name": "m", "engine": "mlx-vlm"}
+        control = ActiveRequest(asyncio.Event(), asyncio.Event(), None, "mlx-vlm")
+        supervisor.active_requests["r1"] = control
+        return supervisor, control
+
+    async def test_status_reports_the_rate_while_generating(self):
+        supervisor, control = self._supervisor_with_active_request()
+        self.assertNotIn("generationTokensPerSecond", supervisor.status())
+
+        supervisor._record_progress(control, {"generated_tokens": 128, "generation_tps": 37.44})
+        status = supervisor.status()
+        self.assertEqual(status["generationTokensPerSecond"], 37.4)
+        self.assertEqual(status["generatedTokens"], 128)
+
+    async def test_a_stale_rate_is_not_reported_as_current(self):
+        supervisor, control = self._supervisor_with_active_request()
+        supervisor._record_progress(control, {"generated_tokens": 10, "generation_tps": 12.0})
+        control.progress_at -= 120
+        self.assertNotIn("generationTokensPerSecond", supervisor.status())
+
+    async def test_a_progress_event_without_a_rate_reports_nothing(self):
+        supervisor, control = self._supervisor_with_active_request()
+        supervisor._record_progress(control, {"generated_tokens": 5, "generation_tps": None})
+        self.assertNotIn("generationTokensPerSecond", supervisor.status())
+
+    async def test_status_never_raises_on_an_unexpected_active_entry(self):
+        """`status()` is polled once a second by the menu bar."""
+        supervisor = WorkerSupervisor(self.root, self.settings)
+        supervisor.active_requests["odd"] = object()
+        self.assertEqual(supervisor.status()["activeRequestCount"], 1)

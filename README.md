@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.5.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.5.3 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -39,7 +39,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.5.2.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.5.3.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -78,6 +78,8 @@ Developer ID署名・公証済みの正式配布版では、手順3は通常不�
 - 「キャッシュ」設定: 永続プロンプトキャッシュの有効化、容量上限、使用量確認、RAM／ディスクキャッシュの個別消去、古いキャッシュ世代の自動回収
 
 モデルのロード中は、対象モデル名、エンジン、現在段階、経過秒数をモデル画面とメニューバーに表示します。完了後は「モデル名をコピー」またはメニューバーのコピーボタンから、読み込み済みモデル名をクリップボードへコピーできます。
+
+生成中は「モデルが応答を生成中」の下に、その時点のトークン毎秒を表示します。ZCodeやLAN内の別PCから届いた要求でも表示されます。値はランタイム自身が各トークンで計算しているもの（prefillを除外した最初のトークンからの平均）で、ランタイムが提供しない場合はWorker側の実測に切り替わります。最初の数トークンは分母がほぼ0で無意味な値になるため表示しません。
 
 メニューバーを開いている間は1秒間隔で状態を更新します。ZCodeやLAN内の別PCからリクエストを処理している間は「モデルが応答を生成中」、並列要求がある場合は待機件数、生成要求がなくロード済みの場合は「待機中」と表示します。外部API経由の生成でもメニューバーアイコンと表示が切り替わります。
 
@@ -226,6 +228,14 @@ v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻�
 
 「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GB（既定10 GB）の容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
 
+### 公開APIの入口
+
+v1.5.3では、認証を本文の解析より前で行います。以前はFastAPIがハンドラ引数の`body`を先に解釈していたため、資格情報を持たない相手でも送った分だけメモリを確保させられました（認証なし40MB×24並列で60→1,822MB）。現在は同じ条件で60→69MBに収まります。
+
+要求サイズの上限は設定から算出します。`generation.maxPromptCharacters`×4（UTF-8最悪）と`generation.maxImages`×`generation.maxImageBytes`×4/3（base64）の合計に1MBを加えた値で、既定設定では約281MBです。画像8枚をdata URIで送る要求は正当に280MBへ達しうるため、固定値では壊れてしまいます。`Content-Length`が上限を超える要求は本文を読まずにHTTP 413で拒否し、`Transfer-Encoding: chunked`では受信量が上限に達した時点で打ち切ります。画像入力を使わない場合は`api.maxRequestBytes`へ明示値を設定すると上限を下げられます。
+
+同時接続数は`api.maxConcurrentConnections`（既定64）で頭打ちにします。超過分はHTTP 503です。`/health`は監視用に認証不要のままです。認証失敗はAPIログへ`AUTHENTICATION_FAILED`として記録されます。
+
 ### メモリ安全性
 
 大きなモデルをメモリに載せたまま長時間動かすため、v1.5.0では3段階で保護します。
@@ -320,7 +330,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.5.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.5.3.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

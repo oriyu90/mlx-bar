@@ -266,7 +266,7 @@ async def chat(request: Request, body: dict):
                                 request.state.api_log[key] = event[key]
                     elif event.get("type") == "tool_support":
                         request.state.api_log["tool_support"] = event.get("state")
-                    elif event.get("type") in {"phase", "heartbeat", "queue"}:
+                    elif event.get("type") in {"phase", "heartbeat", "queue", "progress"}:
                         # SSE comments are ignored by OpenAI clients, but keep the
                         # connection alive during long tokenization/prefill.
                         yield ": mlxbar keep-alive\n\n"

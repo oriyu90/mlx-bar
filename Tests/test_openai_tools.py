@@ -669,3 +669,36 @@ def test_degraded_tool_support_is_recorded_in_the_api_log():
         assert rows[1]["tool_support"] == "degraded"
         assert rows[0]["tool_support"] is None
         database.close()
+
+
+class ProgressWorker:
+    loaded = {"id": "m", "name": "m", "engine": "mlx-vlm"}
+    active_requests: dict = {}
+    queued_requests: dict = {}
+
+    async def generate(self, *_args, **_kwargs):
+        yield {"type": "progress", "generated_tokens": 40, "generation_tps": 33.2,
+               "elapsed_seconds": 1.2}
+        yield {"type": "delta", "text": "hello"}
+        yield {"type": "completed", "finish_reason": "stop"}
+
+
+def test_progress_keeps_the_stream_alive_without_entering_the_reply():
+    """The rate is for the menu bar; a client must never see it as content."""
+    state = SimpleNamespace(settings=SimpleNamespace(data={"api": {"requireToken": False},
+                                                           "generation": {}}),
+                            workers=ProgressWorker())
+    with TestClient(make_public_app(state)) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "m", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    assert ": mlxbar keep-alive" in response.text
+    assert "generated_tokens" not in response.text
+    assert "generation_tps" not in response.text
+    content = "".join(
+        json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and "[DONE]" not in line
+        and json.loads(line[6:]).get("choices"))
+    assert content == "hello"

@@ -106,6 +106,10 @@ def test_long_prefill_emits_heartbeats_before_first_token():
 class SlowBufferedToolAdapter(ThreadBoundAdapter):
     def stream(self, request_id: str, params: dict):
         for text in ("<tool", "_call>", "read", "</tool_call>"):
+            # Deliberately shorter than the 0.03 s heartbeat the test configures.
+            # A longer gap lets the prefill heartbeat fire in between, and that
+            # resets `last_visible_event`, which is what the tool_parse
+            # heartbeat measures against -- making the assertion a race.
             time.sleep(0.02)
             yield {"type": "delta", "text": text}
 
@@ -589,7 +593,7 @@ def test_mlx_vlm_apc_failure_retries_once_without_disk_cache():
     assert manager.closed is True
     assert adapter.apc_manager is None
     assert adapter.apc_disabled_reason == "runtime_failed:RuntimeError"
-    assert events[0] == {"type": "delta", "text": "recovered"}
+    assert events[0]["type"] == "delta" and events[0]["text"] == "recovered"
     assert events[-1]["cache_tier"] == "cold"
 
 
@@ -651,7 +655,7 @@ def test_mlx_vlm_broken_apc_stats_do_not_break_generation():
     adapter.apc_manager = Manager()
     with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
         events = list(adapter.stream("request", {"prompt": "hello"}))
-    assert events[0] == {"type": "delta", "text": "ok"}
+    assert events[0]["type"] == "delta" and events[0]["text"] == "ok"
     assert events[-1]["cache_tier"] == "cold"
 
 
@@ -1004,8 +1008,8 @@ def test_prompt_cache_rollback_failure_retries_instead_of_failing_the_request():
     with patch.dict(sys.modules, {"mlx_vlm": mlx_vlm, "mlx_vlm.prompt_utils": prompt_utils}):
         events = list(adapter.stream("request", {"prompt": "hello"}))
     assert attempts["count"] == 2, "the failed attempt was not retried"
-    assert [event for event in events if event.get("type") == "delta"] == [
-        {"type": "delta", "text": "recovered"}]
+    deltas = [event for event in events if event.get("type") == "delta"]
+    assert [event["text"] for event in deltas] == ["recovered"]
     assert adapter.prompt_cache_reuse_failures == 1
 
 
@@ -1078,3 +1082,115 @@ def test_genuine_model_errors_are_not_retried_as_cache_failures():
             raise AssertionError("a genuine model error must surface")
     assert attempts["count"] == 1
     assert adapter.prompt_cache_reuse_failures == 0
+
+
+# --------------------------------------------------------------------------
+# v1.5.3: live generation rate
+# --------------------------------------------------------------------------
+
+
+class SilentUntilTheEndAdapter(ThreadBoundAdapter):
+    """Reproduces a real runtime behaviour: no text until the very end.
+
+    `Qwen3.5-9B-MLX-8bit` held 111 tokens in its detokenizer and emitted one
+    delta after 14 seconds. Anything that measures the rate by counting deltas
+    reports nothing at all for such a model.
+    """
+
+    def stream(self, request_id: str, params: dict):
+        from mlx_vlm_worker.adapter import _ProgressTicker, _live_progress
+        ticker = _ProgressTicker(params)
+        # Must outlast the ticker's 0.5 s floor several times over, or the
+        # generation finishes before a single tick is due.
+        for index in range(60):
+            time.sleep(0.03)
+            response = SimpleNamespace(generation_tokens=index + 1,
+                                       generation_tps=25.0 + index)
+            if index < 59:
+                if ticker.due():
+                    yield {"type": "token_progress", **_live_progress(response)}
+            else:
+                yield {"type": "delta", "text": "all of it at once",
+                       **_live_progress(response)}
+
+
+def test_generation_rate_is_reported_even_when_no_text_is_emitted():
+    adapter = SilentUntilTheEndAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "silent", "params": {
+            "prompt": "hi", "heartbeat_interval_seconds": 0.5}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    progress = [event for event in events if event.get("type") == "progress"]
+    assert progress, "no progress reported for a runtime that batches its output"
+    assert progress[-1]["generated_tokens"] >= 3
+    assert progress[-1]["generation_tps"] > 0
+    # The worker's internal tick must not reach the coordinator.
+    assert not [event for event in events if event.get("type") == "token_progress"]
+
+
+class FastRateAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        from mlx_vlm_worker.adapter import _live_progress
+        for index in range(8):
+            time.sleep(0.02)
+            # The runtimes divide by elapsed-since-first-token, so their very
+            # first sample is nonsense; it must never be published.
+            response = SimpleNamespace(generation_tokens=index + 1,
+                                       generation_tps=57280.36 if index == 0 else 40.0)
+            yield {"type": "delta", "text": f"t{index}", **_live_progress(response)}
+
+
+def test_the_runtimes_bogus_first_rate_sample_is_never_published():
+    adapter = FastRateAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "fast", "params": {
+            "prompt": "hi", "heartbeat_interval_seconds": 0.05}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    rates = [event["generation_tps"] for event in events if event.get("type") == "progress"]
+    assert rates, "expected progress events"
+    assert max(rates) < 1000, rates
+
+
+class NoRuntimeCountersAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        for index in range(8):
+            time.sleep(0.02)
+            yield {"type": "delta", "text": f"t{index}"}
+
+
+def test_rate_still_works_when_the_runtime_reports_no_counters():
+    """A future runtime may rename or drop these fields; that must not break it."""
+    adapter = NoRuntimeCountersAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "nocounters", "params": {
+            "prompt": "hi", "heartbeat_interval_seconds": 0.05}})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    progress = [event for event in events if event.get("type") == "progress"]
+    assert progress, "the worker must fall back to measuring the rate itself"
+    assert progress[-1]["generation_tps"] > 0
+
+
+def test_live_progress_ignores_anything_it_does_not_recognise():
+    from mlx_vlm_worker.adapter import _live_progress
+
+    assert _live_progress(SimpleNamespace(generation_tokens=42, generation_tps=37.4)) == {
+        "tokens": 42, "tps": 37.4}
+    assert _live_progress(SimpleNamespace()) == {}
+    assert _live_progress(SimpleNamespace(generation_tokens="x", generation_tps=None)) == {}
+    assert _live_progress(SimpleNamespace(generation_tokens=0, generation_tps=0.0)) == {"tokens": 0}
+
+
+def test_progress_ticker_throttles_and_clamps_its_interval():
+    from mlx_vlm_worker.adapter import _ProgressTicker
+
+    # Half a second is the floor: ticking faster would cost more than the
+    # display it feeds is worth.
+    assert _ProgressTicker({"heartbeat_interval_seconds": 0.001}).interval == 0.5
+    assert _ProgressTicker({"heartbeat_interval_seconds": 999}).interval == 30.0
+    assert _ProgressTicker({"heartbeat_interval_seconds": "nonsense"}).interval == 10.0
+
+    ticker = _ProgressTicker({"heartbeat_interval_seconds": 0.5})
+    assert ticker.due() is False
+    time.sleep(0.55)
+    assert ticker.due() is True
+    assert ticker.due() is False

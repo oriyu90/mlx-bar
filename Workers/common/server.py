@@ -32,6 +32,10 @@ CANCEL_MAX_ENTRIES = 256
 # against; the pages this reads change on a far slower timescale.
 HOST_MEMORY_CACHE_SECONDS = 2.0
 MEMORY_CHECK_INTERVAL_SECONDS = 5.0
+# The runtimes compute tokens-per-second as (n + 1) / elapsed-since-first-token,
+# so the very first sample divides by roughly zero and reads in the tens of
+# thousands. Wait for a few tokens before reporting anything.
+MIN_PROGRESS_TOKENS = 3
 VM_STAT_PATTERN = re.compile(r"^Pages\s+(free|inactive|speculative|purgeable):\s+(\d+)\.", re.MULTILINE)
 _HOST_MEMORY_CACHE: dict[str, float] = {}
 
@@ -351,6 +355,10 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 tool_stream = IncrementalToolStream() if tool_mode else None
                 stop_filter = StopSequenceFilter(params.get("stop"))
                 stopped = False
+                live_tokens = 0
+                live_tps = None
+                first_delta_at = None
+                last_progress = started
                 iterator = adapter.stream(request_id, params)
                 while True:
                     pending = asyncio.create_task(on_mlx_thread(next_event, iterator))
@@ -380,6 +388,36 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                                               "message": f"生成中にメモリ安全上限へ達したため停止しました（{exceeded}）",
                                               "retryable": True}, ensure_ascii=False) + "\n"
                             return
+                    if event.get("type") in {"delta", "token_progress"}:
+                        # `token_progress` carries the same counters for tokens
+                        # that produced no text: a runtime may hold a whole reply
+                        # in its detokenizer and emit one delta at the very end,
+                        # so counting deltas alone would report nothing.
+                        # Read before the tool filter, which rebuilds events and
+                        # would otherwise drop the counters on that path.
+                        if first_delta_at is None:
+                            first_delta_at = time.monotonic()
+                        reported = event.get("tokens")
+                        live_tokens = reported if isinstance(reported, int) else live_tokens + 1
+                        rate = event.get("tps")
+                        if isinstance(rate, (int, float)) and rate > 0:
+                            live_tps = float(rate)
+                        else:
+                            # The runtime no longer reports a rate: measure it here
+                            # so the display keeps working across runtime changes.
+                            span = time.monotonic() - first_delta_at
+                            live_tps = (live_tokens / span) if span > 0.05 else None
+                    if (live_tokens >= MIN_PROGRESS_TOKENS
+                            and time.monotonic() - last_progress >= heartbeat_interval):
+                        # Deliberately does not touch `last_visible_event`: that
+                        # timer drives the tool_parse heartbeat, which exists to
+                        # keep the client's connection alive while tool markup is
+                        # being buffered. Progress is a separate, status-only
+                        # signal and must not starve it.
+                        last_progress = time.monotonic()
+                        yield json.dumps({"type": "progress", "generated_tokens": live_tokens,
+                                          "generation_tps": round(live_tps, 2) if live_tps else None,
+                                          "elapsed_seconds": round(last_progress - started, 1)}) + "\n"
                     if request_id in adapter.cancelled:
                         adapter.cancelled.discard(request_id)
                         close = getattr(iterator, "close", None)
@@ -387,6 +425,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                             await on_mlx_thread(close)
                         yield json.dumps({"type": "completed", "finish_reason": "cancelled"}) + "\n"
                         return
+                    if event.get("type") == "token_progress":
+                        # Internal to the worker; `lines()` publishes its own
+                        # throttled `progress` instead. Checked after
+                        # cancellation, because a model that emits no text for a
+                        # while makes these the only events in the loop.
+                        continue
                     if tool_mode and event.get("type") == "reasoning_start":
                         tool_stream.start_reasoning()
                     elif tool_mode and event.get("type") == "delta":

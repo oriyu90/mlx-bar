@@ -11,8 +11,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Coordinator"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Workers"))
@@ -20,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Workers"))
 from mlxbar.api.images import resolve_public_images  # noqa: E402
 from mlxbar.errors import MLXBarError  # noqa: E402
 from mlxbar.runtimes.updater import RuntimeUpdater  # noqa: E402
+from mlxbar.database import Database  # noqa: E402
+from mlxbar.main import make_public_app, max_request_bytes  # noqa: E402
 from mlxbar.settings import SettingsStore  # noqa: E402
 from mlxbar.workers.supervisor import WorkerSupervisor  # noqa: E402
 
@@ -354,3 +358,96 @@ def test_worker_socket_permissions_are_applied_at_startup_not_shutdown():
     chmod = source.index("os.chmod(args.socket", startup)
     run_call = source.index("uvicorn.run(app", startup)
     assert chmod < run_call, "the socket must be tightened before uvicorn starts serving"
+
+
+# --------------------------------------------------------------------------
+# v1.5.3: nothing is parsed before the caller is authorised
+# --------------------------------------------------------------------------
+
+
+def _guarded_client(**settings_patch):
+    directory = tempfile.mkdtemp()
+    root = Path(directory)
+    settings = SettingsStore(root)
+    if settings_patch:
+        settings.update(settings_patch)
+    state = SimpleNamespace(settings=settings, workers=WorkerSupervisor(root, settings),
+                            database=Database(root / "state.sqlite3"))
+    return TestClient(make_public_app(state)), settings, state
+
+
+def test_request_body_is_not_parsed_before_authentication():
+    """An unauthenticated caller must not be able to allocate anything.
+
+    FastAPI resolves `body: dict` before the handler runs, so `authorize()`
+    inside the handler was only reached after the whole request had been read
+    and turned into Python objects.
+    """
+    client, settings, state = _guarded_client()
+    token = settings.api_token
+    payload = {"model": "m", "messages": [{"role": "user", "content": "hi" * 1000}]}
+
+    unauthenticated = client.post("/v1/chat/completions", json=payload)
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["error"]["code"] == "AUTHENTICATION_FAILED"
+
+    # Malformed JSON is the tell: if the body were still parsed first it would
+    # come back as 422 rather than 401.
+    malformed = client.post("/v1/chat/completions", content=b"{ not json",
+                            headers={"Content-Type": "application/json"})
+    assert malformed.status_code == 401
+
+    authorized = client.post("/v1/chat/completions", json=payload,
+                             headers={"Authorization": f"Bearer {token}"})
+    assert authorized.status_code != 401
+    state.database.close()
+
+
+def test_health_stays_reachable_without_a_token():
+    client, _settings, state = _guarded_client()
+    assert client.get("/health").status_code == 200
+    state.database.close()
+
+
+def test_token_free_installations_are_not_blocked_by_the_guard():
+    client, _settings, state = _guarded_client(api={"requireToken": False})
+    assert client.post("/v1/chat/completions", json={"model": "m", "messages": []}).status_code == 422
+    state.database.close()
+
+
+def test_oversized_requests_are_refused_before_the_body_is_read():
+    client, settings, state = _guarded_client()
+    token = settings.api_token
+    limit = max_request_bytes(settings)
+    response = client.post("/v1/chat/completions", content=b"{}",
+                           headers={"Authorization": f"Bearer {token}",
+                                    "Content-Type": "application/json",
+                                    "Content-Length": str(limit + 1)})
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "INPUT_TOO_LARGE"
+    state.database.close()
+
+
+def test_the_largest_legal_request_is_not_pre_rejected():
+    """Eight 25 MiB images as base64 is a legal request worth ~280 MB.
+
+    A fixed body cap would break image input outright, so the ceiling has to
+    follow the same settings the handlers enforce.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        settings = SettingsStore(Path(directory))
+        generation = settings.data["generation"]
+        legal = (generation["maxImages"] * generation["maxImageBytes"] * 4 // 3
+                 + generation["maxPromptCharacters"] * 4)
+        assert max_request_bytes(settings) > legal
+        # An explicit override wins, for installations that never send images.
+        settings.update({"api": {"maxRequestBytes": 16 * 1024 * 1024}})
+        assert max_request_bytes(settings) == 16 * 1024 * 1024
+
+
+def test_request_ceiling_survives_incomplete_settings():
+    """This runs on every request; a malformed file must not become a 500."""
+    assert max_request_bytes(SimpleNamespace(data={})) > 0
+    assert max_request_bytes(SimpleNamespace(data={"api": {}, "generation": {}})) > 0
+    assert max_request_bytes(SimpleNamespace(data={"generation": {"maxImages": "x"}})) > 0
+    assert max_request_bytes(SimpleNamespace()) > 0
