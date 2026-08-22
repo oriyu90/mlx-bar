@@ -33,12 +33,19 @@ class WorkerStalled(Exception):
         self.seconds = seconds
 
 
+# Older than this and a reported rate says more about the past than the present.
+PROGRESS_FRESHNESS_SECONDS = 30.0
+
+
 @dataclass
 class ActiveRequest:
     done: asyncio.Event
     cancel_requested: asyncio.Event
     task: asyncio.Task | None
     engine: str
+    generated_tokens: int = 0
+    generation_tps: float | None = None
+    progress_at: float = 0.0
 
 
 @dataclass
@@ -509,7 +516,10 @@ class WorkerSupervisor:
                         response.raise_for_status()
                         async for line in self._lines_with_idle_timeout(response.aiter_lines(), idle_timeout):
                             if line:
-                                yield json.loads(line)
+                                event = json.loads(line)
+                                if event.get("type") == "progress":
+                                    self._record_progress(control, event)
+                                yield event
                 completed_cleanly = True
         except WorkerStalled as exc:
             # No token and no heartbeat for the idle budget: the worker itself
@@ -540,6 +550,33 @@ class WorkerSupervisor:
                 # The client went away mid-stream. Tell the worker so it stops
                 # at the next token instead of finishing a reply nobody reads.
                 self._notify_worker_cancelled(request_id)
+
+    @staticmethod
+    def _record_progress(control: ActiveRequest | None, event: dict) -> None:
+        """Keep the newest live rate so status can show it while generating."""
+        if control is None:
+            return
+        tokens = event.get("generated_tokens")
+        if isinstance(tokens, int) and tokens >= 0:
+            control.generated_tokens = tokens
+        rate = event.get("generation_tps")
+        control.generation_tps = float(rate) if isinstance(rate, (int, float)) and rate > 0 else None
+        control.progress_at = time.monotonic()
+
+    def _live_generation(self) -> dict:
+        """Current tokens-per-second, or empty when there is nothing to report.
+
+        Reached from `status()`, which the menu bar polls every second, so this
+        reports nothing rather than raising if a request has no rate yet.
+        """
+        now = time.monotonic()
+        for control in list(self.active_requests.values()):
+            rate = getattr(control, "generation_tps", None)
+            stamp = getattr(control, "progress_at", 0.0) or 0.0
+            if rate and now - stamp <= PROGRESS_FRESHNESS_SECONDS:
+                return {"generationTokensPerSecond": round(float(rate), 1),
+                        "generatedTokens": int(getattr(control, "generated_tokens", 0) or 0)}
+        return {}
 
     def _notify_worker_cancelled(self, request_id: str) -> None:
         """Best-effort cancel RPC for a stream the client abandoned.
@@ -982,7 +1019,8 @@ class WorkerSupervisor:
                 "oldestQueuedSeconds": self._oldest_queued_seconds(),
                 "generationLockState": self._generation_lock_state(),
                 "generationLockRecoveries": self.generation_lock_recoveries,
-                "maintenanceEngines": sorted(self.maintenance_engines)}
+                "maintenanceEngines": sorted(self.maintenance_engines),
+                **self._live_generation()}
 
     def _generation_lock_state(self) -> str:
         if not self.generation_lock.locked():

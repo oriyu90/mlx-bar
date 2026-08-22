@@ -119,6 +119,10 @@ final class MenuBarViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var chatOutput = ""
     @Published var generationTPS: Double?
+    /// Tokens per second of the generation currently running, from the status
+    /// poll rather than from a stream this GUI owns -- so it also reflects work
+    /// arriving from ZCode or another machine on the LAN.
+    @Published var liveGenerationTPS: Double?
     @Published var currentRequestID: String?
     @Published var cancellationInProgress = false
     @Published var cancellationStatus: String?
@@ -221,6 +225,7 @@ final class MenuBarViewModel: ObservableObject {
             setIfChanged(\.activeRequestCount, (json["activeRequestCount"] as? NSNumber)?.intValue ?? 0)
             setIfChanged(\.queuedRequestCount, (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0)
             setIfChanged(\.oldestQueuedSeconds, (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0)
+            setIfChanged(\.liveGenerationTPS, (json["generationTokensPerSecond"] as? NSNumber)?.doubleValue)
             if let loaded = json["loadedModel"] as? [String: Any] {
                 setIfChanged(\.loadedName, loaded["name"] as? String)
                 setIfChanged(\.loadedEngine, loaded["engine"] as? String)
@@ -234,6 +239,7 @@ final class MenuBarViewModel: ObservableObject {
                 setIfChanged(\.loadedModelMaxTokens, nil); setIfChanged(\.effectiveMaxTokens, configuredMaxTokens)
                 setIfChanged(\.effectiveMaxPromptCharacters, 100000); setIfChanged(\.activeRequestCount, 0)
                 setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
+                setIfChanged(\.liveGenerationTPS, nil)
             }
             if let loading = json["loadingModel"] as? [String: Any] {
                 setIfChanged(\.loadingModelName, loading["name"] as? String)
@@ -258,6 +264,7 @@ final class MenuBarViewModel: ObservableObject {
             setIfChanged(\.serviceStatus, guiLanguage == "ja" ? "サービス停止" : "Service stopped")
             setIfChanged(\.activeRequestCount, 0)
             setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
+            setIfChanged(\.liveGenerationTPS, nil)
             setIfChanged(\.errorMessage, error.localizedDescription)
         }
     }
@@ -556,6 +563,17 @@ final class MenuBarViewModel: ObservableObject {
 
     var configuredRepetitionContextSize: Int {
         (((settings["generation"] as? [String: Any])?["repetitionContextSize"] as? NSNumber)?.intValue) ?? 20
+    }
+
+    /// Rate shown under the activity line, or nil when there is nothing to show.
+    ///
+    /// Coarser above 10 tok/s on purpose: the value refreshes every second, and
+    /// a digit that changes on every poll is exactly the content churn that
+    /// destabilises `MenuBarExtra`'s window style (see mlx-bar.md).
+    var generationRateText: String? {
+        guard activeRequestCount > 0, let rate = liveGenerationTPS, rate > 0 else { return nil }
+        let value = rate >= 10 ? String(Int(rate.rounded())) : String(format: "%.1f", rate)
+        return guiLanguage == "ja" ? "\(value) tok/秒" : "\(value) tok/s"
     }
 
     var modelActivityText: String {

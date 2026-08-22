@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import time
 
 from common.server import BaseAdapter, run
 from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
@@ -168,6 +169,7 @@ class MLXLMAdapter(BaseAdapter):
         generated: list[int] = []
         completed = False
         finish_reason = None
+        ticker = _ProgressTicker(params)
         try:
             for response in stream_generate(self.model, self.processor, **kwargs):
                 if request_id in self.cancelled:
@@ -179,7 +181,9 @@ class MLXLMAdapter(BaseAdapter):
                 finish_reason = getattr(response, "finish_reason", None) or finish_reason
                 text = getattr(response, "text", response if isinstance(response, str) else "")
                 if text:
-                    yield {"type": "delta", "text": text}
+                    yield {"type": "delta", "text": text, **_live_progress(response)}
+                elif ticker.due():
+                    yield {"type": "token_progress", **_live_progress(response)}
             completed = True
         finally:
             # A completed generation is the only safe thing to remember: an
@@ -227,6 +231,50 @@ class MLXLMAdapter(BaseAdapter):
         except Exception:
             pass
         return parse_tool_markup(text)
+
+
+class _ProgressTicker:
+    """Throttled per-token progress, independent of when text is emitted.
+
+    A runtime only yields a `delta` when the detokenizer has a complete
+    segment, and some models hand over a whole reply at once after many
+    seconds. Counting deltas would then report nothing at all, so the tick is
+    driven by the generation loop itself rather than by visible output.
+    """
+
+    def __init__(self, params: dict):
+        try:
+            self.interval = min(30.0, max(0.5, float(
+                params.get("heartbeat_interval_seconds", 10))))
+        except (TypeError, ValueError):
+            self.interval = 10.0
+        self.last = time.monotonic()
+
+    def due(self) -> bool:
+        now = time.monotonic()
+        if now - self.last < self.interval:
+            return False
+        self.last = now
+        return True
+
+
+def _live_progress(response) -> dict:
+    """Per-token counters the runtime already computes, if it still offers them.
+
+    Both mlx-lm and mlx-vlm set `generation_tokens` and `generation_tps` on
+    every streamed response, and their tps excludes prefill. Reading them costs
+    nothing and is more accurate than counting deltas, but a future runtime may
+    rename or drop them, so absence is normal rather than an error -- the
+    worker falls back to its own count.
+    """
+    result = {}
+    tokens = getattr(response, "generation_tokens", None)
+    if isinstance(tokens, int) and tokens >= 0:
+        result["tokens"] = tokens
+    tps = getattr(response, "generation_tps", None)
+    if isinstance(tps, (int, float)) and tps > 0:
+        result["tps"] = float(tps)
+    return result
 
 
 def _tool_support(params: dict, rendered_kwargs: dict) -> str:

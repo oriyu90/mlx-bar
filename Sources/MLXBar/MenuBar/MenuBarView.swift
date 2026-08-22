@@ -43,6 +43,12 @@ struct MenuBarView: View {
                     .font(.caption)
                     .foregroundStyle(model.activeRequestCount > 0 || model.queuedRequestCount > 0 ? .orange :
                                      model.loadingModelName != nil ? .secondary : .green)
+                if let rate = model.generationRateText {
+                    Text(rate)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
 
             if let error = model.errorMessage {

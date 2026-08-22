@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import logging.handlers
 import os
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import secrets
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -26,6 +28,125 @@ from .state import AppState, CATALOG_CLASSIFIER_VERSION
 
 
 LOGGER = logging.getLogger(__name__)
+
+# Reachable without credentials so a monitor can see the listener is alive.
+UNAUTHENTICATED_PATHS = {"/health"}
+# Headroom above the largest request the settings actually permit.
+REQUEST_SIZE_SLACK_BYTES = 1 << 20
+DEFAULT_MAX_PROMPT_CHARACTERS = 100_000
+DEFAULT_MAX_IMAGES = 8
+DEFAULT_MAX_IMAGE_BYTES = 26_214_400
+FALLBACK_MAX_REQUEST_BYTES = 512 << 20
+
+
+def max_request_bytes(settings) -> int:
+    """Largest request body the current settings could legitimately produce.
+
+    A fixed cap would be wrong in both directions: eight 25 MiB images encoded
+    as base64 data URIs is a *legal* request worth about 280 MB, while a small
+    installation should not have to accept that much. Deriving the ceiling from
+    the same limits the handlers enforce keeps the two from drifting apart.
+    """
+    data = getattr(settings, "data", {}) or {}
+    try:
+        configured = int(data.get("api", {}).get("maxRequestBytes", 0) or 0)
+        if configured > 0:
+            return configured
+        generation = data.get("generation", {})
+        # Four bytes per character is the UTF-8 worst case; base64 inflates by 4/3.
+        prompt = int(generation.get("maxPromptCharacters", DEFAULT_MAX_PROMPT_CHARACTERS)) * 4
+        images = (int(generation.get("maxImages", DEFAULT_MAX_IMAGES))
+                  * int(generation.get("maxImageBytes", DEFAULT_MAX_IMAGE_BYTES)) * 4 // 3)
+        return prompt + images + REQUEST_SIZE_SLACK_BYTES
+    except (AttributeError, TypeError, ValueError):
+        # This runs on every request. A malformed settings file must not turn
+        # into a 500 for traffic that is otherwise fine; the handlers still
+        # enforce their own limits, so falling back to a generous ceiling only
+        # loses the early rejection.
+        return FALLBACK_MAX_REQUEST_BYTES
+
+
+class PublicRequestGuard:
+    """Reject unauthorised or oversized requests before anything is parsed.
+
+    FastAPI resolves a handler's `body: dict` parameter before the handler
+    runs, so `authorize()` inside the handler was reached only after the whole
+    request had been read and turned into Python objects. That let anyone who
+    could reach the port allocate memory in proportion to what they sent,
+    without presenting a credential. Rejecting at the ASGI layer keeps an
+    unauthenticated request down to whatever the socket already buffered.
+
+    Installed inside the access-log middleware so rejections are still logged.
+    """
+
+    def __init__(self, app, state):
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") in UNAUTHENTICATED_PATHS:
+            await self.app(scope, receive, send)
+            return
+        # First occurrence wins, matching what `request.headers.get()` returns
+        # in the handler, so both layers judge the same value.
+        headers: dict[str, str] = {}
+        for key, value in scope.get("headers", []):
+            headers.setdefault(key.decode("latin-1").lower(), value.decode("latin-1"))
+        if not self._authorized(headers):
+            await self._reject(scope, send, 401, "AUTHENTICATION_FAILED",
+                               "AUTHENTICATION_FAILED")
+            return
+        limit = max_request_bytes(self.state.settings)
+        declared = headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            await self._reject(scope, send, 413, "INPUT_TOO_LARGE",
+                               f"要求が大きすぎます（上限{limit // 1_048_576}MB）")
+            return
+        await self.app(scope, _capped_receive(receive, limit), send)
+
+    def _authorized(self, headers: dict) -> bool:
+        try:
+            if not self.state.settings.data["api"].get("requireToken", True):
+                return True
+            expected = "Bearer " + self.state.settings.api_token
+        except (AttributeError, KeyError, OSError):
+            # Anything unexpected about the token or its settings fails closed;
+            # the handler's own authorize() then produces the real error.
+            return False
+        return secrets.compare_digest(headers.get("authorization", ""), expected)
+
+    @staticmethod
+    async def _reject(scope, send, status: int, code: str, message: str) -> None:
+        # The access-log middleware reads this back off the shared scope state.
+        scope.setdefault("state", {})["api_log"] = {"error_code": code}
+        body = json.dumps({"error": {"message": message, "type": "invalid_request_error",
+                                     "param": None, "code": code}}).encode("utf-8")
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode("ascii")),
+                                (b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": body})
+
+
+def _capped_receive(receive, limit: int):
+    """Stop feeding a body to the app once it exceeds `limit`.
+
+    Covers requests that arrive chunked, where there is no Content-Length to
+    check up front. The app sees a truncated body and rejects it as invalid;
+    what matters here is that memory stays bounded.
+    """
+    total = 0
+
+    async def capped():
+        nonlocal total
+        message = await receive()
+        if message.get("type") == "http.request":
+            total += len(message.get("body", b""))
+            if total > limit:
+                return {"type": "http.request", "body": b"", "more_body": False}
+        return message
+
+    return capped
 
 
 def make_management_app(state: AppState) -> FastAPI:
@@ -67,6 +188,8 @@ def make_public_app(state: AppState) -> FastAPI:
             "type": "invalid_request_error", "param": parameter, "code": "INVALID_REQUEST",
         }})
 
+    app.add_middleware(PublicRequestGuard, state=state)
+
     @app.middleware("http")
     async def recent_api_log(request: Request, call_next):
         started = time.monotonic()
@@ -101,7 +224,8 @@ def make_public_app(state: AppState) -> FastAPI:
                     "generation_tps": details.get("generation_tps", 0),
                     "cache_tier": details.get("cache_tier"),
                     "tool_support": details.get("tool_support"),
-                    "error_code": details.get("error_code") or error_code,
+                    "error_code": (details.get("error_code") or error_code
+                                   or (f"HTTP_{status}" if status >= 400 else None)),
                     "client_scope": "local" if client_host in {"127.0.0.1", "::1", "testclient", ""} else "lan",
                 })
             except Exception:
@@ -159,7 +283,9 @@ class PublicListener:
             listener_socket.close()
             raise RuntimeError(f"port {port} を使用できません: {exc}") from exc
         config = uvicorn.Config(self.app, host=host, port=port, log_level="warning",
-                                access_log=False, timeout_graceful_shutdown=60, lifespan="off")
+                                access_log=False, timeout_graceful_shutdown=60, lifespan="off",
+                                limit_concurrency=int(self.state.settings.data["api"].get(
+                                    "maxConcurrentConnections", 64)))
         server = uvicorn.Server(config)
         task = asyncio.create_task(server.serve(sockets=[listener_socket]))
         for _ in range(50):
