@@ -88,6 +88,10 @@ MLXBar v1.5.0は、大規模モデルを常用するための強化リリース�
 - 新規インストールでは`runtimes.*.autoCheck`が`false`になります。なお自動チェックはこれまで実装されておらず、更新は常に手動操作でした。
 - 追加された設定：`generation.wiredLimitRatio`、`generation.cacheLimitRatio`、`promptCache.keepGenerations`、`promptCache.memoryRatio`。
 
+SHA-256 (`MLXBar-1.5.0.dmg`):
+
+`cfb10c341404a38eff1e3be7820d11dd7e4ad829e262b5d90428bbeb56d77517`
+
 The included build is ad-hoc signed. On first launch, macOS may require approval in System Settings > Privacy & Security.
 
 このビルドはad-hoc署名です。初回起動時に「システム設定 > プライバシーとセキュリティ」から実行許可が必要になる場合があります。

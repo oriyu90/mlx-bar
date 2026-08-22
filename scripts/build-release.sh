@@ -91,7 +91,7 @@ rm -rf "$DMG_STAGE"
 mkdir -p "$DMG_STAGE/Source code"
 cp -R "$APP_DIR" "$DMG_STAGE/MLXBar.app"
 ln -s /Applications "$DMG_STAGE/Applications"
-for item in README.md licence.md CHANGELOG.md SECURITY.md TEST_PLAN_v1.4.1.md Package.swift Coordinator Workers CLI Sources Tests Packaging scripts '設計書_v2.1.md'; do
+for item in README.md licence.md CHANGELOG.md SECURITY.md "TEST_PLAN_v$VERSION.md" Package.swift Coordinator Workers CLI Sources Tests Packaging scripts '設計書_v2.1.md'; do
   cp -R "$PROJECT_DIR/$item" "$DMG_STAGE/Source code/"
 done
 rm -rf "$DMG_STAGE/Source code/Coordinator/.venv" "$DMG_STAGE/Source code/Coordinator/.pytest_cache"
