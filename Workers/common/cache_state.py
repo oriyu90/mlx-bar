@@ -118,15 +118,20 @@ def can_capture(cache: Any) -> bool:
     This is the same contract mlx-lm's ``save_prompt_cache`` relies on, so it is
     as stable as cache serialisation itself. A recurrent component satisfies it
     even though it can never satisfy :func:`can_trim`.
+
+    The question is asked of the **type**, never of the instance. The probe runs
+    on an empty cache, and an empty ``KVCache`` cannot answer it: its getter
+    reads ``self.keys.shape[2]`` while ``keys`` is still ``None``, so a value
+    read raises ``AttributeError`` -- which ``hasattr`` reports as "no such
+    attribute". Asking the instance therefore called every hybrid architecture
+    incapable of the one rollback it is actually capable of.
     """
     entries = _entries(cache)
     if not entries:
         return False
     for entry in entries:
-        if not hasattr(entry, "state"):
-            return False
-        setter = getattr(type(entry), "state", None)
-        if not isinstance(setter, property) or setter.fset is None:
+        descriptor = getattr(type(entry), "state", None)
+        if not isinstance(descriptor, property) or descriptor.fset is None:
             return False
     return True
 

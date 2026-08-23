@@ -55,6 +55,12 @@ def fake_mlx(tmp_path: Path | None = None) -> ModuleType:
     core.eval = lambda *args: None
 
     def save_safetensors(path, arrays):
+        # mlx appends the extension when the path does not already end in it,
+        # so a caller that writes to "<name>.safetensors.tmp" gets a file it
+        # never named. Mirrored here because the difference is the whole bug:
+        # a fake that writes exactly where it is told cannot show it.
+        if not str(path).endswith(".safetensors"):
+            path = str(path) + ".safetensors"
         payload = {name: value.data for name, value in arrays.items()}
         Path(path).write_text(json.dumps(payload), encoding="utf-8")
 
@@ -97,6 +103,35 @@ class TrimmableCache:
     @state.setter
     def state(self, value):
         self._state = value
+
+
+class EmptyKVCache:
+    """A plain KV cache before its first token, exactly as mlx-lm builds one.
+
+    Its `state` getter reads `self.keys.shape` and therefore raises while `keys`
+    is still None. The capability probe runs on a cache in precisely this state.
+    """
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    @property
+    def state(self):
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, count: int) -> int:
+        return count
 
 
 class RecurrentCache:
@@ -154,6 +189,34 @@ def test_a_cache_without_trim_is_capturable_but_not_trimmable():
     assert cache_state.can_trim(hybrid) is False
     assert cache_state.can_capture(hybrid) is True
     assert cache_state.rollback_capability(hybrid) == cache_state.ROLLBACK_CHECKPOINT
+
+
+def test_an_empty_kv_cache_is_still_capturable():
+    """The probe runs before the first token, and must not read a value.
+
+    Reading `state` on an empty KVCache raises, and `hasattr` reports that as
+    "no such attribute". Judging the instance therefore reported every hybrid
+    -- a recurrent stack plus plain attention layers -- as incapable of the one
+    rollback it can actually do, which switched snapshots off for exactly the
+    architectures they exist for.
+    """
+    assert cache_state.can_capture([EmptyKVCache()]) is True
+    hybrid = [EmptyKVCache(), RecurrentCache()]
+    assert cache_state.can_capture(hybrid) is True
+    assert cache_state.rollback_capability(hybrid) == cache_state.ROLLBACK_CHECKPOINT
+
+
+def test_a_type_without_a_state_setter_is_not_capturable():
+    class ReadOnly:
+        @property
+        def state(self):
+            return []
+
+    class Plain:
+        state = []
+
+    assert cache_state.can_capture([ReadOnly()]) is False
+    assert cache_state.can_capture([Plain()]) is False
 
 
 def test_a_plain_kv_cache_reports_trim():
@@ -313,38 +376,113 @@ def test_a_branch_restores_a_snapshot_when_one_matches():
     controller = Controller(restore=lambda ids: (snapshot, [1, 2], "disk"))
     state = guarded(controller, [1, 2, 3, 4], [RecurrentCache()])
     assert state.find_prefix_length([1, 2, 9, 9]) == 2
-    assert state.cache is snapshot
+    assert list(state.cache) == snapshot
     assert state.token_ids == [1, 2]
     assert state.last_probe["restoredFrom"] == "disk"
 
 
-def test_a_snapshot_is_not_swapped_in_once_the_caller_holds_the_old_cache():
-    """Ordering guard: a swap is only safe while nobody has read the cache.
+def test_a_snapshot_reaches_a_caller_that_read_the_cache_first():
+    """Ordering independence: the snapshot moves into the list, not over it.
 
-    mlx-vlm reads `.cache` immediately after asking for the prefix length. If a
-    future version were to read it first, swapping would hand back one cache
-    paired with another cache's prefix length -- wrong output rather than a
-    slow request -- so the swap simply does not happen.
+    mlx-vlm 0.6.15 reads `.cache` once to test it against None and again after
+    asking for the prefix length; a future version may read it only once, and
+    before asking. Restoring into the retained list rather than replacing it
+    means the reference a caller already holds becomes the restored cache, so
+    the length that is returned and the cache that is used still describe the
+    same tokens either way.
     """
+    snapshot = [RecurrentCache()]
+    controller = Controller(restore=lambda ids: (snapshot, [1, 2], "memory"))
     original = [RecurrentCache()]
-    controller = Controller(restore=lambda ids: ([RecurrentCache()], [1, 2], "memory"))
     state = guarded(controller, [1, 2, 3, 4], original)
-    _ = state.cache  # the caller reads it early
-    assert state.find_prefix_length([1, 2, 9, 9]) == 0
-    assert state.cache is original
+    early = state.cache  # the caller reads it before asking
+    assert state.find_prefix_length([1, 2, 9, 9]) == 2
+    assert list(early) == snapshot
+    assert early is state.cache
 
 
-def test_a_refused_branch_releases_the_cache_it_can_no_longer_use():
-    """The retained cache is dropped before the replacement is built.
+def test_a_refused_branch_releases_the_cache_but_leaves_it_iterable():
+    """The retained cache is emptied, never replaced with None.
 
-    It is unusable on this path by definition -- no trim, no matching snapshot
-    -- and whatever happens next replaces it. Holding it through the restore
-    would put a third full cache in memory for no possible benefit.
+    Emptying releases the components before a replacement is built, which is the
+    point: on this path the cache is unusable either way. Handing back None
+    instead would break the caller, which has already passed its own
+    `cache is not None` test and goes on to compute a drop amount by iterating
+    whatever it is given.
+    """
+    controller = Controller()
+    original = [RecurrentCache()]
+    state = guarded(controller, [1, 2, 3, 4], original)
+    assert state.find_prefix_length([1, 2, 9]) == 0
+    assert state.cache == []
+    assert original == []
+    assert state.token_ids is None
+
+
+def test_a_continuation_is_refused_when_the_cache_sits_ahead_of_its_labels():
+    """The invariant that keeps `trim()` unreachable.
+
+    A cache whose offset is longer than the prefix being claimed leaves the
+    runtime with tokens to drop, and it computes that amount from the cache
+    rather than from the length it was handed. On a recurrent component the drop
+    is not merely wrong, it does not exist -- so the length is refused instead.
+    """
+    controller = Controller()
+    state = guarded(controller, [1, 2, 3], [TrimmableCache(offset=5), RecurrentCache()])
+    assert state.find_prefix_length([1, 2, 3, 4]) == 0
+    assert state.last_probe["reason"] == cache_state.COLD_REUSE_UNSUPPORTED
+
+
+def test_a_continuation_is_allowed_when_the_cache_agrees_with_its_labels():
+    controller = Controller()
+    state = guarded(controller, [1, 2, 3], [TrimmableCache(offset=3), RecurrentCache()])
+    assert state.find_prefix_length([1, 2, 3, 4]) == 3
+    assert state.last_probe["action"] == "reuse"
+
+
+def test_no_answer_ever_leaves_the_runtime_with_tokens_to_drop():
+    """Replays what mlx-vlm does with the answer, for every shape of request.
+
+    `dispatch._prefix_cache_trim_amount` takes the largest offset any component
+    reports and subtracts the prefix length; anything left over becomes a
+    `trim()` call on every component. A recurrent component has no `trim`, so
+    the only safe answers are ones that leave nothing over.
+    """
+    def runtime_would_trim(state, new_ids) -> bool:
+        if state.cache is None:                      # dispatch's own guard
+            return False
+        prefix_len = state.find_prefix_length(new_ids)
+        kv_cache = state.cache
+        cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+        n_drop = max(0, cached_len - prefix_len)
+        return bool(0 < prefix_len < len(new_ids) and n_drop)
+
+    for held_ids, offset, prompt in (
+        ([1, 2, 3], 3, [1, 2, 3, 4]),            # continuation, cache in step
+        ([1, 2, 3], 5, [1, 2, 3, 4]),            # continuation, cache ahead
+        ([1, 2, 3, 4], 4, [1, 2, 9]),            # branch
+        ([1, 2, 3, 4], 6, [1, 2, 9]),            # branch, cache ahead
+        ([1, 2, 3], 3, [9, 9, 9]),               # nothing shared
+    ):
+        state = guarded(Controller(), held_ids,
+                        [TrimmableCache(offset=offset), RecurrentCache()])
+        assert runtime_would_trim(state, prompt) is False, (held_ids, offset, prompt)
+
+
+def test_an_emptied_cache_is_never_claimed_as_a_prefix():
+    """The state left behind by a refused branch must not be reused.
+
+    The runtime's own guard is `cache is not None`, so an emptied list passes
+    it. Answering with a length then makes the runtime drop that many tokens
+    from the prompt and prefill the rest into an empty cache -- a wrong answer,
+    not a slow one.
     """
     controller = Controller()
     state = guarded(controller, [1, 2, 3, 4], [RecurrentCache()])
-    assert state.find_prefix_length([1, 2, 9]) == 0
-    assert state.cache is None
+    assert state.find_prefix_length([1, 2, 9]) == 0      # refuses, empties
+    state.token_ids = [1, 2, 3, 4]                        # as if labels survived
+    assert state.find_prefix_length([1, 2, 3, 4, 5]) == 0
+    assert state.last_probe["action"] == "cold"
 
 
 def test_the_first_request_is_reported_as_such():
@@ -377,6 +515,31 @@ def test_a_store_refuses_to_write_what_its_limit_cannot_hold(tmp_path, mlx_stub)
     store.remember(list(range(1000)), [TrimmableCache()])
     assert store.persist(list(range(1000))) == cache_state.COLD_BUDGET_INSUFFICIENT
     assert store.disabled_reason == cache_state.COLD_BUDGET_INSUFFICIENT
+
+
+def test_a_persisted_snapshot_lands_under_the_name_the_index_records(tmp_path, mlx_stub):
+    """mlx renames a path that does not end in `.safetensors`.
+
+    Writing to "<digest>.safetensors.tmp" produced "<digest>.safetensors.tmp
+    .safetensors" -- a file the chmod, the rename and the eviction all miss. The
+    snapshot was never readable and the leftover was never reclaimed, at roughly
+    200 MB each.
+    """
+    store = budgeted_store(tmp_path, mlx_stub)
+    ids = list(range(1024))
+    assert store.remember(ids, [RecurrentCache()]) is True
+    assert store.persist(ids) is None
+    files = sorted(item.name for item in store.directory.iterdir())
+    assert any(name.endswith(".safetensors") and ".tmp" not in name for name in files), files
+    assert not [name for name in files if ".tmp" in name], files
+    assert store.restore_best(ids + [9], lambda: [RecurrentCache()]) is not None
+
+
+def test_a_store_forgets_the_leftovers_of_a_write_that_never_finished(tmp_path, mlx_stub):
+    store = budgeted_store(tmp_path, mlx_stub)
+    (store.directory / "abc.tmp.safetensors").write_text("partial", encoding="utf-8")
+    reopened = budgeted_store(tmp_path, mlx_stub)
+    assert list(reopened.directory.glob("*.tmp*")) == []
 
 
 def test_a_store_stops_writing_once_its_session_budget_is_spent(tmp_path, mlx_stub):
@@ -563,3 +726,36 @@ def test_persisting_is_throttled_by_growth(mlx_stub):
     adapter._persisted_tokens = 4000
     assert adapter._should_persist(4200) is False
     assert adapter._should_persist(5100) is True
+
+
+def test_the_namespace_sweep_leaves_the_checkpoint_store_alone(tmp_path, mlx_stub, monkeypatch):
+    """The two stores share a parent directory, and only one owns the sweep.
+
+    APC generations sit directly under the cache root; checkpoints keep theirs
+    under a sibling `checkpoints/`. A sweep that treats every directory as a
+    stale generation deletes the snapshots of the model that is loaded right
+    now -- silently, at the moment a second generation appears.
+    """
+    from mlx_vlm_worker.adapter import MLXVLMAdapter, APC_NAMESPACE_PREFIX
+
+    adapter = MLXVLMAdapter()
+    adapter.apc_root = tmp_path
+    adapter.apc_namespace = APC_NAMESPACE_PREFIX + "current"
+    current = tmp_path / adapter.apc_namespace
+    older = tmp_path / (APC_NAMESPACE_PREFIX + "older")
+    oldest = tmp_path / (APC_NAMESPACE_PREFIX + "oldest")
+    checkpoints = tmp_path / "checkpoints" / "mlxbar-vlm-ckpt-v1-current"
+    for path in (current, older, oldest, checkpoints):
+        path.mkdir(parents=True)
+    (checkpoints / "snapshot.safetensors").write_text("kept", encoding="utf-8")
+    import os, time
+    now = time.time()
+    os.utime(older, (now - 60, now - 60))
+    os.utime(oldest, (now - 600, now - 600))
+
+    removed = adapter._sweep_stale_namespaces(2)
+
+    assert (checkpoints / "snapshot.safetensors").is_file()
+    assert current.is_dir()
+    assert removed == [oldest.name]
+    assert adapter._namespace_count() == 2

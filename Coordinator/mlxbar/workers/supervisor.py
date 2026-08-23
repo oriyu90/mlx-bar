@@ -413,7 +413,16 @@ class WorkerSupervisor:
         if (not self.loaded or self.loaded.get("engine") == "lm-studio"
                 or not self.socket_path):
             return {"enabled": False, "engine": self.loaded.get("engine") if self.loaded else None}
-        response = await self._call("prompt_cache_stats", {}, timeout=10)
+        try:
+            response = await self._call("prompt_cache_stats", {}, timeout=10)
+        except httpx.TimeoutException:
+            # The Worker answers RPCs on the MLX thread, so a generation in
+            # flight blocks this read for as long as it runs -- minutes on a
+            # 27B. "Is reuse working?" is exactly the question a slow request
+            # provokes, so answer it with what is known and say so, rather than
+            # failing at the only moment anyone asks.
+            known = ((self.loaded or {}).get("capabilities") or {}).get("promptCache") or {}
+            return {**known, "stale": True, "staleReason": "worker_busy"}
         return response.get("cache", {})
 
     async def clear_memory_prompt_cache(self) -> dict:

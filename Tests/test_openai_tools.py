@@ -741,3 +741,158 @@ def test_progress_keeps_the_stream_alive_without_entering_the_reply():
         if line.startswith("data: ") and "[DONE]" not in line
         and json.loads(line[6:]).get("choices"))
     assert content == "hello"
+
+
+# ------------------------------------------ what a client learns about reuse
+
+class ReuseWorker:
+    """A worker that reports a warm request the way the mlx workers do."""
+
+    loaded = {"id": "laguna-id", "name": "Laguna-S-2.1-oQ2e"}
+
+    def __init__(self, cached_tokens=None, cache_tier="memory", cold_reason=None):
+        self.cached_tokens = cached_tokens
+        self.cache_tier = cache_tier
+        self.cold_reason = cold_reason
+
+    async def generate(self, messages, images, options, request_id, image_root=None):
+        yield {"type": "delta", "text": "ok"}
+        yield {"type": "usage", "prompt_tokens": 400, "completion_tokens": 1}
+        metrics = {"type": "metrics", "prompt_tokens": 400, "cache_tier": self.cache_tier,
+                   "shared_prefix_tokens": 380, "held_prefix_tokens": 402,
+                   "prompt_tps": 900.0, "generation_tps": 40.0}
+        if self.cached_tokens is not None:
+            metrics["cached_tokens"] = self.cached_tokens
+        if self.cold_reason is not None:
+            metrics["cold_reason"] = self.cold_reason
+        yield metrics
+        yield {"type": "completed", "finish_reason": "stop"}
+
+
+def make_reuse_client(tmp: Path, worker):
+    state = SimpleNamespace(
+        settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+        workers=worker,
+        database=Database(tmp / "state.sqlite3"),
+    )
+    return TestClient(make_public_app(state)), state.database
+
+
+def reuse_body(stream=False):
+    body = {"model": "Laguna-S-2.1-oQ2e", "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}]}
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+    return body
+
+
+def test_usage_reports_the_reused_prefix_so_a_client_can_see_its_cache_working():
+    """OpenAI-compatible clients read reuse from `prompt_tokens_details`.
+
+    MLXBar already measures it; without this field the caller's own context and
+    cost accounting reports every warm request as a full recomputation, and the
+    only place the truth appears is MLXBar's own settings window.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_reuse_client(Path(directory), ReuseWorker(cached_tokens=380))
+        usage = client.post("/v1/chat/completions", json=reuse_body()).json()["usage"]
+        assert usage["prompt_tokens"] == 400
+        assert usage["prompt_tokens_details"] == {"cached_tokens": 380}
+
+
+def test_streaming_usage_reports_the_reused_prefix_too():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_reuse_client(Path(directory), ReuseWorker(cached_tokens=380))
+        response = client.post("/v1/chat/completions", json=reuse_body(stream=True))
+        chunks = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: ") and not line.endswith("[DONE]")]
+        usage = [chunk["usage"] for chunk in chunks if chunk.get("usage")]
+        assert usage[-1]["prompt_tokens_details"] == {"cached_tokens": 380}
+
+
+def test_usage_omits_the_reuse_field_when_the_runtime_does_not_measure_it():
+    """Absent and zero are different claims, and a client acts on them alike."""
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_reuse_client(Path(directory), ReuseWorker(cached_tokens=None))
+        usage = client.post("/v1/chat/completions", json=reuse_body()).json()["usage"]
+        assert "prompt_tokens_details" not in usage
+
+
+def test_a_reported_reuse_can_never_exceed_the_prompt_it_belongs_to():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_reuse_client(Path(directory), ReuseWorker(cached_tokens=99999))
+        usage = client.post("/v1/chat/completions", json=reuse_body()).json()["usage"]
+        assert usage["prompt_tokens_details"]["cached_tokens"] == usage["prompt_tokens"]
+
+
+def test_the_workers_cache_report_reaches_the_api_log():
+    """The hop the settings window and the cold-streak warning both depend on.
+
+    Every field here is produced by the worker and consumed by the UI, with the
+    request handler as the only thing in between; nothing else notices when one
+    of them stops being copied.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        worker = ReuseWorker(cached_tokens=0, cache_tier="cold", cold_reason="reuse_unsupported")
+        client, database = make_reuse_client(Path(directory), worker)
+        assert client.post("/v1/chat/completions", json=reuse_body()).status_code == 200
+        assert client.post("/v1/chat/completions", json=reuse_body(stream=True)).status_code == 200
+        for entry in database.list_api_logs(2):
+            assert entry["cache_tier"] == "cold"
+            assert entry["cold_reason"] == "reuse_unsupported"
+            assert entry["shared_prefix_tokens"] == 380
+            assert entry["held_prefix_tokens"] == 402
+
+
+# --------------------------------------------------- what the catalog offers
+
+def test_the_model_list_omits_rows_the_scanner_could_not_read():
+    """A discovery client offers whatever this list contains.
+
+    The component folders of a diffusion model look like MLX checkpoints from
+    the outside, so the scanner records them with no engine. They stay in the
+    management API, which exists to explain what was skipped, and out of this
+    one, which exists to say what can answer a request.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        settings = SettingsStore(Path(directory))
+        settings.data["api"]["requireToken"] = False
+        database = Database(Path(directory) / "state.sqlite3")
+        database.replace_models([
+            catalog_model(),
+            {**catalog_model("vae-id", "vae"), "format": "unknown", "engine": None,
+             "modalities": []},
+        ])
+        state = SimpleNamespace(settings=settings, workers=AutoLoadWorker(), database=database,
+                                model_autoload_lock=asyncio.Lock())
+        client = TestClient(make_public_app(state))
+        listed = client.get("/v1/models").json()["data"]
+        assert [item["id"] for item in listed] == ["Laguna-S-2.1-oQ2e"]
+        assert len(database.list_models()) == 2
+
+
+def test_the_model_list_states_which_inputs_a_model_accepts():
+    with tempfile.TemporaryDirectory() as directory:
+        settings = SettingsStore(Path(directory))
+        settings.data["api"]["requireToken"] = False
+        database = Database(Path(directory) / "state.sqlite3")
+        database.replace_models([{**catalog_model(), "modalities": ["text", "image"]}])
+        state = SimpleNamespace(settings=settings, workers=AutoLoadWorker(), database=database,
+                                model_autoload_lock=asyncio.Lock())
+        client = TestClient(make_public_app(state))
+        assert client.get("/v1/models").json()["data"][0]["modalities"] == ["text", "image"]
+
+
+def test_an_unknown_model_is_missing_rather_than_busy_while_another_request_runs():
+    """A typo is permanent; ENGINE_BUSY invites the client to retry it forever."""
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_autoload_client(Path(directory))
+        assert client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e", "messages": [{"role": "user", "content": "hi"}],
+        }).status_code == 200
+        worker.active_requests = {"someone-elses-request": object()}
+        response = client.post("/v1/chat/completions", json={
+            "model": "no-such-model", "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "MODEL_NOT_FOUND"

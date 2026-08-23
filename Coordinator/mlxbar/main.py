@@ -153,6 +153,18 @@ def make_management_app(state: AppState) -> FastAPI:
     app = FastAPI(title="MLXBar Management API", docs_url=None, redoc_url=None)
     app.state.mlxbar = state
     app.include_router(management_router)
+
+    @app.exception_handler(Exception)
+    async def logged_internal_error(request: Request, exc: Exception):
+        # Without this the caller gets a bare "Internal Server Error" and the
+        # cause is written to a stream nobody keeps: the service log records
+        # asyncio task failures but not request ones, so a route that starts
+        # failing leaves no trace anywhere the user can reach.
+        LOGGER.error("Management request failed: %s %s", request.method, request.url.path,
+                     exc_info=exc)
+        return JSONResponse(status_code=500, content={"error": {
+            "code": "INTERNAL_ERROR", "message": type(exc).__name__}})
+
     return app
 
 
@@ -223,6 +235,14 @@ def make_public_app(state: AppState) -> FastAPI:
                     "prompt_tps": details.get("prompt_tps", 0),
                     "generation_tps": details.get("generation_tps", 0),
                     "cache_tier": details.get("cache_tier"),
+                    # Why a request was cold, and how much of it was shared.
+                    # The column, the writer, the worker and the settings window
+                    # all had these from v1.6.0; this copy is what they travel
+                    # through, and until v1.6.1 it was the one place they were
+                    # not listed, so every row recorded a NULL reason.
+                    "cold_reason": details.get("cold_reason"),
+                    "shared_prefix_tokens": details.get("shared_prefix_tokens", 0),
+                    "held_prefix_tokens": details.get("held_prefix_tokens", 0),
                     "tool_support": details.get("tool_support"),
                     "error_code": (details.get("error_code") or error_code
                                    or (f"HTTP_{status}" if status >= 400 else None)),
@@ -275,6 +295,14 @@ class PublicListener:
 
     async def _launch(self, host: str, port: int) -> tuple[uvicorn.Server, asyncio.Task]:
         listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # An update is quit, replace, launch -- and the port the previous
+        # process was serving on is still in TIME_WAIT when the new one starts.
+        # Without this the public API simply does not come back until something
+        # restarts the service again, which is the worst possible first minute
+        # after an update. SO_REUSEADDR only forgives that state: a port another
+        # process is actively listening on still fails, which is what keeps the
+        # conflict handling below meaningful.
+        listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener_socket.bind((host, port))
             listener_socket.listen(128)

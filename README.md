@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.6.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.6.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -40,7 +40,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -207,9 +207,9 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 管理API、モデルの実パス、更新操作は公開TCP APIへ露出しません。
 
-APIのモデル指定には、`GET /v1/models`が返す表示名または内部IDを利用できます。モデルが未ロードでも、既定では最初の要求時にカタログから探してロード完了を待ち、その後に生成します。アプリやモデルWorkerの再起動後も同様に復元します。「設定…」→「モデル」で自動ロードを無効にできます。メニューバーから明示的にアンロードした場合は、意図しない再起動を防ぐためGUIで再ロードするまで自動ロードしません。
+APIのモデル指定には、`GET /v1/models`が返す表示名または内部IDを利用できます。この一覧には生成に使えるモデルだけが並びます。スキャンで読み取れなかったフォルダ（拡散モデルの`vae`・`text_encoder`・`transformer`など、外から見るとMLXの重みと区別が付かないもの）は、理由の分かる形で「設定…」→「モデル」には残しますが、公開APIの一覧からは外します。各項目の`modalities`には`text` / `image`が入るので、クライアント側で画像入力の可否をモデル名から推測する必要がありません。存在しないモデル名を指定した場合は、他の要求が実行中でもHTTP 404の`MODEL_NOT_FOUND`を返します（再試行しても直らないものを、再試行すれば直る`ENGINE_BUSY`として返さないためです）。モデルが未ロードでも、既定では最初の要求時にカタログから探してロード完了を待ち、その後に生成します。アプリやモデルWorkerの再起動後も同様に復元します。「設定…」→「モデル」で自動ロードを無効にできます。メニューバーから明示的にアンロードした場合は、意図しない再起動を防ぐためGUIで再ロードするまで自動ロードしません。
 
-OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。`response_format`は`text`のみ対応で、`json_object`・`json_schema`と`logprobs`は黙って無視せずHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。複数候補生成（`n > 1`）とテキスト以外の出力は未対応で、フリーズせず入力エラーとして終了します。
+OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。`response_format`は`text`のみ対応で、`json_object`・`json_schema`と`logprobs`は黙って無視せずHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。プロンプトキャッシュで再計算を省けたtoken数は、OpenAI標準の`usage.prompt_tokens_details.cached_tokens`に入れて返します。ランタイムが再利用量を報告しなかった場合は0を書かずにフィールドごと省くため、「キャッシュが効かなかった」と「計測していない」を取り違えません。複数候補生成（`n > 1`）とテキスト以外の出力は未対応で、フリーズせず入力エラーとして終了します。
 
 ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルまたは`extra_body`内の`thinking`と`reasoning_effort`も受理し、mlx-lm・mlx-vlmのチャットテンプレートへ渡します。`thinking.type`の`enabled` / `disabled`は`enable_thinking`へ、`budget_tokens`は`thinking_budget`へ、`clear_thinking`は逆値の`preserve_thinking`へ、`thinking.effort`は`reasoning_effort`へ変換します。将来のZCodeやOpenAI互換クライアントが追加する未知の拡張項目は生成へ渡さず安全に無視するため、項目追加だけでHTTP 400になりません。同じ値が`extra_body.chat_template_kwargs`に明示された場合はそちらを優先します。`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`はMLXBarが管理するため、`chat_template_kwargs`内での上書きは受け付けません。
 
@@ -227,11 +227,11 @@ namespaceはモデルとランタイム版から作られるため、モデル�
 
 v1.6.0で追加した設定: `promptCache.branchCheckpoint`（`auto`／`off`、既定`auto`）は、巻き戻せないアーキテクチャで完了ターンのスナップショットを保持するかを切り替えます。`promptCache.diskWriteBudgetGB`（既定32）はWorkerの生存期間あたりの書き込み量の上限です。長い会話のスナップショットは1件で数GBに達するため、上限のないディスク層はキャッシュではなく継続的な書き込み負荷になります。`promptCache.memoryBlocks`（`auto`／`off`、既定`off`）はmlx-vlmのAPCブロックプールを有効にしますが、27B級ハイブリッドでの実測がないため既定では有効にしていません。
 
-v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻き戻せない場合でも要求を失敗させません。応答をまだ送信していなければ新しいキャッシュで一度だけ再試行します。回復回数は`GET /api/v1/prompt-cache`の`reuseFailures`で確認できます。**v1.6.0以降、この再試行は安全網であって通常経路ではありません**（巻き戻しの可否を事前に判定するため、そもそも失敗しません）。
+v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻き戻せない場合でも要求を失敗させません。応答をまだ送信していなければ新しいキャッシュで一度だけ再試行します。回復回数は`GET /api/v1/prompt-cache`の`reuseFailures`で確認できます。**v1.6.1以降、この再試行は安全網であって通常経路ではありません。** v1.6.0は巻き戻しの可否を事前に判定していましたが、ランタイムが破棄量をキャッシュ自身のoffsetから計算するため、キャッシュが自分のラベルより先行しているときだけ判定をすり抜けていました。v1.6.1は返す長さが破棄を生まないことまで確認します。再試行が起きた場合もAPIログには`cold_reason`が残ります。
 
 v1.6.0では、中断した生成のキャッシュを破棄しません。ランタイムは再利用したキャッシュをその場で進めますが、対応するトークンIDを書き戻すのは生成が完走したときだけなので、中断したターンではキャッシュだけが1手先に進みます。プロンプトのトークンIDと生成トークンを記録して対応を組み直し、**報告されるoffsetが「プロンプト＋生成」と一致して対応を証明できるときだけ**書き換えます。証明できない場合と、offsetを報告しないランタイムでは従来どおり破棄します。
 
-また、Qwen3.5／3.8系のように再帰層を含むモデルはキャッシュを短いprefixへ巻き戻せません（再帰状態に「末尾Nトークン」が存在しないため）。v1.6.0はこの可否をキャッシュ自身へ問い合わせてランタイムより手前で判定し、巻き戻せない場合は完了ターンのスナップショットを復元します。判定材料はメソッドの存在だけで、モデル名・アーキ名・ランタイム版で分岐しません。詳しくは「プロンプトの再利用と中断からの再開」を参照してください。
+また、Qwen3.5／3.8系のように再帰層を含むモデルはキャッシュを短いprefixへ巻き戻せません（再帰状態に「末尾Nトークン」が存在しないため）。MLXBarはこの可否をキャッシュ自身へ問い合わせてランタイムより手前で判定し、巻き戻せない場合は完了ターンのスナップショットを復元します。判定材料はメソッドの存在だけで、モデル名・アーキ名・ランタイム版で分岐しません。**v1.6.0ではこの問い合わせが空のキャッシュに値を尋ねていたため、注意層と再帰層が混在するモデルすべてでスナップショットが無効のままでした（v1.6.1で修正）。**この構成に当てはまるモデルでは、v1.6.1にするまで枝分かれしたターンが毎回cold prefillになります。詳しくは「プロンプトの再利用と中断からの再開」を参照してください。
 
 「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GB（既定10 GB）の容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
 
@@ -253,7 +253,7 @@ v1.5.3では、認証を本文の解析より前で行います。以前はFastA
 
 判定には物理メモリ総量比（`generation.memoryLimitRatio`、既定0.90）だけでなく、空きメモリ、macOS自身のメモリ逼迫レベル、Workerプロセスの現在の常駐サイズを使います。総量比だけでは他のアプリの使用量が見えないため、MLX単体では上限未満でもマシン全体はスワップしている状態を検出できないからです。
 
-APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、`cache_tier`、`tool_support`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。
+APIアクセスログには本文・tool定義・APIキーを保存せず、`message_chars`、`tool_schema_chars`、`first_token_ms`、`prompt_tokens`、`cached_tokens`、`prompt_tps`、`generation_tps`、`cache_tier`、`cold_reason`、`shared_prefix_tokens`、`held_prefix_tokens`、`tool_support`、推論モードを記録します。長い初回応答が入力処理と生成のどちらに起因するかを切り分けられます。なおv1.6.0では、この記録のうちcold理由と共通prefix長がアクセスログへ渡らず、常に空欄になっていました（v1.6.1で修正）。
 
 OpenAI系クライアントの`reasoning_effort=high` / `minimal`は最初に原値でテンプレートへ渡し、Qwenが拒否した場合だけ同等の`xhigh` / `low`へ再試行します。汎用テンプレートのOpenAI表記を優先しながらQwenのdialectにも対応します。
 
@@ -307,6 +307,46 @@ ZCode 3.2.5以降のモデル設定が追加する`extra_body.chat_template_kwar
 
 ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒否せず到着順にキューへ入れます。待機中も同じheartbeatを送るため、subagent接続は生成開始まで維持されます。クライアントが接続を閉じた待機要求は自動削除されます。「設定…」→「モデル」→「並列リクエスト」で最大待機件数と最大待ち時間を変更できます。メニューバーには現在の待機件数を表示します。
 
+### OpenClaw
+
+OpenClaw（`openai-completions`）から使う場合は、カスタムプロバイダとして登録します。**`timeoutSeconds`を必ず指定してください。**
+
+```json5
+{
+  models: {
+    providers: {
+      mlxbar: {
+        baseUrl: "http://127.0.0.1:11435/v1",
+        apiKey: "${MLXBAR_API_KEY}",
+        api: "openai-completions",
+        timeoutSeconds: 900,
+        models: [
+          {
+            id: "Qwen3.8-27B-MLX-8bit",
+            name: "MLXBar Qwen3.8 27B",
+            reasoning: true,
+            input: ["text", "image"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 262144,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+`timeoutSeconds`が要る理由は、OpenClaw側の無応答監視がSSEコメントを数えないためです。MLXBarは長いprefillやtool解析の間に10秒間隔でSSEコメントのheartbeatを送りますが、これはOpenAI互換クライアントに表示されない代わりに、OpenClawの監視タイマーもリセットしません。監視は既定で120秒に丸められ、超えると要求を中断して**同じモデルで再試行**します。`models.providers.<id>.timeoutSeconds`だけがこの上限を上書きできる設定で、`agents.defaults.timeoutSeconds`やエージェント側のタイムアウトを上げても丸めは残ります。監視が無効になるのはbaseUrlがloopbackで、かつ実行時間の上限をどこにも設定していない場合だけなので、LAN公開のMLXBarへ別PCから接続する構成では必ず指定してください。
+
+10万token級の会話では、再利用が効いたターンの最初のtokenまで数秒、cold prefillでは分単位になります。`timeoutSeconds`は最も長いcold prefillより長く設定してください。
+
+`input`には`GET /v1/models`の`modalities`をそのまま指定できます。OpenClawはこの値を見て画像添付をターンへ注入するため、vision対応モデルで`["text"]`のままにすると画像が無視されます。`GET /v1/models`は生成に使えるモデルだけを返すので、`agents.defaults.models`に`"mlxbar/*": {}`を書いて一覧から自動生成する構成でも、読み取れなかったフォルダが候補に混ざりません。
+
+応答の`usage.prompt_tokens_details.cached_tokens`に再利用できたprompt token数を入れるため、OpenClaw側の`cacheRead`にキャッシュの実績がそのまま出ます。
+
+MLXBarは要求を到着順に直列処理します。subagentを並列に開始しても拒否せずキューに入れ、待機中もheartbeatを送ります。ただし別のモデルを指定した要求は、他の要求が実行中・待機中のあいだ`ENGINE_BUSY`（HTTP 429）になります。
+
 ### プロンプトの再利用と中断からの再開
 
 同じ会話を続けるかぎり、MLXBarは前のターンで計算済みのプロンプト部分を再利用します。10万トークン級のZCodeセッションでは、再利用が効いたターンの最初のトークンまで数秒、効かなかったターンは数分という差になります。
@@ -353,7 +393,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

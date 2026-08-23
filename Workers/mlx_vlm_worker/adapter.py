@@ -21,6 +21,13 @@ from .prompt_cache import CheckpointStore, build_guarded_state
 LOGGER = logging.getLogger(__name__)
 
 
+# Every APC cache generation is a directory under `apc_root` whose name starts
+# with this. The checkpoint store keeps its own generations under a sibling
+# `checkpoints/` directory, so the sweep below has to recognise which of the two
+# it is looking at rather than treating every directory as a stale generation.
+APC_NAMESPACE_PREFIX = "mlxbar-vlm-v1-"
+
+
 class MLXVLMAdapter(BaseAdapter):
     engine = "mlx-vlm"
 
@@ -125,7 +132,7 @@ class MLXVLMAdapter(BaseAdapter):
             self.apc_root = Path(root_value)
             self.apc_root.mkdir(parents=True, exist_ok=True)
             os.chmod(self.apc_root, 0o700)
-            self.apc_namespace = f"mlxbar-vlm-v1-{fingerprint}"
+            self.apc_namespace = APC_NAMESPACE_PREFIX + fingerprint
             maximum = int(os.environ.get("MLXBAR_PROMPT_CACHE_MAX_BYTES", str(5 << 30)))
             disk = DiskBlockStore(
                 self.apc_root,
@@ -214,7 +221,8 @@ class MLXVLMAdapter(BaseAdapter):
             return []
         try:
             entries = [item for item in self.apc_root.iterdir()
-                       if item.is_dir() and item.name != self.apc_namespace]
+                       if item.is_dir() and item.name != self.apc_namespace
+                       and item.name.startswith(APC_NAMESPACE_PREFIX)]
         except OSError:
             return []
 
@@ -322,7 +330,8 @@ class MLXVLMAdapter(BaseAdapter):
         if self.apc_root is None:
             return 0
         try:
-            return sum(1 for item in self.apc_root.iterdir() if item.is_dir())
+            return sum(1 for item in self.apc_root.iterdir()
+                       if item.is_dir() and item.name.startswith(APC_NAMESPACE_PREFIX))
         except OSError:
             return 0
 
@@ -616,6 +625,10 @@ class MLXVLMAdapter(BaseAdapter):
         received_response = False
         generated = 0
         generated_ids: list[int] = []
+        # A retry replaces the state object, and with it the probe that explains
+        # why this request is slow. Carried across so the reason survives the
+        # recovery instead of being reported as an ordinary cold request.
+        retry_probe: dict | None = None
         ticker = _ProgressTicker(params)
         try:
             try:
@@ -650,6 +663,9 @@ class MLXVLMAdapter(BaseAdapter):
                 # shared prefix for this architecture. Before anything was
                 # emitted it is safe to retry once with a fresh cache, which
                 # skips reuse entirely for this request.
+                retry_probe = dict(getattr(self.prompt_cache_state, "last_probe", None) or {})
+                retry_probe.update({"action": "cold",
+                                    "reason": cache_state.COLD_REUSE_UNSUPPORTED})
                 if apc_failed:
                     self._disable_apc_after_failure(exc)
                     kwargs.pop("apc_manager", None)
@@ -689,7 +705,7 @@ class MLXVLMAdapter(BaseAdapter):
                 and hasattr(last_response, "prompt_tokens")):
             apc_after = self._apc_stats_snapshot()
             cached_tokens = int(getattr(last_response, "cached_tokens", 0) or 0)
-            probe = getattr(self.prompt_cache_state, "last_probe", None) or {}
+            probe = retry_probe or (getattr(self.prompt_cache_state, "last_probe", None) or {})
             if probe.get("action") == "restore":
                 # A restored snapshot is the reuse, whichever tier it came from.
                 cache_tier = "disk" if probe.get("restoredFrom") == "disk" else "memory"

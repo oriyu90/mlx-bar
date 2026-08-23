@@ -38,12 +38,26 @@ async def health():
     return {"status": "ok"}
 
 
+def _is_generatable(model: dict) -> bool:
+    """Whether a catalog row can answer `/v1/chat/completions` at all.
+
+    The scanner records everything it finds, including rows it could not read:
+    the component folders of a diffusion model (`vae`, `text_encoder`,
+    `transformer`) look like MLX checkpoints from the outside. The management
+    API keeps them so the UI can explain why they were skipped. Advertising them
+    here is different -- a client that discovers models from this list would
+    offer them as chat models and get a load failure on the first request.
+    """
+    return bool(model.get("engine")) and model.get("format") != "unknown"
+
+
 @router.get("/v1/models")
 async def models(request: Request):
     authorize(request)
     state = app_state(request)
     loaded = state.workers.loaded
-    data = [_model_descriptor(state, model, loaded) for model in state.database.list_models()]
+    data = [_model_descriptor(state, model, loaded)
+            for model in state.database.list_models() if _is_generatable(model)]
     if loaded and not any(item["id"] in {loaded.get("id"), loaded.get("name")} for item in data):
         data.append(_model_descriptor(state, loaded, loaded))
     return {"object": "list", "data": data}
@@ -196,7 +210,9 @@ async def chat(request: Request, body: dict):
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     if body.get("stream", False):
         async def stream():
-            usage = _usage(normalized_messages, "")
+            estimated_prompt_tokens = _estimated_prompt_tokens(normalized_messages)
+            usage = _estimated_usage(estimated_prompt_tokens, "")
+            cached_tokens = None
             completion_text = ""
             created = int(time.time())
             completed = False
@@ -221,7 +237,7 @@ async def chat(request: Request, body: dict):
                     if event.get("type") == "delta":
                         mark_first_token()
                         completion_text += event["text"]
-                        usage = _usage(normalized_messages, completion_text)
+                        usage = _estimated_usage(estimated_prompt_tokens, completion_text)
                         delta = {"content": event["text"]}
                         chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
@@ -257,9 +273,17 @@ async def chat(request: Request, body: dict):
                         yield "data: " + json.dumps(chunk) + "\n\n"
                         completed = True
                     elif event.get("type") == "usage":
-                        usage = _usage_from_event(event, usage)
+                        usage = _usage_from_event(event, usage, cached_tokens)
                         request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
                     elif event.get("type") == "metrics":
+                        if event.get("cached_tokens") is not None:
+                            cached_tokens = int(event["cached_tokens"])
+                            # `metrics` follows `usage`, so the usage already
+                            # built has to learn the reuse count it was missing.
+                            usage = _usage_from_event(
+                                {"prompt_tokens": usage["prompt_tokens"],
+                                 "completion_tokens": usage["completion_tokens"]},
+                                usage, cached_tokens)
                         for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
                                     "cache_tier", "tool_support", "cold_reason",
                                     "shared_prefix_tokens", "held_prefix_tokens"):
@@ -310,6 +334,7 @@ async def chat(request: Request, body: dict):
     tool_calls: list[dict] = []
     finish_reason = "stop"
     usage = None
+    cached_tokens = None
     generation = app_state(request).workers.generate(
         normalized_messages, images, options, request_id, image_root=image_root)
     try:
@@ -329,9 +354,13 @@ async def chat(request: Request, body: dict):
             elif event.get("type") == "completed":
                 finish_reason = event.get("finish_reason") or finish_reason
             elif event.get("type") == "usage":
-                usage = _usage_from_event(event)
+                usage = _usage_from_event(event, None, cached_tokens)
                 request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
             elif event.get("type") == "metrics":
+                if event.get("cached_tokens") is not None:
+                    cached_tokens = int(event["cached_tokens"])
+                    if usage is not None:
+                        usage = _usage_from_event(usage, usage, cached_tokens)
                 for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
                             "cache_tier", "tool_support", "cold_reason",
                             "shared_prefix_tokens", "held_prefix_tokens"):
@@ -377,15 +406,19 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
         loaded = state.workers.loaded
         if loaded and _model_matches(loaded, requested, state):
             return loaded
+        # Resolved before the busy check, because the two answers mean opposite
+        # things to a caller: ENGINE_BUSY is retryable and a missing model never
+        # will be. Reporting a typo as "try again later" makes a client retry
+        # a request that cannot succeed.
+        model = _find_model(state, requested)
+        if not model:
+            raise MLXBarError("MODEL_NOT_FOUND", f"モデル「{requested}」が見つかりません。モデル一覧を再スキャンしてください", 404)
         if loaded and (getattr(state.workers, "active_requests", {})
                        or getattr(state.workers, "queued_requests", {})):
             # Queued requests resolve against whatever model is loaded when
             # their turn comes, so switching under them is as disruptive as
             # switching under a running one.
             raise MLXBarError("ENGINE_BUSY", "別のモデルが応答中のため、モデルを切り替えられません", 429, True)
-        model = _find_model(state, requested)
-        if not model:
-            raise MLXBarError("MODEL_NOT_FOUND", f"モデル「{requested}」が見つかりません。モデル一覧を再スキャンしてください", 404)
         result = await state.workers.load(model)
         state.database.set_metadata_value("last_loaded_model_id", model["id"])
         state.database.set_metadata_value("api_autoload_suspended", "0")
@@ -438,7 +471,11 @@ def _model_descriptor(state, model: dict, loaded: dict | None) -> dict:
         maximum = state.workers.effective_max_tokens()
     descriptor = {"id": model.get("name") or model.get("id"), "object": "model", "created": 0,
                   "owned_by": "mlxbar", "loaded": is_loaded, "max_tokens": maximum,
-                  "context_window": capabilities.get("modelMaxTokens")}
+                  "context_window": capabilities.get("modelMaxTokens"),
+                  # A client cannot infer this from the id, and guessing it
+                  # wrong is not symmetric: a vision model configured as
+                  # text-only silently drops every image it is sent.
+                  "modalities": list(model.get("modalities") or [])}
     if is_loaded:
         # What a client needs in order to keep its own prompt inside the range
         # where reuse actually happens. Advertising it here is cheaper for
@@ -451,18 +488,41 @@ def _model_descriptor(state, model: dict, loaded: dict | None) -> dict:
     return descriptor
 
 
-def _usage(messages: list[dict], text: str) -> dict:
+def _estimated_prompt_tokens(messages: list[dict]) -> int:
+    """A stand-in until the runtime reports the real count.
+
+    Serialising the messages is the expensive half, and the prompt cannot change
+    while a response streams, so it is measured once per request rather than
+    once per token. At OpenClaw-sized prompts the difference is a JSON dump of
+    several hundred kilobytes per generated token.
+    """
     prompt_chars = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
-    prompt_tokens = max(1, (prompt_chars + 3) // 4)
+    return max(1, (prompt_chars + 3) // 4)
+
+
+def _estimated_usage(prompt_tokens: int, text: str) -> dict:
     completion_tokens = (len(text) + 3) // 4
     return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens}
 
 
-def _usage_from_event(event: dict, fallback: dict | None = None) -> dict:
+def _usage(messages: list[dict], text: str) -> dict:
+    return _estimated_usage(_estimated_prompt_tokens(messages), text)
+
+
+def _usage_from_event(event: dict, fallback: dict | None = None,
+                      cached_tokens: int | None = None) -> dict:
     prompt = int(event.get("prompt_tokens", (fallback or {}).get("prompt_tokens", 0)))
     completion = int(event.get("completion_tokens", (fallback or {}).get("completion_tokens", 0)))
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+             "total_tokens": prompt + completion}
+    # Absent when the runtime did not report reuse at all. "No cache hit" and
+    # "not measured" mean different things to a client that adjusts its own
+    # context budget from this number, so the field is omitted rather than
+    # reported as zero.
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": max(0, min(int(cached_tokens), prompt))}
+    return usage
 
 
 def _normalize_input_tool_calls(calls: list) -> list[dict]:

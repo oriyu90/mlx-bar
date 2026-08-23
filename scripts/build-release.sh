@@ -8,7 +8,7 @@ APP_DIR="$DIST_DIR/MLXBar.app"
 CONTENTS="$APP_DIR/Contents"
 PYINSTALLER_DIR="$PROJECT_DIR/.release-python"
 DMG_STAGE="$PROJECT_DIR/.dmg-stage"
-VERSION=1.6.0
+VERSION=1.6.1
 
 # Prefer the complete Xcode toolchain when it is installed. A separately
 # updated Command Line Tools package can temporarily expose a compiler/SDK

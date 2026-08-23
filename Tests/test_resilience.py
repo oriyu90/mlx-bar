@@ -749,3 +749,110 @@ class LiveGenerationRateTests(unittest.IsolatedAsyncioTestCase):
         supervisor = WorkerSupervisor(self.root, self.settings)
         supervisor.active_requests["odd"] = object()
         self.assertEqual(supervisor.status()["activeRequestCount"], 1)
+
+
+def test_an_unexpected_management_failure_is_logged_and_named(caplog=None):
+    """A 500 that leaves no trace is a bug nobody can report.
+
+    Request failures were not written anywhere: the service log records asyncio
+    task errors, and the bare "Internal Server Error" body names nothing. One
+    line with the route and the traceback is what turns "the cache page is
+    broken" into something actionable.
+    """
+    import logging
+    import tempfile
+    from pathlib import Path as _Path
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from mlxbar.database import Database
+    from mlxbar.main import make_management_app
+    from mlxbar.settings import SettingsStore
+
+    class Exploding:
+        loaded = {"engine": "mlx-vlm"}
+
+        async def prompt_cache_stats(self):
+            raise RuntimeError("worker went away")
+
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(settings=SettingsStore(_Path(directory)), workers=Exploding(),
+                                database=Database(_Path(directory) / "state.sqlite3"))
+        client = TestClient(make_management_app(state), raise_server_exceptions=False)
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger = logging.getLogger("mlxbar.main")
+        logger.addHandler(handler)
+        try:
+            response = client.get("/api/v1/prompt-cache")
+        finally:
+            logger.removeHandler(handler)
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "INTERNAL_ERROR"
+        assert any("/api/v1/prompt-cache" in record.getMessage() for record in records)
+        assert any(record.exc_info for record in records)
+
+
+def test_the_cache_report_answers_while_the_worker_is_generating():
+    """A read that waits on the MLX thread cannot answer during a generation.
+
+    The Worker serialises RPCs behind the model, so on a 27B this read blocks
+    for minutes -- and "is my prompt cache working?" is precisely the question a
+    minutes-long request provokes. Answering with what is known, labelled as
+    such, beats a 500 at the only moment anyone looks.
+    """
+    import asyncio
+    import httpx
+    from mlxbar.workers.supervisor import WorkerSupervisor
+
+    supervisor = WorkerSupervisor.__new__(WorkerSupervisor)
+    supervisor.loaded = {"engine": "mlx-vlm", "capabilities": {"promptCache": {
+        "enabled": True, "rollbackCapability": "checkpoint", "reuseFailures": 3}}}
+    supervisor.socket_path = "/tmp/does-not-matter.sock"
+
+    async def timing_out(*_args, **_kwargs):
+        raise httpx.ReadTimeout("")
+
+    supervisor._call = timing_out
+    stats = asyncio.run(supervisor.prompt_cache_stats())
+    assert stats["stale"] is True
+    assert stats["staleReason"] == "worker_busy"
+    assert stats["rollbackCapability"] == "checkpoint"
+    assert stats["reuseFailures"] == 3
+
+
+def test_the_api_port_is_reusable_after_a_restart_but_not_while_taken():
+    """Quit, replace, launch: the old listener is still in TIME_WAIT.
+
+    SO_REUSEADDR forgives that state and nothing else -- a port another process
+    is actively listening on still fails to bind, so a genuine conflict is still
+    reported instead of two servers claiming the same port.
+    """
+    import asyncio
+    import socket
+    from types import SimpleNamespace
+    from mlxbar.main import PublicListener
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+
+    listener = PublicListener.__new__(PublicListener)
+    listener.app = None
+    listener.state = SimpleNamespace(settings=SimpleNamespace(data={"api": {}}))
+    try:
+        asyncio.run(listener._launch("127.0.0.1", port))
+    except RuntimeError as exc:
+        assert "使用できません" in str(exc)
+    else:
+        raise AssertionError("binding a port in use should fail")
+    finally:
+        holder.close()
+
+    # The same port, now only lingering, binds again.
+    reopened = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reopened.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    reopened.bind(("127.0.0.1", port))
+    reopened.close()

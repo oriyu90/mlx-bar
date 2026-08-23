@@ -5,6 +5,30 @@
 
 ## 未解決の課題
 
+### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）
+
+**出発点は「テストが通っているのに、実機のAPIログが全部coldになる」**。v1.6.0の37件のテストは全部緑で、実機の191件の生成のうち`cold_reason`が入っている行はゼロ、`shared_prefix_tokens`が0でない行もゼロだった。**その2つが同時に起きているとき、疑うのは機能ではなく計装である。**
+
+**判定は「型」に聞くこと、「値」に聞かないこと。** `can_capture()`が`hasattr(entry, "state")`でインスタンスを読んでいた。能力プローブはロード直後の**空の**キャッシュに対して走る（重みが要らないので安い）が、空の`KVCache`は`state`ゲッターが`self.keys.shape[2]`を読むため`AttributeError`になり、`hasattr`はそれを`False`に変換する。結果、注意層と再帰層が混在するモデルはすべて`rollbackCapability: none`。**v1.6.0の主機能は一度も起動していない。** `getattr(type(entry), "state", None)`がpropertyでfsetを持つかだけ見れば、空でも同じ答えが出る。
+
+**mlx-vlmは`.cache`を2回読む。** `dispatch.py:844`の`if prompt_cache_state is not None and prompt_cache_state.cache is not None:`が1回目、`846`の`kv_cache = prompt_cache_state.cache`が2回目。v1.6.0の順序ガードは「まだ誰も読んでいないときだけ差し替える」で、1回目を数えてしまうため**復元経路に一度も入らない**。v1.5.0のメモにある「`find_prefix_length()`は`.cache`読み出しより前に呼ばれる」は1行ずれていた。**上流の行番号をメモに書くときは、その行の前後も一緒に読むこと。**
+
+**差し替えではなく中身の入れ替えにすれば、順序に依存しなくなる。** 保持しているリストを`clear()`して`extend()`する。呼び出し側が先に参照を取っていても、その参照が復元後のキャッシュになる。ついでに`.cache = None`をやめられる——ランタイムは自分のnull検査を通過済みで、その後に渡されたものを反復して破棄量を計算するので、`None`を返すと`TypeError: 'NoneType' object is not iterable`になる。**v1.6.0にこの地雷が埋まっていたが、復元経路に到達しないので踏めなかった。順序ガードだけ直すと露出する。**
+
+**ランタイムは破棄量を「返した長さ」ではなく「キャッシュのoffset」から計算する。** `_prefix_cache_trim_amount()`は`max(offset) - prefix_len`。したがってキャッシュが自分のラベルより先行していると、**単なる継続でも**`trim()`に届く。事前判定は「巻き戻しが要るか」ではなく「**返す長さが破棄を生まないか**」で書くこと。稼働中のWorkerで14件記録されていた。
+
+**`mx.save_safetensors`は拡張子で終わらないパスに`.safetensors`を足す。** `<digest>.safetensors.tmp`へ書くと`<digest>.safetensors.tmp.safetensors`ができ、直後の`chmod`がENOENTで落ちる。読めないスナップショットと214 MBの残骸だけが残る。一時ファイル名は**拡張子で終わらせる**（`<digest>.tmp.safetensors`）。**偽の`mlx.core`は言われたとおりの場所へ書いていたので、単体テストでは出ない。** 偽モジュールは実物の癖まで真似ること。
+
+**APCの世代掃除とCheckpointStoreの保存先が同じ親を共有していた。** `apc_root.iterdir()`のうち現在のnamespace以外を古い順に消す実装で、`checkpoints/`もその対象に見える。世代が2つ以上ある状態で、いま使っているモデルのスナップショットごと消えうる。掃除の対象は名前の接頭辞（`mlxbar-vlm-v1-`）で限定する。
+
+**計装は「列がある」ではなく「端から端まで届く」でテストする。** `cold_reason` / `shared_prefix_tokens` / `held_prefix_tokens`は、列もmigrationもWorkerもUIもv1.6.0で揃っていたが、`main.py`のアクセスログが組み立てる辞書にだけ載っていなかった。DB層の単体テストは通る。**Workerのイベント→APIログ→DBを1本で通すテストを書くこと**（`test_the_workers_cache_report_reaches_the_api_log`）。再試行が走ると`last_probe`が差し替えで消えるので、probeは`_reset_prompt_cache()`の前に控えておく。
+
+**まだ残っている問題**
+
+- **同一モデルを複数クライアントで共有すると、キャッシュを取り合う。** `PromptCacheState`もCheckpointStoreのメモリ層も**1本しか持たない**。LANのエージェントとローカルのテストを交互に流すと、双方が毎回相手のprefixを追い出して両方coldになる。実測で確認済み（LAN側が77,127 tokenのprompt、共通prefixは相手の925 tokenだけ）。会話ごとにスロットを持つ設計が要るが、27B級のキャッシュを複数保持するメモリ予算と直結するので、`memoryRatio`の設計とセットで考えること。
+- **`/api/v1/prompt-cache`はWorkerのMLXスレッドを待つ。** v1.6.1で「生成中は`stale: true`で既知の値を返す」ようにしたが、根本は「読み取り専用のRPCが生成と同じスレッドで直列化されている」こと。統計だけ別スレッドで答えられるようにするなら、`apc_manager.stats_snapshot()`がMLX配列に触らないことを先に確認すること。
+- **OpenClawの無応答監視はSSEコメントを数えない。** MLXBarのheartbeatはコメントなので届かない。可視イベント（content / reasoning / tool call）だけがタイマーをリセットする。prefill中は送れる本物のデータが無いので**MLXBar側では塞げない**。READMEの手順で`models.providers.<id>.timeoutSeconds`を指定してもらうしかない。空の`delta: {}`も効かないことを実測で確認済み。
+
 ### 中断後の再開とtrim非依存の再利用（v1.6.0対応）
 
 **当初の想定が外れた点から書く。** v1.5.0の「次にやるなら」には「部分ロールバック（prefill完了時点へのtrim）ができれば」と書いたが、**この方向は原理的に行き止まりだった。** `Qwen3.8-27B`は64層中48層が`linear_attention`で、その状態は`ArraysCache`＝固定サイズの漸化式状態。「末尾Nトークンを削る」という操作が数学的に存在しないので、`trim`相当のAPIをどこに足しても解けない。**巻き戻しではなく複製と復元（checkpoint）が唯一の解**である。

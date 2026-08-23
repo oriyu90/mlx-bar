@@ -91,6 +91,7 @@ class CheckpointStore:
                 self.directory.mkdir(parents=True, exist_ok=True)
                 os.chmod(self.directory, 0o700)
                 self._sweep_stale(max(1, int(keep_generations)))
+                self._drop_partial_writes()
             except OSError as exc:
                 self.root = None
                 self.disabled_reason = f"initialization_failed:{type(exc).__name__}"
@@ -101,6 +102,18 @@ class CheckpointStore:
     @property
     def directory(self) -> Path:
         return (self.root or Path(".")) / (self.namespace or "default")
+
+    def _drop_partial_writes(self) -> None:
+        """Remove snapshots that were never finished.
+
+        A write that dies between the temporary file and the rename leaves a
+        file no index refers to, so nothing else would ever reclaim it -- and
+        one of these is measured in hundreds of megabytes.
+        """
+        with contextlib.suppress(OSError):
+            for stale in self.directory.glob("*.tmp*"):
+                with contextlib.suppress(OSError):
+                    stale.unlink()
 
     def _sweep_stale(self, keep: int) -> None:
         """Drop generations this model or runtime can no longer read.
@@ -299,7 +312,11 @@ class CheckpointStore:
         try:
             import mlx.core as mx
             arrays, manifest = cache_state.flatten(payload)
-            temporary = self.directory / (name + ".tmp")
+            # The suffix has to stay last: mlx appends `.safetensors` to any
+            # path that does not already end in it, so writing to
+            # "<digest>.safetensors.tmp" silently produces a third name that
+            # nothing afterwards -- chmod, rename, eviction -- can find.
+            temporary = self.directory / f"{digest}.tmp.safetensors"
             mx.save_safetensors(str(temporary), arrays)
             os.chmod(temporary, 0o600)
             temporary.replace(self.directory / name)
@@ -309,7 +326,7 @@ class CheckpointStore:
         except Exception as exc:
             LOGGER.warning("Could not persist prompt cache snapshot: %s", exc)
             with contextlib.suppress(OSError):
-                (self.directory / (name + ".tmp")).unlink()
+                (self.directory / f"{digest}.tmp.safetensors").unlink()
             return None
         self.bytes_written += size
         entries.append({"tokens": len(ids), "digest": digest, "file": name,
@@ -372,75 +389,98 @@ def build_guarded_state(base_class, controller) -> Any:
     call time rather than at import. Only two documented interactions are used:
     the runtime asks for a shared prefix length, then reads the cache. Nothing
     reaches into the runtime's internals.
+
+    Two properties make the answer safe whatever order the runtime uses.
+
+    The returned length never leaves the runtime with trailing tokens to drop
+    from a cache that cannot drop them. mlx-vlm computes that amount from the
+    cache's own offset, not from the length it was handed, so a cache that sits
+    ahead of its own labels turns an ordinary continuation into a ``trim()``
+    call on a recurrent component. Proving the two agree before answering is
+    what keeps the exception from existing.
+
+    A restored snapshot is moved **into the retained cache list** rather than
+    replacing it. mlx-vlm 0.6.15 reads ``.cache`` once to test it for ``None``
+    and again after asking for the length, and a future version may read it only
+    once, before asking. Mutating the list the caller already holds makes both
+    orders correct, and it is also why this path never leaves ``.cache`` as
+    ``None``: the runtime has already passed its own ``is not None`` test by
+    then, and would fail computing the drop amount from nothing.
     """
 
     class GuardedPromptCacheState(base_class):
         def __init__(self):
-            self._cache_reads = 0
             self._last_probe = None
             super().__init__()
 
-        # `cache` is a property so the state can tell whether the runtime read
-        # it before or after asking for the prefix length. A snapshot may only
-        # be swapped in when the read comes after: swapping under a caller that
-        # already holds the previous cache would pair one cache with another
-        # cache's prefix length, which is silent corruption rather than a slow
-        # request.
-        @property
-        def cache(self):
-            self._cache_reads += 1
-            return self._cache
-
-        @cache.setter
-        def cache(self, value):
-            self._cache = value
-
         def begin_request(self) -> None:
-            self._cache_reads = 0
             self._last_probe = None
 
         @property
         def last_probe(self) -> dict | None:
             return self._last_probe
 
+        def _take_held_list(self) -> list:
+            """Empty the retained cache in place and hand the same list back.
+
+            Emptying releases the components before a replacement is built: on
+            this path the retained cache is lost either way -- it cannot be
+            rolled back, and whatever happens next replaces it -- so holding it
+            through the restore would only put a third full cache in unified
+            memory at the moment there is least room for one.
+            """
+            held = self.cache
+            if not isinstance(held, list):
+                held = []
+                self.cache = held
+                return held
+            held.clear()
+            return held
+
         def find_prefix_length(self, new_ids: list) -> int:
             held = list(self.token_ids or [])
             natural = super().find_prefix_length(new_ids)
+            cached = cache_state.cached_length(self.cache)
             probe = {"promptTokens": len(new_ids), "heldTokens": len(held),
-                     "sharedPrefix": int(natural), "action": "reuse", "restoredFrom": None}
+                     "cachedTokens": cached, "sharedPrefix": int(natural),
+                     "action": "reuse", "restoredFrom": None}
             controller.observe_prompt(list(new_ids))
+            if not self.cache:
+                # An emptied cache still passes the runtime's `is not None`
+                # test. Claiming a prefix against it would make the runtime skip
+                # those tokens and generate from nothing, which is wrong output
+                # rather than a slow request.
+                probe["action"] = "cold"
+                probe["reason"] = cache_state.COLD_NO_PREFIX if held else cache_state.COLD_FIRST_REQUEST
+                self._last_probe = probe
+                return 0
             if natural <= 0:
                 probe["action"] = "cold"
                 probe["reason"] = cache_state.COLD_NO_PREFIX if held else cache_state.COLD_FIRST_REQUEST
                 self._last_probe = probe
                 return 0
-            if natural >= len(held):
-                # Pure continuation: the retained cache is already the prefix,
-                # so no rollback is involved and every architecture can reuse it.
+            if natural >= len(held) and (cached is None or cached <= natural):
+                # Pure continuation, and the cache agrees it holds exactly this
+                # much: nothing is dropped, so every architecture can reuse it.
                 self._last_probe = probe
                 return natural
             # A rollback is required. Ask the cache itself whether it can do one.
-            if cache_state.can_trim(self._cache):
+            if cache_state.can_trim(self.cache):
                 probe["action"] = "trim"
                 self._last_probe = probe
                 return natural
-            restored = None
-            if self._cache_reads == 0:
-                # Release the retained cache before building the replacement.
-                # On this path it is already lost either way -- it cannot be
-                # rolled back, and whatever happens next replaces it -- so
-                # holding it through the restore only puts a third full cache in
-                # unified memory at the moment there is least room for one.
-                self._cache = None
-                restored = controller.restore_for(list(new_ids))
+            held_list = self._take_held_list()
+            restored = controller.restore_for(list(new_ids))
             if restored is not None:
                 cache, ids, tier = restored
-                self._cache = cache
+                held_list.extend(cache)
+                self.cache = held_list
                 self.token_ids = list(ids)
                 probe.update({"action": "restore", "restoredFrom": tier,
                               "sharedPrefix": len(ids)})
                 self._last_probe = probe
                 return len(ids)
+            self.token_ids = None
             probe.update({"action": "cold", "reason": cache_state.COLD_REUSE_UNSUPPORTED})
             self._last_probe = probe
             # Refusing here is what keeps the runtime away from `trim()` on a
