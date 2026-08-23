@@ -20,6 +20,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
 - mlx-lm・mlx-vlm両方で長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
+- 生成を中断しても、そこまでに計算した分を保持して次のターンから再開
 - ZCode等のOpenAI Chat Completionsクライアント向けtool calling（履歴、`tools`、`tool_choice`、ストリーミング差分）
 - 本文とAPIキーを含めない、最大2,000件の最近のAPIログ
 - モデルから検出したトークン上限の表示、ユーザー上限設定、超過要求の自動調整
@@ -216,15 +217,21 @@ tool calling有効時も通常本文を生成中に逐次配信します。Qwen�
 
 v1.4.1では、ZCodeやGUIがSSE接続を途中で閉じても内側の生成処理を明示的に終了します。生成ロックは要求ID付きで所有され、所有者が実行中にも待機中にも存在しない孤立状態だけをGUI状態更新やキューheartbeatが自動回復します。正常なキュー移行や別要求のロックは解放しないため、モデル生成の直列性を維持します。診断情報の`generationLockState`と`generationLockRecoveries`で回復状態を確認できます。
 
-mlx-lm・mlx-vlmのテキスト要求では、過去の要求との最長共通token prefixを安全に再利用します。mlx-lmではmlx-lm公式の`LRUPromptCache`をRAM層、prefix snapshotをディスク層として使います。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有せず、キャンセル・生成失敗時は途中キャッシュを破棄します。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
+mlx-lm・mlx-vlmのテキスト要求では、過去の要求との最長共通token prefixを安全に再利用します。mlx-lmではmlx-lm公式の`LRUPromptCache`をRAM層、prefix snapshotをディスク層として使います。ZCodeが毎ターン送る大きなsystem prompt・tools定義・会話履歴を再計算せず、OpenAI形式のmessages・tools・tool calling動作は変更しません。画像内容はtokenだけでは同一性を確認できないため画像要求にはキャッシュを共有しません。キャンセル時の扱いはv1.6.0で変わりました（下記）。メモリ安全上限に達した場合はキャッシュだけを解放して再判定します。モデルロード後の最初の要求や共通prefixがない要求は従来どおりcold prefillが必要です。
 
 v1.4.0では、mlx-vlm公式の`APCManager` / `DiskBlockStore`をディスク専用の下位層として追加しました。現在の`PromptCacheState`は高速なRAM層として維持され、Worker再起動後は`~/Library/Application Support/MLXBar/prompt-cache/`から共通prefixを復元します。モデル、tokenizer/chat template、重み、mlx-vlmランタイム版が変わると別namespaceになるため、互換性のないcacheを読みません。hybrid exact-cacheでは末尾256 tokensを毎回再計算し、その前の長いsystem/tools prefixを異なる最初のユーザー文でも再利用できるようにします。画像要求は引き続き共有対象外です。
 
 v1.5.0では、これまでmlx-vlm経路にしかなかった仕組みをmlx-lmにも用意しました。RAM層はmlx-lm公式の`LRUPromptCache`で、複数のprefixを木構造で保持して最も長く一致するものを返します。ディスク層は`save_prompt_cache` / `load_prompt_cache`によるprefix snapshotで、mlx-vlm側と同じく末尾256 tokensをcoldに残すため、最初のユーザー文が変わっても大きなsystem/tools prefixを再利用できます。保存するのは常にプロンプト部分までで、モデル自身の応答をprefixとして保存することはありません。
 
-namespaceはモデルとランタイム版から作られるため、モデル切替やランタイム更新のたびに新しい世代が生まれます。容量上限は1世代の中でしか効かないので、`promptCache.keepGenerations`（既定2）を超えた古い世代は自動削除します。RAM層は`promptCache.memoryRatio`（既定0.10、物理メモリ比）で上限を設けます。8,000 token規模のsnapshotは1 GBに達するため、どちらの上限も実測に基づいて設定してください。
+namespaceはモデルとランタイム版から作られるため、モデル切替やランタイム更新のたびに新しい世代が生まれます。容量上限は1世代の中でしか効かないので、`promptCache.keepGenerations`（既定2）を超えた古い世代は自動削除します。RAM層は`promptCache.memoryRatio`（既定0.10、物理メモリ比）で上限を設けます。8,000 token規模のsnapshotは1 GBに達するため、どちらの上限も実測に基づいて設定してください。v1.6.0以降、1トークンあたりの必要量はモデルの`config.json`から算出してロード時に表示するので、上限が足りているかは推測せずに確認できます。
 
-v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻き戻せない場合でも要求を失敗させません。Qwen3.5／3.8系のようにhybrid層を持つモデルでは、会話が枝分かれしたターンでランタイムの巻き戻し処理が失敗することがあります。再利用はあくまで最適化なので、応答をまだ送信していなければ新しいキャッシュで一度だけ再試行します。ディスクキャッシュは再試行でも参照されるため、cold prefillではなくdisk hitになります。回復回数は`GET /api/v1/prompt-cache`の`reuseFailures`で確認できます。
+v1.6.0で追加した設定: `promptCache.branchCheckpoint`（`auto`／`off`、既定`auto`）は、巻き戻せないアーキテクチャで完了ターンのスナップショットを保持するかを切り替えます。`promptCache.diskWriteBudgetGB`（既定32）はWorkerの生存期間あたりの書き込み量の上限です。長い会話のスナップショットは1件で数GBに達するため、上限のないディスク層はキャッシュではなく継続的な書き込み負荷になります。`promptCache.memoryBlocks`（`auto`／`off`、既定`off`）はmlx-vlmのAPCブロックプールを有効にしますが、27B級ハイブリッドでの実測がないため既定では有効にしていません。
+
+v1.5.1では、ランタイムがキャッシュを短い共通prefixまで巻き戻せない場合でも要求を失敗させません。応答をまだ送信していなければ新しいキャッシュで一度だけ再試行します。回復回数は`GET /api/v1/prompt-cache`の`reuseFailures`で確認できます。**v1.6.0以降、この再試行は安全網であって通常経路ではありません**（巻き戻しの可否を事前に判定するため、そもそも失敗しません）。
+
+v1.6.0では、中断した生成のキャッシュを破棄しません。ランタイムは再利用したキャッシュをその場で進めますが、対応するトークンIDを書き戻すのは生成が完走したときだけなので、中断したターンではキャッシュだけが1手先に進みます。プロンプトのトークンIDと生成トークンを記録して対応を組み直し、**報告されるoffsetが「プロンプト＋生成」と一致して対応を証明できるときだけ**書き換えます。証明できない場合と、offsetを報告しないランタイムでは従来どおり破棄します。
+
+また、Qwen3.5／3.8系のように再帰層を含むモデルはキャッシュを短いprefixへ巻き戻せません（再帰状態に「末尾Nトークン」が存在しないため）。v1.6.0はこの可否をキャッシュ自身へ問い合わせてランタイムより手前で判定し、巻き戻せない場合は完了ターンのスナップショットを復元します。判定材料はメソッドの存在だけで、モデル名・アーキ名・ランタイム版で分岐しません。詳しくは「プロンプトの再利用と中断からの再開」を参照してください。
 
 「設定…」→「キャッシュ」では永続cacheの有効/無効、1〜100 GB（既定10 GB）の容量上限、使用量・disk hit数を確認でき、RAMまたはdisk cacheを個別に消去できます。永続cacheはKV状態とtoken IDをローカルへ保存するため、MLXBar専用フォルダはユーザーだけがアクセスできる権限で作成します。「すべてのデータを削除して終了」でも削除されます。APCの初期化・復元に失敗した場合、応答をまだ送信していなければv1.3.7の`PromptCacheState`/cold経路で一度だけ再試行します。OpenAI APIのmessages、tools、応答形式は変更しません。
 
