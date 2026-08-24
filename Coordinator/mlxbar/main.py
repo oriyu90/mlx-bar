@@ -401,31 +401,43 @@ def configure_logging(root: Path) -> None:
 
 
 def _preload_last_model(state) -> "asyncio.Task | None":
-    """Reload the model that was in use before the last shutdown.
+    """Reload explicitly retained models and, optionally, the last model.
 
     Deliberately skipped when the user unloaded the model themselves: that flag
     is the difference between "MLXBar restarted" and "I turned this off", and
     only the first is an invitation to load 27 GB of weights unasked.
     """
-    if not state.settings.data.get("general", {}).get("preloadLastModel", True):
-        return None
     if state.database.metadata_value("api_autoload_suspended") == "1":
         return None
-    model_id = state.database.metadata_value("last_loaded_model_id")
-    if not model_id:
+    ids = [str(profile.get("modelId"))
+           for profile in state.settings.data.get("models", {}).get("pool", {}).get("profiles", [])
+           if profile.get("keepLoaded") and profile.get("modelId")]
+    if state.settings.data.get("general", {}).get("preloadLastModel", True):
+        model_id = state.database.metadata_value("last_loaded_model_id")
+        if model_id and model_id not in ids:
+            ids.append(model_id)
+    if not ids:
         return None
 
     async def work() -> None:
         try:
             async with state.model_autoload_lock:
-                if state.workers.loaded:
-                    return
-                model = next((item for item in state.database.list_models()
-                              if item.get("id") == model_id), None)
-                if model is None:
-                    return
-                await state.workers.load(model)
-                logging.getLogger(__name__).info("Preloaded %s", model.get("name") or model_id)
+                catalog = {item.get("id"): item for item in state.database.list_models()}
+                for model_id in ids:
+                    model = catalog.get(model_id)
+                    if model is None:
+                        continue
+                    try:
+                        await state.workers.load(model)
+                        logging.getLogger(__name__).info(
+                            "Preloaded %s", model.get("name") or model_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # One incompatible retained model must not block all
+                        # remaining safe preloads.
+                        logging.getLogger(__name__).warning(
+                            "Could not preload %s: %s", model_id, exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

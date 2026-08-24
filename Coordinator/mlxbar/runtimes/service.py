@@ -20,6 +20,7 @@ class RuntimeUpdateService:
 
         old_slot = self.slots.active(engine).get("active")
         loaded = None
+        resident = []
         staged = None
         activated = False
         maintenance = False
@@ -29,22 +30,34 @@ class RuntimeUpdateService:
             self.database.add_runtime_history(engine, new_slot, "staged", {"check": candidate, "probe": staged["probe"]})
             self.workers.begin_maintenance(engine)
             maintenance = True
+            snapshot = getattr(self.workers, "snapshot_resident", None)
+            resident = snapshot(engine) if snapshot else []
             loaded = self.workers.loaded.copy() if self.workers.loaded and self.workers.loaded.get("engine") == engine else None
-            if loaded:
+            if loaded and not resident:
+                resident = [{"model": loaded, "engine": engine, "sessionPinned": True}]
+            if resident:
                 await progress(0.91, "実行中の生成が終わるのを待っています")
                 if not await self.workers.wait_until_idle(timeout=30):
                     raise MLXBarError("ENGINE_BUSY", "生成が続いているため切替を中止しました。生成完了後に再実行してください", 409, True)
             await progress(0.92, "新しいランタイムへ切替中")
-            if loaded:
-                await self.workers.unload()
+            if resident:
+                unload_engine = getattr(self.workers, "unload_engine", None)
+                if unload_engine:
+                    await unload_engine(engine)
+                else:
+                    await self.workers.unload()
             self.slots.activate(engine, new_slot)
             activated = True
             await progress(0.95, "切替後のワーカーを確認中")
-            if not self.workers.loaded:
+            if not self.workers.loaded or callable(getattr(self.workers, "snapshot_resident", None)):
                 await self.workers.probe_runtime(engine)
-            if loaded:
+            if resident:
                 await progress(0.97, "使用中モデルを再ロード中")
-                await self.workers.load(loaded, engine)
+                reload_resident = getattr(self.workers, "reload_resident", None)
+                if reload_resident:
+                    await reload_resident(resident, engine)
+                else:
+                    await self.workers.load(loaded, engine)
             result = {"engine": engine, "updated": True, "fromSlot": old_slot,
                       "toSlot": new_slot, "version": staged["probe"].get("version"), "check": candidate}
             result["removedSlots"] = self.slots.cleanup(
@@ -62,10 +75,18 @@ class RuntimeUpdateService:
             rollback_error = None
             if activated:
                 try:
-                    await self.workers.unload()
+                    unload_engine = getattr(self.workers, "unload_engine", None)
+                    if unload_engine:
+                        await unload_engine(engine)
+                    else:
+                        await self.workers.unload()
                     self.slots.restore(engine, old_slot)
-                    if loaded and old_slot:
-                        await self.workers.load(loaded, engine)
+                    if resident and old_slot:
+                        reload_resident = getattr(self.workers, "reload_resident", None)
+                        if reload_resident:
+                            await reload_resident(resident, engine)
+                        else:
+                            await self.workers.load(loaded, engine)
                 except Exception as rollback_exc:
                     rollback_error = str(rollback_exc)
             self.database.add_runtime_history(engine, failed_slot, "cancelled" if cancelled else "failed", {

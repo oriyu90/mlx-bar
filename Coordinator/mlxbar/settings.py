@@ -19,6 +19,22 @@ DEFAULTS: dict[str, Any] = {
         "watchFolders": True,
         "autoLoadOnAPIRequest": True,
         "roots": [],
+        "pool": {
+            # Keep independent model processes warm while preserving the
+            # pre-v1.6.2 global single-generation contract.  A process boundary
+            # contains runtime/model crashes and gives each model an allocator
+            # ceiling of its own.
+            "enabled": True,
+            "maxResidentModels": 2,
+            "totalMemoryRatio": 0.75,
+            "minimumSystemReserveGB": 4,
+            "defaultPerModelMaxGB": 32,
+            "idleTTLSeconds": 900,
+            # Loads are deliberately serial: two simultaneous cold loads have
+            # the least predictable combined allocation peak.
+            "loadConcurrency": 1,
+            "profiles": [],
+        },
         "lmStudio": {
             "enabled": True,
             "folder": None,
@@ -190,6 +206,45 @@ class SettingsStore:
             raise ValueError("api.maxConcurrentConnections must be between 1 and 1024")
         if not isinstance(data.get("models", {}).get("autoLoadOnAPIRequest"), bool):
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
+        pool = data.get("models", {}).get("pool", {})
+        if not isinstance(pool.get("enabled", True), bool):
+            raise ValueError("models.pool.enabled must be boolean")
+        pool_integer_ranges = {
+            "maxResidentModels": (1, 8),
+            "idleTTLSeconds": (30, 86400),
+            "loadConcurrency": (1, 1),
+        }
+        for key, (minimum, maximum) in pool_integer_ranges.items():
+            value = pool.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(f"models.pool.{key} must be between {minimum} and {maximum}")
+        total_ratio = pool.get("totalMemoryRatio")
+        if (isinstance(total_ratio, bool) or not isinstance(total_ratio, (int, float))
+                or not 0.5 <= float(total_ratio) <= 0.9):
+            raise ValueError("models.pool.totalMemoryRatio must be between 0.5 and 0.9")
+        for key, minimum, maximum in (("minimumSystemReserveGB", 1, 128),
+                                      ("defaultPerModelMaxGB", 1, 512)):
+            value = pool.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not minimum <= float(value) <= maximum):
+                raise ValueError(f"models.pool.{key} must be between {minimum} and {maximum}")
+        profiles = pool.get("profiles")
+        if not isinstance(profiles, list) or len(profiles) > 64:
+            raise ValueError("models.pool.profiles must be an array with at most 64 entries")
+        seen_profiles: set[str] = set()
+        for profile in profiles:
+            if not isinstance(profile, dict) or not isinstance(profile.get("modelId"), str):
+                raise ValueError("each models.pool profile needs a modelId")
+            model_id = profile["modelId"].strip()
+            if not model_id or model_id in seen_profiles:
+                raise ValueError("models.pool profile modelId values must be unique and non-empty")
+            seen_profiles.add(model_id)
+            if not isinstance(profile.get("keepLoaded", False), bool):
+                raise ValueError("models.pool profile keepLoaded must be boolean")
+            maximum = profile.get("maxMemoryGB", pool.get("defaultPerModelMaxGB"))
+            if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
+                    or not 1 <= float(maximum) <= 512):
+                raise ValueError("models.pool profile maxMemoryGB must be between 1 and 512")
         if data.get("general", {}).get("language") not in {"en", "ja"}:
             raise ValueError("general.language must be en or ja")
         if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):

@@ -123,6 +123,7 @@ class BaseAdapter:
         # prefill or a worker the OS kills.
         self._abort_reasons: dict[str, float] = {}
         self._abort_kinds: dict[str, str] = {}
+        self._applied_memory_limits: dict[str, int] = {}
 
     def note_abort(self, request_id: str, reason: str) -> None:
         if not request_id:
@@ -147,7 +148,8 @@ class BaseAdapter:
 
     def capabilities(self) -> dict:
         return {"engine": self.engine, "protocolVersion": 1, "streaming": True,
-                "modalities": ["text"], "loaded": self.model is not None}
+                "modalities": ["text"], "loaded": self.model is not None,
+                "memoryLimits": dict(self._applied_memory_limits)}
 
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         raise NotImplementedError
@@ -223,6 +225,17 @@ class BaseAdapter:
             physical = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
         if physical <= 0:
             return applied
+        # Unlike the pressure watchdog, set_memory_limit is enforced by MLX's
+        # allocator.  In pool mode it is an absolute per-worker reservation,
+        # not a copy of a machine-wide ratio.  Apply it before model.load().
+        try:
+            absolute = int(os.environ.get("MLXBAR_MLX_MEMORY_LIMIT_BYTES", "0"))
+        except (TypeError, ValueError):
+            absolute = 0
+        memory_limit = getattr(mx, "set_memory_limit", None)
+        if absolute > 0 and callable(memory_limit):
+            memory_limit(absolute)
+            applied["set_memory_limit"] = absolute
         for name, variable, default in (("set_wired_limit", "MLXBAR_WIRED_LIMIT_RATIO", 0.0),
                                         ("set_cache_limit", "MLXBAR_CACHE_LIMIT_RATIO", 0.0)):
             try:
@@ -239,6 +252,7 @@ class BaseAdapter:
             with contextlib.suppress(Exception):
                 function(int(physical * ratio))
                 applied[name] = int(physical * ratio)
+        self._applied_memory_limits.update(applied)
         return applied
 
     def stream(self, request_id: str, params: dict) -> Iterator[dict]:
@@ -249,7 +263,8 @@ class BaseAdapter:
         return {"text": text, "tool_calls": []}
 
 
-def memory_pressure_reason(adapter: BaseAdapter, limit_ratio: float) -> str | None:
+def memory_pressure_reason(adapter: BaseAdapter, limit_ratio: float,
+                           absolute_limit: int = 0) -> str | None:
     """Return a short reason when it is unsafe to keep generating.
 
     Shared by the worker's in-generation watchdog and the coordinator's
@@ -259,14 +274,16 @@ def memory_pressure_reason(adapter: BaseAdapter, limit_ratio: float) -> str | No
     physical = int(memory.get("physical_memory_bytes", 0))
     if int(memory.get("pressure_level", 0)) >= 4:
         return "OSがメモリ逼迫を報告"
-    if physical <= 0:
-        return None
     used = max(int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0)),
                int(memory.get("process_rss_bytes", 0)))
-    if used / physical >= limit_ratio:
+    if absolute_limit > 0 and used >= absolute_limit:
+        return f"model reservation {absolute_limit} bytes exceeded"
+    if physical <= 0:
+        return None
+    if limit_ratio > 0 and used / physical >= limit_ratio:
         return f"MLX使用量が物理メモリの{used / physical:.0%}"
     available = int(memory.get("available_bytes", 0))
-    if available > 0 and available < physical * (1 - limit_ratio):
+    if limit_ratio > 0 and available > 0 and available < physical * (1 - limit_ratio):
         return f"空きメモリが{available / physical:.0%}"
     return None
 
@@ -375,6 +392,10 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     memory_limit_ratio = float(params.get("memory_limit_ratio", 0) or 0)
                 except (TypeError, ValueError):
                     memory_limit_ratio = 0.0
+                try:
+                    memory_limit_bytes = max(0, int(params.get("memory_limit_bytes", 0) or 0))
+                except (TypeError, ValueError):
+                    memory_limit_bytes = 0
                 last_memory_check = started
                 count = 0
                 upstream_metrics = {}
@@ -413,11 +434,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     # this loop runs, so the coordinator's pre-flight check
                     # cannot be the only guard. Failing one request beats
                     # having the OS kill the whole worker.
-                    if (memory_limit_ratio > 0
+                    if ((memory_limit_ratio > 0 or memory_limit_bytes > 0)
                             and time.monotonic() - last_memory_check >= MEMORY_CHECK_INTERVAL_SECONDS):
                         last_memory_check = time.monotonic()
                         exceeded = await on_mlx_thread(memory_pressure_reason,
-                                                       adapter, memory_limit_ratio)
+                                                       adapter, memory_limit_ratio,
+                                                       memory_limit_bytes)
                         if exceeded:
                             # Tell the adapter *why* before the generator is
                             # closed: its cleanup runs inside that close, and by

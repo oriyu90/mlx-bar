@@ -846,6 +846,10 @@ def test_memory_pressure_reason_uses_free_memory_and_the_os_verdict():
     assert memory_pressure_reason(Stub({**healthy, "pressure_level": 4}), 0.9)
     # Resident size counts even when MLX's own counters look small.
     assert memory_pressure_reason(Stub({**healthy, "process_rss_bytes": 95}), 0.9)
+    # The pool's byte reservation is independent of host ratio reporting.
+    assert memory_pressure_reason(Stub(healthy), 0.9, 8)
+    assert memory_pressure_reason(
+        Stub({**healthy, "physical_memory_bytes": 0}), 0.9, 8)
 
 
 def test_every_runtime_tool_marker_is_withheld_from_visible_output():

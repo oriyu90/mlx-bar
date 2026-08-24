@@ -260,3 +260,18 @@
 "再利用方式" = "Reuse method";
 "保存できる長さ" = "Snapshot capacity";
 "直近の再利用なしの理由" = "Last cold reason";
+/* v1.6.2 -- model pool */
+"複数モデル常駐" = "Multiple Resident Models";
+"要求されたモデルを別々のWorkerで保持" = "Keep requested models in separate workers";
+"最大常駐モデル数" = "Maximum resident models";
+"非固定モデルの待機時間" = "Idle time for unpinned models";
+"モデルごとの上限" = "Per-model limit";
+"全体メモリ上限" = "Total memory limit";
+"システム用に残すメモリ" = "Memory reserved for the system";
+"モデル常駐設定を適用" = "Apply Model Residency Settings";
+"有効／無効の切り替えは次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。" = "Enabling or disabling the pool takes effect at the next service start. Other limit changes are applied safely by evicting idle models first.";
+"モデルごとに独立したWorkerを使います。生成は安全のため全体で1件ずつです。手動ロードしたモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。" = "Each model uses an independent worker. Generation remains globally serialized for safety. Manually loaded models stay until stopped; API-loaded models unload after their idle period. Under critical macOS memory pressure, even pinned models are released for safety.";
+"モデル常駐設定に範囲外の値があります" = "One or more model residency limits are outside the supported range";
+"現在の常駐数" = "Currently resident";
+"予約済みメモリ" = "Reserved memory";
+"常駐メモリ予算" = "Resident memory budget";

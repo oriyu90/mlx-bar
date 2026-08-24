@@ -685,6 +685,9 @@ class V150HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "available_bytes": 2}, 0.9))
         self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "pressure_level": 4}, 0.9))
         self.assertTrue(WorkerSupervisor.memory_pressure_reason({**healthy, "process_rss_bytes": 95}, 0.9))
+        self.assertTrue(WorkerSupervisor.memory_pressure_reason(healthy, 0.9, 8))
+        self.assertTrue(WorkerSupervisor.memory_pressure_reason(
+            {**healthy, "physical_memory_bytes": 0}, 0.9, 8))
 
     async def test_completed_job_does_not_retain_its_event_queue(self):
         """A months-long coordinator must not accumulate one queue per job."""

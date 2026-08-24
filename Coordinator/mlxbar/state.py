@@ -19,7 +19,7 @@ from .runtimes.slots import SlotStore
 from .runtimes.updater import RuntimeUpdater
 from .runtimes.service import RuntimeUpdateService
 from .settings import SettingsStore
-from .workers.supervisor import WorkerSupervisor
+from .workers.model_pool import ModelPoolSupervisor
 
 CATALOG_CLASSIFIER_VERSION = "2"
 
@@ -30,7 +30,7 @@ class AppState:
         self.root = self.settings.root
         self.database = Database(self.root / "state.sqlite3")
         self.jobs = JobManager(self.database)
-        self.workers = WorkerSupervisor(self.root, self.settings)
+        self.workers = ModelPoolSupervisor(self.root, self.settings)
         self.slots = SlotStore(self.root)
         self.updater = RuntimeUpdater(self.slots)
         self.runtime_updates = RuntimeUpdateService(self.updater, self.slots, self.workers, self.database)

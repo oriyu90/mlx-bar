@@ -55,9 +55,13 @@ class QueuedRequest:
 
 
 class WorkerSupervisor:
-    def __init__(self, root: Path, settings):
+    def __init__(self, root: Path, settings, *, instance_key: str = "legacy",
+                 memory_limit_bytes: int = 0, reap_orphans: bool = True):
         self.root = root
         self.settings = settings
+        self.instance_key = "".join(c if c.isalnum() or c in "-_" else "_"
+                                    for c in instance_key)[:80] or "worker"
+        self.memory_limit_bytes = max(0, int(memory_limit_bytes))
         self.loaded: dict | None = None
         self.loading: dict | None = None
         self.process: asyncio.subprocess.Process | None = None
@@ -74,7 +78,8 @@ class WorkerSupervisor:
         # Retained so fire-and-forget cancel notifications are not garbage
         # collected mid-flight.
         self._background_tasks: set[asyncio.Task] = set()
-        self.reap_orphan_worker()
+        if reap_orphans:
+            self.reap_orphan_worker()
 
     @property
     def socket_dir(self) -> Path:
@@ -85,10 +90,13 @@ class WorkerSupervisor:
 
     @property
     def manifest_path(self) -> Path:
-        return self.root / "control" / "worker.json"
+        if self.instance_key == "legacy":
+            return self.root / "control" / "worker.json"
+        return self.root / "control" / f"worker-{self.instance_key}.json"
 
     def worker_log_path(self, engine: str) -> Path:
-        return self.root / "logs" / f"worker-{engine}.log"
+        suffix = "" if self.instance_key == "legacy" else f"-{self.instance_key}"
+        return self.root / "logs" / f"worker-{engine}{suffix}.log"
 
     def _write_manifest(self, engine: str, pid: int) -> None:
         try:
@@ -226,6 +234,12 @@ class WorkerSupervisor:
         # The worker decides on its own whether a snapshot is affordable, and it
         # has to judge pressure the same way the watchdog does.
         env["MLXBAR_MEMORY_LIMIT_RATIO"] = str(generation.get("memoryLimitRatio", 0.0))
+        if self.memory_limit_bytes > 0:
+            env["MLXBAR_MLX_MEMORY_LIMIT_BYTES"] = str(self.memory_limit_bytes)
+            # A machine-wide wired ratio cannot be copied into every process.
+            # The pool's aggregate reservation remains authoritative; leave
+            # wiring disabled until an absolute aggregate wired budget exists.
+            env["MLXBAR_WIRED_LIMIT_RATIO"] = "0"
         module = WORKER_MODULES.get(engine, WORKER_MODULES["mlx-vlm"])
         python = self._runtime_python(engine)
         # Worker diagnostics go to a log file rather than a pipe: nothing drains
@@ -397,6 +411,23 @@ class WorkerSupervisor:
         if not self.loaded:
             return {"state": "unloaded"}
         if self.loaded.get("engine") == "lm-studio":
+            instance_id = self.loaded.get("provider_instance_id")
+            if instance_id:
+                base = self.settings.data["models"]["lmStudio"]["baseUrl"].rstrip("/")
+                token = self.settings.lm_studio_token
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                try:
+                    async with httpx.AsyncClient(timeout=15) as client:
+                        response = await client.post(
+                            base + "/api/v1/models/unload",
+                            json={"instance_id": instance_id}, headers=headers)
+                        response.raise_for_status()
+                except Exception as exc:
+                    # Forgetting an externally owned instance would leak its
+                    # memory invisibly. Keep our state and make the failure
+                    # visible so a later retry can still name the instance.
+                    raise MLXBarError("LMSTUDIO_UNLOAD_FAILED",
+                                      f"LM Studioモデルを解放できません: {exc}", 503, True) from exc
             self.loaded = None
             return {"state": "unloaded"}
         try:
@@ -530,6 +561,7 @@ class WorkerSupervisor:
                     "streamHeartbeatSeconds", 10)
                 worker_params["memory_limit_ratio"] = self.settings.data["generation"].get(
                     "memoryLimitRatio", 0.9)
+                worker_params["memory_limit_bytes"] = self.memory_limit_bytes
                 if isinstance(prompt, list):
                     worker_params["messages"] = prompt
                 idle_timeout = float(self.settings.data["generation"].get("tokenIdleTimeoutSeconds", 60))
@@ -937,7 +969,8 @@ class WorkerSupervisor:
         return max(candidates) if candidates else None
 
     @staticmethod
-    def memory_pressure_reason(memory: dict, limit: float) -> str | None:
+    def memory_pressure_reason(memory: dict, limit: float,
+                               absolute_limit: int = 0) -> str | None:
         """Short reason why generating now is unsafe, or None.
 
         Mirrors the worker's in-generation watchdog. A ratio against *total*
@@ -948,14 +981,16 @@ class WorkerSupervisor:
         if int(memory.get("pressure_level", 0)) >= 4:
             return "OSがメモリ逼迫を報告しています"
         physical = int(memory.get("physical_memory_bytes", 0))
-        if physical <= 0:
-            return None
         used = max(int(memory.get("active_bytes", 0)) + int(memory.get("cache_bytes", 0)),
                    int(memory.get("process_rss_bytes", 0)))
-        if used / physical >= limit:
+        if absolute_limit > 0 and used >= absolute_limit:
+            return f"モデル予約{absolute_limit / (1 << 30):.1f} GBに達しています"
+        if physical <= 0:
+            return None
+        if limit > 0 and used / physical >= limit:
             return f"MLX使用量が物理メモリの{used / physical:.0%}に達しています"
         available = int(memory.get("available_bytes", 0))
-        if available > 0 and available < physical * (1 - limit):
+        if limit > 0 and available > 0 and available < physical * (1 - limit):
             return f"空きメモリが{available / physical:.0%}まで低下しています"
         return None
 
@@ -963,14 +998,16 @@ class WorkerSupervisor:
         try:
             limit = float(self.settings.data["generation"]["memoryLimitRatio"])
             result = await self._call("memory", {}, timeout=5)
-            reason = self.memory_pressure_reason(result.get("memory", {}), limit)
+            reason = self.memory_pressure_reason(
+                result.get("memory", {}), limit, self.memory_limit_bytes)
             if reason:
                 # A retained ZCode prefix is disposable. Drop it once before
                 # rejecting the request so caching cannot turn memory safety
                 # into a persistent failure mode.
                 await self._call("clear_prompt_cache", {}, timeout=5)
                 result = await self._call("memory", {}, timeout=5)
-                reason = self.memory_pressure_reason(result.get("memory", {}), limit)
+                reason = self.memory_pressure_reason(
+                    result.get("memory", {}), limit, self.memory_limit_bytes)
                 if reason:
                     raise MLXBarError("MEMORY_PRESSURE",
                                       f"メモリ安全上限に達しているため生成を中止しました（{reason}）", 503, True)

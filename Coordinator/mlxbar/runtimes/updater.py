@@ -131,10 +131,12 @@ class RuntimeUpdater:
                 await update(0.78, "アダプター互換性を検証中")
                 module = "mlx_lm" if engine == "mlx-lm" else "mlx_vlm"
                 code = (
-                    "import importlib,json,sys; from importlib.metadata import version; m=importlib.import_module(sys.argv[1]); "
+                    "import importlib,json,sys; import mlx.core as mx; from importlib.metadata import version; m=importlib.import_module(sys.argv[1]); "
                     "assert callable(getattr(m,'load',None)); assert callable(getattr(m,'stream_generate',None)); "
+                    "assert callable(getattr(mx,'set_memory_limit',None)); "
                     "print(json.dumps({'compatible':True,'python':sys.version.split()[0],"
-                    "'version':version(sys.argv[2]),'streaming':True,'localPath':True,'contractVersion':1}))"
+                    "'version':version(sys.argv[2]),'mlxVersion':version('mlx'),"
+                    "'streaming':True,'localPath':True,'memoryLimit':True,'contractVersion':2}))"
                 )
                 stdout = await self._command(str(python), "-c", code, module, package)
                 probe = json.loads(stdout)

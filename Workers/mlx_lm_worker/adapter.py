@@ -59,6 +59,9 @@ class MLXLMAdapter(BaseAdapter):
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         if not path:
             raise ValueError("model path is required")
+        # The allocator ceiling has to exist before the runtime starts creating
+        # arrays. Applying it only after load cannot contain a cold-load peak.
+        self.apply_memory_limits()
         from mlx_lm import load
         try:
             self.model, self.processor = load(path, tokenizer_config={"trust_remote_code": trust_remote_code})

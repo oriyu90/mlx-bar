@@ -472,6 +472,7 @@ class MLXVLMAdapter(BaseAdapter):
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         if not path:
             raise ValueError("model path is required")
+        self.apply_memory_limits()
         config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
         has_visual_input = any(config.get(key) not in (None, {}) for key in (
             "vision_config", "vision_tower", "visual", "image_token_id",

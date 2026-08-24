@@ -56,10 +56,17 @@ async def models(request: Request):
     authorize(request)
     state = app_state(request)
     loaded = state.workers.loaded
-    data = [_model_descriptor(state, model, loaded)
+    loaded_models = (state.workers.loaded_models()
+                     if callable(getattr(state.workers, "loaded_models", None))
+                     else ([loaded] if loaded else []))
+    def resident_for(model):
+        return next((item for item in loaded_models if item.get("id") == model.get("id")), None)
+    data = [_model_descriptor(state, model, resident_for(model))
             for model in state.database.list_models() if _is_generatable(model)]
-    if loaded and not any(item["id"] in {loaded.get("id"), loaded.get("name")} for item in data):
-        data.append(_model_descriptor(state, loaded, loaded))
+    known = {item["id"] for item in data}
+    for resident in loaded_models:
+        if resident and (resident.get("name") or resident.get("id")) not in known:
+            data.append(_model_descriptor(state, resident, resident))
     return {"object": "list", "data": data}
 
 
@@ -70,7 +77,12 @@ async def retrieve_model(request: Request, model_id: str):
     model = _find_model(state, model_id)
     if not model:
         raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND", "message": "指定されたモデルが見つかりません"})
-    return _model_descriptor(state, model, state.workers.loaded)
+    loaded_models = (state.workers.loaded_models()
+                     if callable(getattr(state.workers, "loaded_models", None))
+                     else ([state.workers.loaded] if state.workers.loaded else []))
+    resident = next((item for item in loaded_models
+                     if item.get("id") == model.get("id")), None)
+    return _model_descriptor(state, model, resident)
 
 
 @router.post("/v1/chat/completions")
@@ -231,8 +243,12 @@ async def chat(request: Request, body: dict):
                            "model": response_model, "choices": [{"index": 0,
                            "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield "data: " + json.dumps(initial, ensure_ascii=False) + "\n\n"
-                generation = app_state(request).workers.generate(
-                    normalized_messages, images, options, request_id, image_root=image_root)
+                generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
+                generation = (generate_for_model(
+                    str(loaded.get("id", "")), normalized_messages, images, options,
+                    request_id, image_root=image_root) if generate_for_model else
+                    app_state(request).workers.generate(
+                        normalized_messages, images, options, request_id, image_root=image_root))
                 async for event in generation:
                     if event.get("type") == "delta":
                         mark_first_token()
@@ -335,8 +351,12 @@ async def chat(request: Request, body: dict):
     finish_reason = "stop"
     usage = None
     cached_tokens = None
-    generation = app_state(request).workers.generate(
-        normalized_messages, images, options, request_id, image_root=image_root)
+    generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
+    generation = (generate_for_model(
+        str(loaded.get("id", "")), normalized_messages, images, options,
+        request_id, image_root=image_root) if generate_for_model else
+        app_state(request).workers.generate(
+            normalized_messages, images, options, request_id, image_root=image_root))
     try:
         async for event in generation:
             if event.get("type") == "delta":
@@ -390,6 +410,11 @@ async def chat(request: Request, body: dict):
 
 async def _ensure_requested_model(request: Request, requested: str) -> dict:
     state = app_state(request)
+    find_loaded = getattr(state.workers, "find_loaded_model", None)
+    if find_loaded:
+        resident = find_loaded(requested)
+        if resident:
+            return resident
     loaded = state.workers.loaded
     if loaded and _model_matches(loaded, requested, state):
         return loaded
@@ -419,7 +444,8 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
             # their turn comes, so switching under them is as disruptive as
             # switching under a running one.
             raise MLXBarError("ENGINE_BUSY", "別のモデルが応答中のため、モデルを切り替えられません", 429, True)
-        result = await state.workers.load(model)
+        load_for_api = getattr(state.workers, "load_for_api", None)
+        result = await (load_for_api(model) if load_for_api else state.workers.load(model))
         state.database.set_metadata_value("last_loaded_model_id", model["id"])
         state.database.set_metadata_value("api_autoload_suspended", "0")
         _record_cache_capability(state, result)

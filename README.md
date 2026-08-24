@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.6.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.6.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -10,6 +10,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 - MLX LM / MLX VLM / LM Studioモデルの統合カタログ
 - MLXモデルのロード、ストリーミング生成、キャンセル、アンロード
+- APIで要求された複数MLXモデルの独立Worker常駐、メモリ予算、TTL/LRU自動解放
 - MLX VLMへの画像入力
 - Lagunaなど、mlx-vlmが提供するテキスト専用アーキテクチャへの対応
 - mlx-lm非対応モデルをmlx-vlmで自動再試行
@@ -40,7 +41,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.1.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.2.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -95,6 +96,26 @@ ZCodeなどがAPI有効上限より大きい`max_tokens`または`max_completion
 ZCodeのシステム指示、会話履歴、ツール結果が従来の100,000文字を超える場合、ロード中モデルのコンテキスト上限を基に入力事前検査を自動拡張します。目安はモデル上限の4倍、かつ最大10,000,000文字です。Laguna-S-2.1-oQ2eでは4,194,304文字になります。文字数は安全な事前検査であり、正確なトークン化とコンテキスト判定はモデルランタイムが行います。
 
 同じモデルフォルダが「追加フォルダ」とLM Studio既定フォルダの両方から見つかった場合は、正規化した実パスで1件へ統合します。`lms`とLM Studio APIから同じProviderモデルが返った場合もProviderキーで統合します。表示名が同じでも実パスが異なるモデルは別モデルとして保持されます。
+
+### 複数モデル常駐とメモリ上限
+
+v1.6.2は、選択済みフォルダの別モデルをOpenAI互換APIが指定したとき、先のMLXモデルを即座に解放せず独立Workerで保持します。既定は最大2モデル、15分間、物理メモリの75%以下かつOS用に4 GB以上を残す設定です。モデルごとの既定上限は32 GBです。
+
+ロード前に実ファイル量から保守的に予約し、個別上限、合計予算、常駐数、現在の空きメモリ、macOSのメモリ圧のどれか一つでも安全条件を満たさなければロードしません。承認したbyte値は重みを読む前にそのWorkerのMLX allocatorへ適用し、応答で同じ値を証明できないランタイムはpoolで利用しません。
+
+APIが自動ロードした非固定モデルは、最後の要求が終了してからTTL後に解放されます。GUIから手動ロードしたモデルと`profiles[].keepLoaded`は通常保持されますが、macOSがcritical pressureを報告した場合はマシンを守るためidleモデルを解放します。生成中のモデルは切断や例外も含むストリーム終了まで解放対象になりません。
+
+安全性を変えないため、常駐モデルが複数でもコールドロードと生成は全体で1件ずつです。poolの有効/無効はプロセス構成に影響するため、設定保存後の次回service起動時に反映されます。上限を後から小さくした場合は、使用中や固定中を中断せず、idleのLRUから回収します。LM Studioは外部プロセスのメモリをMLXBarがbyte単位で強制できないためnative poolに合算せず、切替時にnative modelを解放してLM Studio自身のResource Guardrailsに任せます。
+
+個別例外は`models.pool.profiles`で指定できます。
+
+```json
+{"models":{"pool":{"profiles":[
+  {"modelId":"MODEL_ID","maxMemoryGB":20,"keepLoaded":true}
+]}}}
+```
+
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)を参照してください。
 
 ### 既定の生成パラメータ
 
@@ -393,7 +414,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

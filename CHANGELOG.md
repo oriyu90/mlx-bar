@@ -2,6 +2,29 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.6.2] - 2026-08-24
+
+### 追加
+
+- OpenAI互換APIで要求された複数のMLX LM / MLX VLMモデルを、モデルごとの独立Workerプロセスで常駐できるmodel poolを追加しました。同一モデルの同時要求はsingleflight、異なるモデルの冷間ロードと生成は全体で1件ずつです。
+- モデル単位GB、全体の物理メモリ比、OS用予備GB、最大常駐数を別々に設定できます。事前見積もり、現在空き、macOSメモリ圧、ロード後のRSS/MLX実測を別々検査します。
+- 承認したモデル予約を重みのロード前にMLX 0.32.1 `set_memory_limit`へ適用し、Worker応答の同じbyte値を確認します。新runtime slotのstageでもこのAPI契約を必須probeします。
+- API自動ロードモデルのidle TTLとLRU解放、手動/`keepLoaded`固定、stream lease、critical pressureでの安全優先解放を追加しました。
+- runtime更新は対象engineの全常駐モデルをsnapshot/reloadし、失敗時は旧runtimeと同じ常駐集合へ戻ります。
+- `GET /api/v1/status`に`loadedModels`/`modelPool`を追加し、GUIに常駐数、予約合計、予算を表示します。
+
+### 安全性と互換性
+
+- pool無効時はv1.6.1の単一Worker経路へ委譲します。既存の`loadedModel`とOpenAI互換応答は維持しています。
+- model名やarchitecture名のallowlistは使わず、カタログ、実ファイル量、runtime capabilityだけで判定します。
+- LM Studioは返却された`instance_id`で解放しますが、強制できない外部プロセスのメモリをnative pool予算に合算しません。
+- Coordinatorの強制終了後はmodel単位manifestのPIDと実コマンドを照合し、孤児WorkerをTERM→KILLしてscoped socketを回収します。
+
+### 検証
+
+- Python回帰テスト289件が成功。複数Worker、singleflight、LRU、TTL、pin、critical pressure、事前/実測拒否、allocator契約、stream lease、live設定縮小、異常終了回収、load/unload競合を新規テストしました。
+- 設計根拠と一次情報は`DESIGN_v1.6.2.md`、配布検証は`TEST_PLAN_v1.6.2.md`に記録します。
+
 ## [1.6.1] - 2026-08-23
 
 ### 修正

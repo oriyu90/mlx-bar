@@ -105,6 +105,9 @@ final class MenuBarViewModel: ObservableObject {
     @Published var activeRequestCount = 0
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
+    @Published var residentModelCount = 0
+    @Published var modelPoolReservedBytes: Int64 = 0
+    @Published var modelPoolBudgetBytes: Int64 = 0
     @Published var loadingModelName: String?
     @Published var loadingEngine: String?
     @Published var loadingPhase: String?
@@ -231,6 +234,11 @@ final class MenuBarViewModel: ObservableObject {
             setIfChanged(\.activeRequestCount, (json["activeRequestCount"] as? NSNumber)?.intValue ?? 0)
             setIfChanged(\.queuedRequestCount, (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0)
             setIfChanged(\.oldestQueuedSeconds, (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0)
+            if let pool = json["modelPool"] as? [String: Any] {
+                setIfChanged(\.residentModelCount, (pool["residentCount"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.modelPoolReservedBytes, (pool["reservedBytes"] as? NSNumber)?.int64Value ?? 0)
+                setIfChanged(\.modelPoolBudgetBytes, (pool["budgetBytes"] as? NSNumber)?.int64Value ?? 0)
+            }
             setIfChanged(\.liveGenerationTPS, (json["generationTokensPerSecond"] as? NSNumber)?.doubleValue)
             if let loaded = json["loadedModel"] as? [String: Any] {
                 setIfChanged(\.loadedName, loaded["name"] as? String)
@@ -692,6 +700,27 @@ final class MenuBarViewModel: ObservableObject {
             _ = try await self.json("PUT", "/api/v1/settings", [
                 "generation": ["maxQueuedRequests": maximum, "queueTimeoutSeconds": timeout]
             ])
+            await self.refreshSettings()
+        }
+    }
+
+    func setModelPoolSettings(enabled: Bool, maximum: Int, ttl: Int,
+                              perModelGB: Int, totalRatio: Double, reserveGB: Int) async {
+        guard 1...8 ~= maximum, 30...86400 ~= ttl, 1...512 ~= perModelGB,
+              0.5...0.9 ~= totalRatio, 1...128 ~= reserveGB else {
+            errorMessage = ui("One or more model residency limits are outside the supported range",
+                              "モデル常駐設定に範囲外の値があります")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
+                "enabled": enabled,
+                "maxResidentModels": maximum,
+                "idleTTLSeconds": ttl,
+                "defaultPerModelMaxGB": perModelGB,
+                "totalMemoryRatio": totalRatio,
+                "minimumSystemReserveGB": reserveGB,
+            ]]])
             await self.refreshSettings()
         }
     }

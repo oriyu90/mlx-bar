@@ -3,6 +3,17 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v1.6.2の複数モデルpoolで守ること
+
+- poolは従来の`WorkerSupervisor`を差し替えない。`ModelPoolSupervisor`がmodel単位のSupervisorを合成し、`enabled=false`ではv1.6.1のlegacy経路へ委譲する。互換性調査はまずこの無効経路と`loadedModel`応答を確認する。
+- 各native MLX Workerはロード前に`MLXBAR_MLX_MEMORY_LIMIT_BYTES`を`mlx.core.set_memory_limit`へ適用し、load応答の`capabilities.memoryLimits.set_memory_limit`で同じbyte値を返す。runtime probeでこのAPIを確認する契約を削らない。上流APIが改名/削除された場合はpoolが安全に拒否してからadapterを更新する。
+- 全体予算は実測RSSだけではなく予約chargeの合計でadmissionする。ロード中の瞬間ピークを見た後では遅いため、事前予約、global load lock、allocator上限、ロード後実測の4層のどれも外さない。
+- 生成はモデルごとではなくpool全体のlockで1件。同時生成を有効化するには複数モデルのKV cacheとMetal allocation peakの実機計測、queue/cancel契約の再設計が先に必要。
+- TTL/LRUは`leases == 0`でのみ解放する。leaseはstreamを返す前に取得し、正常終了・client切断・cancel・例外を同じ`finally`で解放する。
+- `models.pool.enabled`はサービス生存期にlatchし、変更は次回起動時に反映。その他の上限縮小はidle unpinned LRUから適用し、active/pinnedを強制中断しない。
+- LM Studioは返された`instance_id`でunloadするが、外部プロセスのメモリをnative pool合計に含めない。byte予約を強制できないのに「予算内」と表示しないことが優先。
+- runtime更新は対象engineの全常駐モデルとpinをsnapshotする。1モデルだけを`loaded`から戻すv1.6.1の前提へ戻さない。
+
 ## 未解決の課題
 
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）

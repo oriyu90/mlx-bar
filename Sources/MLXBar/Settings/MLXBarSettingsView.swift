@@ -223,6 +223,12 @@ struct ModelSourceSettingsView: View {
     @State private var defaultTopP = 1.0
     @State private var defaultRepetitionPenalty = 1.0
     @State private var repetitionContextSize = 20
+    @State private var poolEnabled = true
+    @State private var maxResidentModels = 2
+    @State private var idleTTLSeconds = 900
+    @State private var perModelMaxGB = 32
+    @State private var totalMemoryPercent = 75
+    @State private var systemReserveGB = 4
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
     var body: some View {
@@ -239,6 +245,39 @@ struct ModelSourceSettingsView: View {
                     set: { value in Task { await model.setConfig("models.autoLoadOnAPIRequest", value: value) } }
                 ))
                 Text(LS("アプリやモデルWorkerを再起動した後も、OpenAI互換APIで指定されたモデルを自動的に復元します。手動でアンロードした場合は自動ロードしません。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("複数モデル常駐")) {
+                Toggle(LS("要求されたモデルを別々のWorkerで保持"), isOn: $poolEnabled)
+                Stepper("\(LS("最大常駐モデル数")): \(maxResidentModels)",
+                        value: $maxResidentModels, in: 1...8)
+                Stepper("\(LS("非固定モデルの待機時間")): \(idleTTLSeconds) \(LS("秒"))",
+                        value: $idleTTLSeconds, in: 30...86400, step: 30)
+                Stepper("\(LS("モデルごとの上限")): \(perModelMaxGB) GB",
+                        value: $perModelMaxGB, in: 1...512)
+                Stepper("\(LS("全体メモリ上限")): \(totalMemoryPercent)%",
+                        value: $totalMemoryPercent, in: 50...90)
+                Stepper("\(LS("システム用に残すメモリ")): \(systemReserveGB) GB",
+                        value: $systemReserveGB, in: 1...128)
+                Button(LS("モデル常駐設定を適用")) {
+                    Task {
+                        await model.setModelPoolSettings(
+                            enabled: poolEnabled, maximum: maxResidentModels,
+                            ttl: idleTTLSeconds, perModelGB: perModelMaxGB,
+                            totalRatio: Double(totalMemoryPercent) / 100,
+                            reserveGB: systemReserveGB)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("有効／無効の切り替えは次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                LabeledContent(LS("現在の常駐数"), value: "\(model.residentModelCount)")
+                LabeledContent(LS("予約済みメモリ"), value: ByteCountFormatter.string(
+                    fromByteCount: model.modelPoolReservedBytes, countStyle: .memory))
+                LabeledContent(LS("常駐メモリ予算"), value: ByteCountFormatter.string(
+                    fromByteCount: model.modelPoolBudgetBytes, countStyle: .memory))
+                Text(LS("モデルごとに独立したWorkerを使います。生成は安全のため全体で1件ずつです。手動ロードしたモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -330,6 +369,13 @@ struct ModelSourceSettingsView: View {
             let generation = model.settings["generation"] as? [String: Any] ?? [:]
             maxQueuedRequests = (generation["maxQueuedRequests"] as? NSNumber)?.intValue ?? 16
             queueTimeoutSeconds = (generation["queueTimeoutSeconds"] as? NSNumber)?.intValue ?? 3600
+            let pool = ((model.settings["models"] as? [String: Any])?["pool"] as? [String: Any]) ?? [:]
+            poolEnabled = pool["enabled"] as? Bool ?? true
+            maxResidentModels = (pool["maxResidentModels"] as? NSNumber)?.intValue ?? 2
+            idleTTLSeconds = (pool["idleTTLSeconds"] as? NSNumber)?.intValue ?? 900
+            perModelMaxGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
+            totalMemoryPercent = Int(((pool["totalMemoryRatio"] as? NSNumber)?.doubleValue ?? 0.75) * 100)
+            systemReserveGB = (pool["minimumSystemReserveGB"] as? NSNumber)?.intValue ?? 4
         }
         }
     }
