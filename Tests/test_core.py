@@ -109,6 +109,23 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "preloadLastModel"):
                 store.update({"general": {"preloadLastModel": "yes"}})
 
+    def test_pool_generation_concurrency_default_and_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["models"]["pool"]["generationConcurrency"], 2)
+            self.assertEqual(store.data["models"]["pool"]["perGenerationHeadroomGB"], 0)
+            updated = store.update({"models": {"pool": {"generationConcurrency": 1}}})
+            self.assertEqual(updated["models"]["pool"]["generationConcurrency"], 1)
+            with self.assertRaisesRegex(ValueError, "generationConcurrency"):
+                store.update({"models": {"pool": {"generationConcurrency": 0}}})
+            with self.assertRaisesRegex(ValueError, "generationConcurrency"):
+                store.update({"models": {"pool": {"generationConcurrency": 9}}})
+            with self.assertRaisesRegex(ValueError, "perGenerationHeadroomGB"):
+                store.update({"models": {"pool": {"perGenerationHeadroomGB": 0.1}}})
+            self.assertEqual(
+                store.update({"models": {"pool": {"perGenerationHeadroomGB": 4}}})
+                ["models"]["pool"]["perGenerationHeadroomGB"], 4)
+
     def test_lan_access_requires_matching_host_and_api_token(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))

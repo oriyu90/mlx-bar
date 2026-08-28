@@ -57,7 +57,13 @@ def parser() -> argparse.ArgumentParser:
     scan = model.add_parser("scan"); scan.add_argument("--wait", action="store_true")
     probe = model.add_parser("probe"); probe.add_argument("model_id")
     load = model.add_parser("load"); load.add_argument("model_id"); load.add_argument("--engine", default="auto")
-    model.add_parser("unload")
+    unload = model.add_parser("unload")
+    unload.add_argument("model_id", nargs="?", help="省略すると常駐モデルをすべて解放（従来動作）")
+    unload.add_argument("--force", action="store_true")
+    model.add_parser("resident")
+    pin = model.add_parser("pin"); pin.add_argument("model_id")
+    pin.add_argument("--max-memory-gb", type=float, default=None)
+    unpin = model.add_parser("unpin"); unpin.add_argument("model_id")
     add_folder = model.add_parser("add-folder"); add_folder.add_argument("path")
     remove_folder = model.add_parser("remove-folder"); remove_folder.add_argument("path")
     gen = sub.add_parser("generate"); gen.add_argument("--prompt", required=True); gen.add_argument("--image", action="append", default=[])
@@ -137,7 +143,47 @@ def execute(args, client: Client):
             return wait_job(client, job, args.global_json) if args.wait else job
         if args.action == "probe": return client.request("POST", f"/api/v1/models/{args.model_id}/probe").json()
         if args.action == "load": return client.request("POST", f"/api/v1/models/{args.model_id}/load", {"engine": args.engine}).json()
-        if args.action == "unload": return client.request("DELETE", "/api/v1/models/loaded").json()
+        if args.action == "unload":
+            if getattr(args, "model_id", None):
+                path = f"/api/v1/models/{args.model_id}/unload"
+                if args.force:
+                    path += "?force=true"
+                return client.request("POST", path).json()
+            return client.request("DELETE", "/api/v1/models/loaded").json()
+        if args.action == "resident":
+            status = client.request("GET", "/api/v1/status").json()
+            pool = status.get("modelPool", {})
+            return {"residentCount": pool.get("residentCount", 0),
+                    "maxResidentModels": pool.get("maxResidentModels"),
+                    "generationConcurrency": pool.get("generationConcurrency"),
+                    "activeGenerations": pool.get("activeGenerations"),
+                    "models": [{"id": item.get("id"), "engine": item.get("engine"),
+                                "poolState": item.get("poolState"),
+                                "keepLoaded": item.get("keepLoaded"),
+                                "activeLeases": item.get("activeLeases"),
+                                "laneQueueDepth": item.get("laneQueueDepth")}
+                               for item in status.get("loadedModels", [])]}
+        if args.action in {"pin", "unpin"}:
+            settings = client.request("GET", "/api/v1/settings").json()
+            pool = settings.get("models", {}).get("pool", {})
+            profiles = [dict(item) for item in pool.get("profiles", [])]
+            profiles = [item for item in profiles if item.get("modelId") != args.model_id]
+            if args.action == "pin":
+                profile = {"modelId": args.model_id, "keepLoaded": True}
+                if getattr(args, "max_memory_gb", None) is not None:
+                    profile["maxMemoryGB"] = args.max_memory_gb
+                profiles.append(profile)
+            client.request("PUT", "/api/v1/settings",
+                           {"models": {"pool": {"profiles": profiles}}})
+            result = {"profiles": profiles,
+                      "note": "常駐指定は次回サービス起動時のプリロードに反映されます"}
+            if args.action == "pin":
+                try:
+                    result["loaded"] = client.request(
+                        "POST", f"/api/v1/models/{args.model_id}/load", {"engine": "auto"}).json()
+                except Exception as exc:  # noqa: BLE001 - report, do not abort the pin
+                    result["loadError"] = str(exc)
+            return result
         if args.action == "add-folder":
             roots = client.request("GET", "/api/v1/settings").json().get("models", {}).get("roots", [])
             if args.path not in roots: roots.append(args.path)

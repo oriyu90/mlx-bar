@@ -2,6 +2,29 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.7.0] - 2026-08-28
+
+### 追加
+
+- モデル間の同時生成を追加しました。別々の常駐モデルは `models.pool.generationConcurrency`（既定2、範囲1–8）まで並行して生成します。同一モデルへの複数要求は従来どおり到着順に直列です。`generationConcurrency=1` で v1.6.2 と挙動がバイト等価です。
+- メモリ・ヘッドルームガード: 2レーン目以降は、常駐予約＋生成ヘッドルーム見積が全体予算内で、かつ macOS がメモリ圧を報告していないときだけ開始します。通らない要求は失敗させずキューへ回し、逼迫時は自動的に直列へ降格します。`models.pool.perGenerationHeadroomGB`（既定0=算出、範囲0.25–32）で上書きできます。
+- キュー・キャンセル・孤児レーン回復をモデル単位に再設計しました。切断された handshake がレーンを恒久的に塞ぐ v1.6.2 の穴を塞ぎ、`WorkerSupervisor` と同じ判定でレーンを回復します。
+- `POST /api/v1/models/{id}/unload`（`?force=`）で1モデルだけ解放できます（他は常駐のまま）。`DELETE /api/v1/models/loaded`（全解放）は据え置きです。
+- `mlxbarctl` に `model unload <id>` / `model resident` / `model pin <id>` / `model unpin <id>` を追加しました。
+- 設定画面に「同時生成の上限」Stepper、「常駐させるモデル」（`models.pool.profiles`）のトグル一覧、「同時生成 N / 上限 M」の表示を追加しました。
+- `GET /api/v1/status` に `generationConcurrency` / `activeGenerations` / `loadedModels[].laneQueueDepth` / `loadedModels[].laneRecoveries` を追加しました。
+
+### 安全性と互換性
+
+- `generationConcurrency=1` で v1.6.2 と生成順序・キュー・キャンセル・`/api/v1/status` が等価です（`queue` イベントの `position` のみプール通し番号→モデルレーン単位に変化。単一常駐モデルの通常構成では同一）。`enabled=false` は完全に v1.6.1 の単一 Worker 経路へ委譲します（バイト等価）。
+- OpenAI 互換の形（`/v1/models`、Chat Completions のルーティング、tools 128 件上限、bearer 認証、SSE keep-alive コメント）は不変です。設定 schema は version 1 のままで、v1.6.x の config を変換なしで読み込めます。
+- 既定 `generationConcurrency=2` はオーナー明示指示による判断で、「実測がないなら既定を動かさない」方針から意図的に外れています。合算 allocation ピークの実機計測は未実施で、`TEST_PLAN_v1.7.0.md §2` の実機手順を通すまで実機保証はしません。
+
+### 検証
+
+- Python 回帰テスト 307 件が成功（v1.6.2 の 289 + 新規 18）。モデル間並行、同一モデル直列、セマフォ上限、メモリガードのキュー降格、per-lane キャンセル、孤児レーン回復、`generationConcurrency=1` の回帰、2 常駐モデルへの同時ストリームが API 層で直列化されないこと、128/129 tools 境界を新規テストしました。
+- 設計根拠と v1.6.2 非目的の更新は `DESIGN_v1.7.0.md`、実機・配布検証手順は `TEST_PLAN_v1.7.0.md` に記録します。
+
 ## [1.6.2] - 2026-08-24
 
 ### 追加

@@ -108,6 +108,8 @@ final class MenuBarViewModel: ObservableObject {
     @Published var residentModelCount = 0
     @Published var modelPoolReservedBytes: Int64 = 0
     @Published var modelPoolBudgetBytes: Int64 = 0
+    @Published var generationConcurrency = 1
+    @Published var activeGenerations = 0
     @Published var loadingModelName: String?
     @Published var loadingEngine: String?
     @Published var loadingPhase: String?
@@ -238,6 +240,10 @@ final class MenuBarViewModel: ObservableObject {
                 setIfChanged(\.residentModelCount, (pool["residentCount"] as? NSNumber)?.intValue ?? 0)
                 setIfChanged(\.modelPoolReservedBytes, (pool["reservedBytes"] as? NSNumber)?.int64Value ?? 0)
                 setIfChanged(\.modelPoolBudgetBytes, (pool["budgetBytes"] as? NSNumber)?.int64Value ?? 0)
+                setIfChanged(\.generationConcurrency,
+                             (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 1)
+                setIfChanged(\.activeGenerations,
+                             (pool["activeGenerations"] as? NSNumber)?.intValue ?? 0)
             }
             setIfChanged(\.liveGenerationTPS, (json["generationTokensPerSecond"] as? NSNumber)?.doubleValue)
             if let loaded = json["loadedModel"] as? [String: Any] {
@@ -705,9 +711,11 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func setModelPoolSettings(enabled: Bool, maximum: Int, ttl: Int,
-                              perModelGB: Int, totalRatio: Double, reserveGB: Int) async {
+                              perModelGB: Int, totalRatio: Double, reserveGB: Int,
+                              generationConcurrency: Int) async {
         guard 1...8 ~= maximum, 30...86400 ~= ttl, 1...512 ~= perModelGB,
-              0.5...0.9 ~= totalRatio, 1...128 ~= reserveGB else {
+              0.5...0.9 ~= totalRatio, 1...128 ~= reserveGB,
+              1...8 ~= generationConcurrency else {
             errorMessage = ui("One or more model residency limits are outside the supported range",
                               "モデル常駐設定に範囲外の値があります")
             return
@@ -720,8 +728,34 @@ final class MenuBarViewModel: ObservableObject {
                 "defaultPerModelMaxGB": perModelGB,
                 "totalMemoryRatio": totalRatio,
                 "minimumSystemReserveGB": reserveGB,
+                "generationConcurrency": generationConcurrency,
             ]]])
             await self.refreshSettings()
+        }
+    }
+
+    /// Add or remove a model from the pool's keep-loaded profile list.  The
+    /// preload at the next service start reads this list; an explicit load is
+    /// still needed to make it resident right now.
+    func setModelPin(_ modelId: String, keepLoaded: Bool) async {
+        let pool = (settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
+        var profiles = (pool["profiles"] as? [[String: Any]] ?? [])
+            .filter { ($0["modelId"] as? String) != modelId }
+        if keepLoaded {
+            profiles.append(["modelId": modelId, "keepLoaded": true])
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    ["models": ["pool": ["profiles": profiles]]])
+            await self.refreshSettings()
+            if keepLoaded {
+                // Make it resident now too, not just at the next service start.
+                // Model loads legitimately take minutes, so use the load timeout.
+                _ = try? await self.json(
+                    "POST", "/api/v1/models/\(self.pathComponent(modelId))/load",
+                    ["engine": "auto"], timeoutSeconds: CoordinatorClient.Timeout.modelLoad)
+                await self.refreshStatus()
+            }
         }
     }
 

@@ -7,6 +7,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "Workers"))
@@ -881,6 +882,174 @@ def test_the_model_list_states_which_inputs_a_model_accepts():
                                 model_autoload_lock=asyncio.Lock())
         client = TestClient(make_public_app(state))
         assert client.get("/v1/models").json()["data"][0]["modalities"] == ["text", "image"]
+
+
+def _many_tools(count: int) -> list[dict]:
+    return [{"type": "function", "function": {
+        "name": f"tool_{index}", "description": "x",
+        "parameters": {"type": "object", "properties": {}}}} for index in range(count)]
+
+
+def test_tool_list_boundary_is_128_entries():
+    """OpenClaw-style clients pile up MCP tools; 128 is the documented ceiling."""
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        base = {"model": "Laguna-S-2.1-oQ2e", "messages": [{"role": "user", "content": "hi"}]}
+        accepted = client.post("/v1/chat/completions", json={**base, "tools": _many_tools(128)})
+        assert accepted.status_code == 200
+        rejected = client.post("/v1/chat/completions", json={**base, "tools": _many_tools(129)})
+        assert rejected.status_code == 422
+        assert rejected.json()["error"]["code"] == "INVALID_REQUEST"
+
+
+class _TwoModelPool:
+    """Minimal stand-in for ModelPoolSupervisor's OpenAI-facing surface."""
+
+    def __init__(self):
+        self.residents = {name: {"id": name, "name": name, "engine": "mlx-lm"}
+                          for name in ("model-a", "model-b")}
+        self.gates = {name: asyncio.Event() for name in self.residents}
+        self.entered = {name: asyncio.Event() for name in self.residents}
+        self.routed: list[str] = []
+        self.loaded = self.residents["model-a"]
+
+    def find_loaded_model(self, requested):
+        return self.residents.get(requested.strip())
+
+    def loaded_models(self):
+        return list(self.residents.values())
+
+    def raise_if_queue_full(self):
+        return None
+
+    async def generate_for_model(self, model_id, messages, images, options, request_id,
+                                 image_root=None):
+        self.routed.append(model_id)
+        self.entered[model_id].set()
+        await self.gates[model_id].wait()
+        yield {"type": "delta", "text": f"hi from {model_id}"}
+        yield {"type": "completed", "finish_reason": "stop"}
+
+
+def _two_model_state(root: Path):
+    return SimpleNamespace(
+        settings=SimpleNamespace(data={"api": {"requireToken": False},
+                                       "models": {"autoLoadOnAPIRequest": True}}),
+        workers=_TwoModelPool(), database=Database(root / "state.sqlite3"))
+
+
+def test_chat_completions_route_to_the_requested_resident_model():
+    with tempfile.TemporaryDirectory() as directory:
+        state = _two_model_state(Path(directory))
+        for gate in state.workers.gates.values():
+            gate.set()
+        client = TestClient(make_public_app(state))
+        for name in ("model-b", "model-a"):
+            body = {"model": name, "messages": [{"role": "user", "content": "hi"}]}
+            response = client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 200
+            assert response.json()["model"] == name
+        assert state.workers.routed == ["model-b", "model-a"]
+
+
+def test_two_resident_models_stream_without_api_layer_serialisation():
+    """Both requests must reach their worker before either is allowed to finish."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            state = _two_model_state(Path(directory))
+            pool = state.workers
+            transport = httpx.ASGITransport(app=make_public_app(state))
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                async def run(name):
+                    body = {"model": name, "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}]}
+                    async with client.stream("POST", "/v1/chat/completions", json=body) as r:
+                        return [line async for line in r.aiter_lines()]
+
+                task_a = asyncio.create_task(run("model-a"))
+                task_b = asyncio.create_task(run("model-b"))
+                await asyncio.wait_for(
+                    asyncio.gather(pool.entered["model-a"].wait(),
+                                   pool.entered["model-b"].wait()), timeout=2)
+                # Neither has been released yet: proves no shared API-layer lock.
+                pool.gates["model-a"].set()
+                pool.gates["model-b"].set()
+                lines_a, lines_b = await asyncio.wait_for(
+                    asyncio.gather(task_a, task_b), timeout=2)
+                assert any("hi from model-a" in line for line in lines_a)
+                assert any("hi from model-b" in line for line in lines_b)
+
+    asyncio.run(scenario())
+
+
+def test_real_pool_behind_openai_api_streams_two_models_concurrently():
+    """End-to-end: OpenAI API -> real ModelPoolSupervisor -> two fake workers."""
+    from unittest.mock import patch as _patch
+
+    import test_model_pool
+    from mlxbar.workers.model_pool import GIB, ModelPoolSupervisor
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.data["api"]["requireToken"] = False
+            store.data["models"]["pool"].update({
+                "enabled": True, "maxResidentModels": 3, "minimumSystemReserveGB": 1,
+                "defaultPerModelMaxGB": 8, "generationConcurrency": 2,
+            })
+            test_model_pool.FakeWorker.instances = []
+            test_model_pool.FakeWorker.load_gate = None
+            with _patch("mlxbar.workers.model_pool.SingleWorkerSupervisor",
+                        test_model_pool.FakeWorker):
+                pool = ModelPoolSupervisor(root, store)
+                pool._physical_memory = lambda: 32 * GIB
+                pool._host_capacity = lambda: (24 * GIB, 1)
+                for name in ("model-a", "model-b"):
+                    await pool.load({"id": name, "name": name, "engine": "mlx-lm",
+                                     "size_bytes": GIB}, pin=True)
+                for name in ("model-a", "model-b"):
+                    pool._slots[name].worker.gen_release = asyncio.Event()
+                state = SimpleNamespace(settings=store, workers=pool,
+                                        database=Database(root / "state.sqlite3"),
+                                        model_autoload_lock=asyncio.Lock())
+                transport = httpx.ASGITransport(app=make_public_app(state))
+                try:
+                    async with httpx.AsyncClient(transport=transport,
+                                                 base_url="http://t") as client:
+                        async def run(name):
+                            body = {"model": name, "stream": True,
+                                    "messages": [{"role": "user", "content": "hi"}]}
+                            async with client.stream("POST", "/v1/chat/completions",
+                                                     json=body) as response:
+                                assert response.status_code == 200
+                                return [line async for line in response.aiter_lines()]
+
+                        task_a = asyncio.create_task(run("model-a"))
+                        task_b = asyncio.create_task(run("model-b"))
+                        for _ in range(200):
+                            await asyncio.sleep(0.01)
+                            if (pool._slots["model-a"].worker.active_requests
+                                    and pool._slots["model-b"].worker.active_requests):
+                                break
+                        # Both models are generating at the same instant.
+                        assert pool._gen_active_lanes == 2
+                        pool._slots["model-a"].worker.gen_release.set()
+                        pool._slots["model-b"].worker.gen_release.set()
+                        lines_a, lines_b = await asyncio.wait_for(
+                            asyncio.gather(task_a, task_b), timeout=3)
+                    # Each stream is tagged with the model it was routed to.
+                    assert any('"model": "model-a"' in line for line in lines_a)
+                    assert all('"model": "model-b"' not in line for line in lines_a)
+                    assert any('"model": "model-b"' in line for line in lines_b)
+                    assert "data: [DONE]" in lines_a
+                    assert "data: [DONE]" in lines_b
+                    assert pool._gen_active_lanes == 0
+                    assert pool._gen_slots._value == 2
+                finally:
+                    await pool.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_an_unknown_model_is_missing_rather_than_busy_while_another_request_runs():

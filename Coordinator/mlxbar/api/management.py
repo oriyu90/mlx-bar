@@ -168,6 +168,29 @@ async def unload(request: Request, force: bool = False):
     return result
 
 
+@router.post("/models/{model_id:path}/unload")
+async def unload_one(model_id: str, request: Request, force: bool = False):
+    """Free a single resident model, leaving the rest of the pool alone.
+
+    Only that model's own in-flight generations block this (``unload_model``
+    raises ``ENGINE_BUSY`` while it has leases); other models keep serving.
+    Falls back to the all-models unload when the pool facade predates this.
+    """
+    app = state(request)
+    unload_model = getattr(app.workers, "unload_model", None)
+    try:
+        if unload_model is None:
+            _raise_if_generations_in_flight(app, force, "モデルを解放")
+            result = await app.workers.unload()
+        else:
+            result = await unload_model(model_id, force=force)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    if app.database.metadata_value("last_loaded_model_id") == model_id:
+        app.database.set_metadata_value("api_autoload_suspended", "1")
+    return result
+
+
 @router.post("/generate")
 async def generate(request: Request, body: dict):
     async def stream():

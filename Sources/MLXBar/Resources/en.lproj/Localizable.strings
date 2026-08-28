@@ -275,3 +275,11 @@
 "現在の常駐数" = "Currently resident";
 "予約済みメモリ" = "Reserved memory";
 "常駐メモリ予算" = "Resident memory budget";
+/* v1.7.0 -- cross-model concurrent generation & preload */
+"同時生成の上限" = "Concurrent generation limit";
+"同時生成" = "Concurrent generations";
+"有効／無効の切り替えと同時生成の上限は次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。" = "Enabling or disabling the pool and the concurrent generation limit take effect at the next service start. Other limit changes are applied safely by evicting idle models first.";
+"モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。" = "Each model uses an independent worker. Different models generate in parallel up to the concurrent generation limit, while requests to the same model are serialized in arrival order. Set it to 1 for the previous behavior of one generation at a time. Manually loaded and pinned models stay until stopped; API-loaded models unload after their idle period. Under critical macOS memory pressure, even pinned models are released for safety.";
+"常駐させるモデル" = "Models to Keep Resident";
+"モデルが見つかりません。フォルダを追加して再スキャンしてください。" = "No models found. Add a folder and rescan.";
+"常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。" = "Pinned models load automatically at service start and are never released while idle. To make one resident right now, load it from the Models screen.";

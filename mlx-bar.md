@@ -14,6 +14,18 @@
 - LM Studioは返された`instance_id`でunloadするが、外部プロセスのメモリをnative pool合計に含めない。byte予約を強制できないのに「予算内」と表示しないことが優先。
 - runtime更新は対象engineの全常駐モデルとpinをsnapshotする。1モデルだけを`loaded`から戻すv1.6.1の前提へ戻さない。
 
+## v1.7.0のモデル間同時生成で守ること
+
+- **同時生成はモデル間だけ。** `PoolSlot.gen_lock`が同一モデルを直列化し、プール全体の`asyncio.Semaphore(generationConcurrency)`がモデル間の並行数を束ねる。同一Workerプロセスは単一スレッドなので、同一モデル内の並行はやらない。`generationConcurrency=1`でv1.6.2と等価（生成順序・キュー・キャンセル・`/api/v1/status`）であることが不変条件。唯一の差は`queue`イベントの`position`がプール通し番号→モデルレーン単位（単一常駐モデルなら同一）。`enabled=false`はv1.6.1へ完全委譲でバイト等価。回帰は`test_concurrency_one_serialises_across_models`と既存プールテストで担保。
+- **1件目の生成は常に許可。** メモリ・ヘッドルームガード（`_admit_concurrent` / `_concurrent_start_ok`）は2レーン目以降にのみ効く。v1.6.x はメモリ圧を生成に対して見ていなかったので、`_gen_active_lanes == 0`のときは無条件で通す。ここを「常に判定」に変えると単一生成の挙動が退行する。
+- **ガードは失敗ではなくキュー降格。** 直列なら成功する要求を絶対に落とさない。permitが空いても`_acquire_lane`内で`_concurrent_start_ok`を再チェックし、通らなければpermitを返して50ms間隔で待つ（キューtimeoutで上限）。この二段構え（entry判定＋permit取得後の再判定）を片方だけにするとガードが素通りになる（`test_memory_guard_downgrades_second_lane_to_queue_without_failing`が実際に最初の実装のバグを捕まえた）。
+- **孤児レーン回復は`WorkerSupervisor._recover_orphaned_generation_slot`と同じ論理積をper modelで。** 「レーンlock保持中」「ownerがactiveにもqueuedにも不在」「unowned active request不在」の全一致でのみ解放する。v1.6.2のプール即席キューにはこの機構が無く、handshake中に切断したclientがレーンを恒久的に塞げた。`new_request` / `queue_wait` / `capacity_check`の各所で評価する。
+- **permit会計は`PoolSlot.gen_permit`で追跡。** `_release_lane`と`_recover_lane`はこのフラグが真のときだけ`_gen_slots.release()`と`_gen_active_lanes`減算をする。フラグを見ずにreleaseするとセマフォを過剰解放して並行上限が壊れる。
+- **`generationConcurrency`はservice生存期にlatch。** 実行中にセマフォ容量を入れ替えると片側レーンが宙に浮く。`enabled`と同じ扱いで、`__init__`で読んで固定、変更は次回起動。
+- **既定2はオーナー明示指示。** `common rules` / このメモの「実測がないなら既定値を動かさない」から意図的に外れている。合算allocationピークの実機計測は未実施（`TEST_PLAN_v1.7.0.md §2`）。次に実機を触れる人は必ずこの手順（2モデル常駐で同時ストリーム、RSS/`vm_stat`/`kern.memorystatus_vm_pressure_level`を1秒間隔で記録）を通し、結果をここに追記すること。問題が出たら既定を1へ戻す。
+- **個別unloadは`POST /api/v1/models/{id}/unload`。** 既存の`DELETE /models/loaded`（全解放）は据え置き。CLIの`model unload`（引数なし）も全解放のまま。`_evict_slot`のlease guardは維持——生成中のWorkerをstreamの下から殺さない。`force=true`はcancel + unpin + best effortで、leaseが落ちた後の次回reapが回収する。
+- **OpenAI互換入口は変えていない。** ルーティングは従来どおり`generate_for_model(str(loaded["id"]), ...)`。`_ensure_requested_model`が生成中の新規モデルautoloadを`ENGINE_BUSY`で拒むのは仕様どおり（生成中のモデル切替を避ける）。同時に使うモデルは事前に常駐させる前提。128 tools上限・bearer認証・SSE keep-aliveコメントは不変。
+
 ## 未解決の課題
 
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）

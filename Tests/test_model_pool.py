@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import tempfile
 import time
 import unittest
@@ -31,6 +32,10 @@ class FakeWorker:
         self.socket_path = None
         self.engine = None
         self.unloaded = False
+        # Concurrency probes: tests set gen_release to an Event the fake will
+        # block on before emitting its first delta, so overlap is observable.
+        self.gen_started: asyncio.Event | None = None
+        self.gen_release: asyncio.Event | None = None
         FakeWorker.instances.append(self)
 
     @staticmethod
@@ -62,6 +67,10 @@ class FakeWorker:
     async def generate(self, prompt, images, options, request_id=None, image_root=None):
         self.active_requests[request_id] = object()
         try:
+            if self.gen_started is not None:
+                self.gen_started.set()
+            if self.gen_release is not None:
+                await self.gen_release.wait()
             await asyncio.sleep(0)
             yield {"type": "delta", "text": str(prompt)}
         finally:
@@ -237,3 +246,314 @@ class ModelPoolTests(unittest.IsolatedAsyncioTestCase):
         await loading
         self.assertEqual(await self.pool._reap_once(), 0)
         self.assertIn("model-1", self.pool._slots)
+
+
+class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
+    """v1.7.0: distinct resident models generate concurrently; same model does not."""
+
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.settings = SettingsStore(self.root)
+        self.settings.data["models"]["pool"].update({
+            "enabled": True, "maxResidentModels": 3, "totalMemoryRatio": 0.75,
+            "minimumSystemReserveGB": 1, "defaultPerModelMaxGB": 8, "idleTTLSeconds": 30,
+        })
+        FakeWorker.instances = []
+        FakeWorker.load_gate = None
+        FakeWorker.load_calls = 0
+        FakeWorker.observed_bytes = 768 << 20
+        self.worker_patch = patch(
+            "mlxbar.workers.model_pool.SingleWorkerSupervisor", FakeWorker)
+        self.worker_patch.start()
+        self._pools: list[ModelPoolSupervisor] = []
+
+    async def asyncTearDown(self):
+        for pool in self._pools:
+            await pool.shutdown()
+        self.worker_patch.stop()
+        self.temporary.cleanup()
+
+    def make_pool(self, concurrency: int | None = None) -> ModelPoolSupervisor:
+        if concurrency is not None:
+            self.settings.data["models"]["pool"]["generationConcurrency"] = concurrency
+        pool = ModelPoolSupervisor(self.root, self.settings)
+        pool._physical_memory = lambda: 32 * GIB
+        pool._host_capacity = lambda: (24 * GIB, 1)
+        self._pools.append(pool)
+        return pool
+
+    @staticmethod
+    def model(number):
+        return {"id": f"model-{number}", "name": f"model-{number}",
+                "engine": "mlx-lm", "size_bytes": GIB}
+
+    @staticmethod
+    async def collect(generation) -> list[dict]:
+        events = []
+        async for event in generation:
+            events.append(event)
+        return events
+
+    async def test_default_generation_concurrency_is_two(self):
+        pool = self.make_pool()
+        self.assertEqual(pool._gen_concurrency, 2)
+
+    async def test_distinct_models_generate_concurrently(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        w2 = pool._slots["model-2"].worker
+        w1.gen_release = asyncio.Event()
+        w2.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        g2 = pool.generate_for_model("model-2", "b", [], {}, "r2")
+        t1 = asyncio.create_task(anext(g1))
+        t2 = asyncio.create_task(anext(g2))
+        await asyncio.sleep(0.05)
+        # Both are inside their worker's generate() at the same time.
+        self.assertTrue(w1.active_requests)
+        self.assertTrue(w2.active_requests)
+        self.assertEqual(pool._gen_active_lanes, 2)
+        w1.gen_release.set()
+        w2.gen_release.set()
+        self.assertEqual((await t1)["text"], "a")
+        self.assertEqual((await t2)["text"], "b")
+        await g1.aclose()
+        await g2.aclose()
+        self.assertEqual(pool._gen_active_lanes, 0)
+
+    async def test_same_model_requests_stay_serialised(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        g2 = pool.generate_for_model("model-1", "b", [], {}, "r2")
+        t2 = asyncio.create_task(self.collect(g2))
+        await asyncio.sleep(0.02)
+        # r2 cannot start while r1 owns the model lane.
+        self.assertIn("r2", pool._slots["model-1"].gen_queued)
+        self.assertEqual(len(w1.active_requests), 1)
+        w1.gen_release.set()
+        self.assertEqual((await t1)["text"], "a")
+        await g1.aclose()
+        events = await t2
+        self.assertEqual(events[-1]["text"], "b")
+
+    async def test_concurrency_one_serialises_across_models(self):
+        pool = self.make_pool(concurrency=1)
+        self.assertEqual(pool._gen_concurrency, 1)
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        g2 = pool.generate_for_model("model-2", "b", [], {}, "r2")
+        t2 = asyncio.create_task(self.collect(g2))
+        await asyncio.sleep(0.02)
+        # The single permit is held by r1; r2 waits even though it is a
+        # different model -- byte-identical to the pre-v1.7.0 global lock.
+        self.assertIn("r2", pool._slots["model-2"].gen_queued)
+        self.assertFalse(pool._slots["model-2"].worker.active_requests)
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+        events = await t2
+        self.assertEqual(events[-1]["text"], "b")
+
+    async def test_memory_guard_downgrades_second_lane_to_queue_without_failing(self):
+        pool = self.make_pool()
+        # Force the head-room charge to blow the budget for any second lane.
+        pool._per_generation_headroom = lambda slot: 999 * GIB
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        g2 = pool.generate_for_model("model-2", "b", [], {}, "r2")
+        t2 = asyncio.create_task(self.collect(g2))
+        await asyncio.sleep(0.02)
+        self.assertIn("r2", pool._slots["model-2"].gen_queued)  # queued, not errored
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+        events = await t2  # completes once the first lane frees
+        self.assertEqual(events[-1]["text"], "b")
+
+    async def test_orphaned_lane_is_recovered(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        slot = pool._slots["model-1"]
+        await slot.gen_lock.acquire()
+        slot.gen_owner = "vanished"
+        slot.gen_permit = True
+        pool._gen_active_lanes = 1
+        self.assertTrue(pool._recover_lane(slot, "test"))
+        self.assertFalse(slot.gen_lock.locked())
+        self.assertIsNone(slot.gen_owner)
+        self.assertEqual(pool._gen_active_lanes, 0)
+        self.assertEqual(slot.gen_recoveries, 1)
+
+    async def test_queued_request_can_be_cancelled_per_model(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        g2 = pool.generate_for_model("model-1", "b", [], {}, "r2")
+        t2 = asyncio.create_task(self.collect(g2))
+        await asyncio.sleep(0.02)
+        result = await pool.cancel("r2")
+        self.assertTrue(result["cancelled"])
+        self.assertTrue(result["queued"])
+        events = await t2
+        self.assertEqual(events[-1]["finish_reason"], "cancelled")
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+
+    async def test_status_reports_concurrency_and_active_lanes(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        status = pool.status()
+        self.assertEqual(status["generationConcurrency"], 2)
+        self.assertEqual(status["activeGenerations"], 1)
+        self.assertEqual(status["modelPool"]["generationConcurrency"], 2)
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+
+    async def test_unload_one_model_leaves_the_other_resident(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        result = await pool.unload_model("model-1")
+        self.assertEqual(result["count"], 1)
+        self.assertNotIn("model-1", pool._slots)
+        self.assertIn("model-2", pool._slots)
+
+    async def test_unload_one_model_refuses_while_leased(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        with self.assertRaises(MLXBarError) as raised:
+            await pool.unload_model("model-1")
+        self.assertEqual(raised.exception.code, "ENGINE_BUSY")
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+
+    async def test_client_disconnect_while_queued_leaves_no_leaked_lane(self):
+        pool = self.make_pool(concurrency=1)
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        w1.gen_release = asyncio.Event()
+        g1 = pool.generate_for_model("model-1", "a", [], {}, "r1")
+        t1 = asyncio.create_task(anext(g1))
+        await asyncio.sleep(0.02)
+        # r2 for a different model is queued behind the single permit.
+        g2 = pool.generate_for_model("model-2", "b", [], {}, "r2")
+        t2 = asyncio.create_task(anext(g2))
+        await asyncio.sleep(0.02)
+        self.assertIn("r2", pool._slots["model-2"].gen_queued)
+        # Client goes away: close the generator while it is still waiting.
+        t2.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t2
+        await g2.aclose()
+        await asyncio.sleep(0.02)
+        self.assertEqual(pool._slots["model-2"].gen_queued, {})
+        self.assertIsNone(pool._slots["model-2"].gen_owner)
+        self.assertFalse(pool._slots["model-2"].gen_lock.locked())
+        # The permit r1 holds is still the only one taken.
+        self.assertEqual(pool._gen_active_lanes, 1)
+        self.assertEqual(pool._gen_slots._value, 0)
+        w1.gen_release.set()
+        await t1
+        await g1.aclose()
+        self.assertEqual(pool._gen_active_lanes, 0)
+        self.assertEqual(pool._gen_slots._value, 1)
+
+    async def test_stress_concurrent_requests_leave_no_leaked_lane_state(self):
+        """Hammer 3 models with overlapping + cancelled requests; nothing sticks."""
+        self.settings.data["generation"]["maxQueuedRequests"] = 64
+        pool = self.make_pool(concurrency=2)
+        for number in (1, 2, 3):
+            await pool.load(self.model(number))
+
+        async def one(model_id: str, index: int, cancel: bool) -> None:
+            gen = pool.generate_for_model(model_id, f"p{index}", [], {}, f"req-{index}")
+            try:
+                async for _event in gen:
+                    if cancel:
+                        break
+            finally:
+                await gen.aclose()
+
+        tasks = []
+        for index in range(24):
+            model_id = f"model-{(index % 3) + 1}"
+            tasks.append(asyncio.create_task(one(model_id, index, cancel=(index % 4 == 0))))
+            if index % 5 == 0:
+                await asyncio.sleep(0)  # interleave starts
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+        # Every lane fully released: no permit leak, semaphore back to full,
+        # no owner or queue entry stranded, no lease left held.
+        self.assertEqual(pool._gen_active_lanes, 0)
+        self.assertEqual(pool._gen_slots._value, 2)
+        for slot in pool._slots.values():
+            self.assertFalse(slot.gen_lock.locked())
+            self.assertIsNone(slot.gen_owner)
+            self.assertFalse(slot.gen_permit)
+            self.assertEqual(slot.gen_queued, {})
+            self.assertEqual(slot.leases, 0)
+        self.assertEqual(pool._request_workers, {})
+
+    async def test_concurrency_never_exceeds_the_configured_limit_under_load(self):
+        pool = self.make_pool(concurrency=2)
+        for number in (1, 2, 3):
+            await pool.load(self.model(number))
+            pool._slots[f"model-{number}"].worker.gen_release = asyncio.Event()
+        seen_peak = 0
+
+        async def run(number: int) -> None:
+            nonlocal seen_peak
+            gen = pool.generate_for_model(f"model-{number}", "p", [], {}, f"r{number}")
+            try:
+                async for _event in gen:
+                    seen_peak = max(seen_peak, pool._gen_active_lanes)
+            finally:
+                await gen.aclose()
+
+        tasks = [asyncio.create_task(run(number)) for number in (1, 2, 3)]
+        await asyncio.sleep(0.05)
+        # Only two lanes may be active at once; the third request is queued.
+        self.assertEqual(pool._gen_active_lanes, 2)
+        self.assertEqual(sum(len(s.gen_queued) for s in pool._slots.values()), 1)
+        for slot in pool._slots.values():
+            slot.worker.gen_release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        self.assertLessEqual(seen_peak, 2)
+        self.assertEqual(pool._gen_active_lanes, 0)

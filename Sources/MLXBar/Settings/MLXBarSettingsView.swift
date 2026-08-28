@@ -229,6 +229,8 @@ struct ModelSourceSettingsView: View {
     @State private var perModelMaxGB = 32
     @State private var totalMemoryPercent = 75
     @State private var systemReserveGB = 4
+    @State private var generationConcurrency = 2
+    @State private var pinnedModelIds: Set<String> = []
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
     var body: some View {
@@ -260,24 +262,51 @@ struct ModelSourceSettingsView: View {
                         value: $totalMemoryPercent, in: 50...90)
                 Stepper("\(LS("システム用に残すメモリ")): \(systemReserveGB) GB",
                         value: $systemReserveGB, in: 1...128)
+                Stepper("\(LS("同時生成の上限")): \(generationConcurrency)",
+                        value: $generationConcurrency, in: 1...8)
                 Button(LS("モデル常駐設定を適用")) {
                     Task {
                         await model.setModelPoolSettings(
                             enabled: poolEnabled, maximum: maxResidentModels,
                             ttl: idleTTLSeconds, perModelGB: perModelMaxGB,
                             totalRatio: Double(totalMemoryPercent) / 100,
-                            reserveGB: systemReserveGB)
+                            reserveGB: systemReserveGB,
+                            generationConcurrency: generationConcurrency)
                     }
                 }.buttonStyle(.borderedProminent)
-                Text(LS("有効／無効の切り替えは次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。"))
+                Text(LS("有効／無効の切り替えと同時生成の上限は次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 LabeledContent(LS("現在の常駐数"), value: "\(model.residentModelCount)")
+                LabeledContent(LS("同時生成"), value: "\(model.activeGenerations) / \(model.generationConcurrency)")
                 LabeledContent(LS("予約済みメモリ"), value: ByteCountFormatter.string(
                     fromByteCount: model.modelPoolReservedBytes, countStyle: .memory))
                 LabeledContent(LS("常駐メモリ予算"), value: ByteCountFormatter.string(
                     fromByteCount: model.modelPoolBudgetBytes, countStyle: .memory))
-                Text(LS("モデルごとに独立したWorkerを使います。生成は安全のため全体で1件ずつです。手動ロードしたモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
+                Text(LS("モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("常駐させるモデル")) {
+                if model.models.isEmpty {
+                    Text(LS("モデルが見つかりません。フォルダを追加して再スキャンしてください。"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ForEach(model.models.filter { $0.engine != nil }) { item in
+                    Toggle(isOn: Binding(
+                        get: { pinnedModelIds.contains(item.id) },
+                        set: { value in
+                            if value { pinnedModelIds.insert(item.id) }
+                            else { pinnedModelIds.remove(item.id) }
+                            Task { await model.setModelPin(item.id, keepLoaded: value) }
+                        }
+                    )) {
+                        Text(item.name).lineLimit(1).truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                Text(LS("常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -361,6 +390,7 @@ struct ModelSourceSettingsView: View {
         .task {
             await model.refreshSettings()
             await model.refreshStatus()
+            await model.refreshModels()
             maxTokenLimit = model.configuredMaxTokens
             defaultTemperature = model.configuredTemperature
             defaultTopP = model.configuredTopP
@@ -376,6 +406,10 @@ struct ModelSourceSettingsView: View {
             perModelMaxGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
             totalMemoryPercent = Int(((pool["totalMemoryRatio"] as? NSNumber)?.doubleValue ?? 0.75) * 100)
             systemReserveGB = (pool["minimumSystemReserveGB"] as? NSNumber)?.intValue ?? 4
+            generationConcurrency = (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 2
+            pinnedModelIds = Set((pool["profiles"] as? [[String: Any]] ?? [])
+                .filter { ($0["keepLoaded"] as? Bool) ?? false }
+                .compactMap { $0["modelId"] as? String })
         }
         }
     }

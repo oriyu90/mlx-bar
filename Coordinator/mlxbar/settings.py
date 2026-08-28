@@ -33,6 +33,16 @@ DEFAULTS: dict[str, Any] = {
             # Loads are deliberately serial: two simultaneous cold loads have
             # the least predictable combined allocation peak.
             "loadConcurrency": 1,
+            # Cross-model concurrent generation cap (v1.7.0).  1 keeps the
+            # pre-v1.7.0 behaviour: one generation at a time across the pool.
+            # Requests to the *same* model always stay serialised; this only
+            # lets distinct resident models generate at the same time, and only
+            # when the memory head-room guard says the combined peak still fits.
+            "generationConcurrency": 2,
+            # Per-concurrent-generation memory head-room charged on top of the
+            # resident reservation before a second lane is allowed to start.
+            # 0 derives a conservative value from the per-model limit.
+            "perGenerationHeadroomGB": 0,
             "profiles": [],
         },
         "lmStudio": {
@@ -213,6 +223,7 @@ class SettingsStore:
             "maxResidentModels": (1, 8),
             "idleTTLSeconds": (30, 86400),
             "loadConcurrency": (1, 1),
+            "generationConcurrency": (1, 8),
         }
         for key, (minimum, maximum) in pool_integer_ranges.items():
             value = pool.get(key)
@@ -228,6 +239,10 @@ class SettingsStore:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not minimum <= float(value) <= maximum):
                 raise ValueError(f"models.pool.{key} must be between {minimum} and {maximum}")
+        headroom = pool.get("perGenerationHeadroomGB", 0)
+        if (isinstance(headroom, bool) or not isinstance(headroom, (int, float))
+                or (float(headroom) != 0 and not 0.25 <= float(headroom) <= 32)):
+            raise ValueError("models.pool.perGenerationHeadroomGB must be 0 or between 0.25 and 32")
         profiles = pool.get("profiles")
         if not isinstance(profiles, list) or len(profiles) > 64:
             raise ValueError("models.pool.profiles must be an array with at most 64 entries")

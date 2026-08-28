@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.6.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.7.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -41,7 +41,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.6.2.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.7.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -99,15 +99,15 @@ ZCodeのシステム指示、会話履歴、ツール結果が従来の100,000�
 
 ### 複数モデル常駐とメモリ上限
 
-v1.6.2は、選択済みフォルダの別モデルをOpenAI互換APIが指定したとき、先のMLXモデルを即座に解放せず独立Workerで保持します。既定は最大2モデル、15分間、物理メモリの75%以下かつOS用に4 GB以上を残す設定です。モデルごとの既定上限は32 GBです。
+選択済みフォルダの別モデルをOpenAI互換APIが指定したとき、先のMLXモデルを即座に解放せず独立Workerで保持します。既定は最大2モデル、15分間、物理メモリの75%以下かつOS用に4 GB以上を残す設定です。モデルごとの既定上限は32 GBです。
 
 ロード前に実ファイル量から保守的に予約し、個別上限、合計予算、常駐数、現在の空きメモリ、macOSのメモリ圧のどれか一つでも安全条件を満たさなければロードしません。承認したbyte値は重みを読む前にそのWorkerのMLX allocatorへ適用し、応答で同じ値を証明できないランタイムはpoolで利用しません。
 
 APIが自動ロードした非固定モデルは、最後の要求が終了してからTTL後に解放されます。GUIから手動ロードしたモデルと`profiles[].keepLoaded`は通常保持されますが、macOSがcritical pressureを報告した場合はマシンを守るためidleモデルを解放します。生成中のモデルは切断や例外も含むストリーム終了まで解放対象になりません。
 
-安全性を変えないため、常駐モデルが複数でもコールドロードと生成は全体で1件ずつです。poolの有効/無効はプロセス構成に影響するため、設定保存後の次回service起動時に反映されます。上限を後から小さくした場合は、使用中や固定中を中断せず、idleのLRUから回収します。LM Studioは外部プロセスのメモリをMLXBarがbyte単位で強制できないためnative poolに合算せず、切替時にnative modelを解放してLM Studio自身のResource Guardrailsに任せます。
+コールドロードは全体で1件ずつです。poolの有効/無効はプロセス構成に影響するため、設定保存後の次回service起動時に反映されます。上限を後から小さくした場合は、使用中や固定中を中断せず、idleのLRUから回収します。LM Studioは外部プロセスのメモリをMLXBarがbyte単位で強制できないためnative poolに合算せず、切替時にnative modelを解放してLM Studio自身のResource Guardrailsに任せます。
 
-個別例外は`models.pool.profiles`で指定できます。
+個別例外は`models.pool.profiles`で指定できます。`keepLoaded: true`のモデルはサービス起動時に自動でプリロードされ、未使用でも解放されません。`mlxbarctl model pin MODEL_ID` / `model unpin MODEL_ID` / `model resident`、または設定画面の「常駐させるモデル」からも編集できます。
 
 ```json
 {"models":{"pool":{"profiles":[
@@ -115,7 +115,19 @@ APIが自動ロードした非固定モデルは、最後の要求が終了し�
 ]}}}
 ```
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)を参照してください。
+`DELETE /api/v1/models/loaded`は常駐モデルをすべて解放します。1モデルだけ解放するには`POST /api/v1/models/{id}/unload`（`?force=`、`mlxbarctl model unload MODEL_ID`）を使います。そのモデルに生成中の要求があるときだけ`ENGINE_BUSY`になり、他の常駐モデルには影響しません。
+
+### モデル間の同時生成（v1.7.0）
+
+v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。1つのMLXプロセスは単一スレッドのため、**同一モデルへの複数要求は従来どおり到着順に直列**です。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
+
+1件目の生成は常に許可します。2件目以降の並行生成は、常駐予約に生成1件ぶんのヘッドルーム見積を足しても全体メモリ予算に収まり、かつmacOSがメモリ圧を報告していないときだけ開始します。条件を満たさない要求は失敗させず、レーンが空くまでキューで待ちます。macOSがwarning以上のメモリ圧を報告した場合は自動的に直列生成へ降格します。ヘッドルーム見積は`models.pool.perGenerationHeadroomGB`（既定0＝`min(モデル上限×0.15, 2 GiB)`を算出、範囲0.25–32）で上書きできます。
+
+`generationConcurrency`はプロセス構成に影響するため、設定保存後の次回service起動時に反映されます。`GET /api/v1/status`に`generationConcurrency`、`activeGenerations`、各`loadedModels[].laneQueueDepth`を追加しています。設定画面に「同時生成の上限」と「同時生成 N / 上限 M」の表示があります。
+
+> **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
+
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。
 
 ### 既定の生成パラメータ
 
@@ -150,7 +162,7 @@ GGUFはMLXワーカーへ渡されず、LM Studio Providerだけが選択され�
 
 ### 生成の安全機能
 
-- 生成本体はメモリ保護のため同時に1件だけ実行し、並列要求は最大16件までFIFOキューで待機します。
+- 同一モデルへの生成は同時に1件だけ実行します。別々の常駐モデルは`models.pool.generationConcurrency`（既定2）まで並行して生成し、メモリ圧のときは自動的に直列へ降格します。上限を超えた並列要求は最大16件までFIFOキューで待機します。
 - 待機中は10秒間隔で接続を維持し、既定の最大待ち時間は3,600秒です。満杯時だけ再試行可能なHTTP 429を返します。
 - GUIの「停止」は協調停止を要求し、5秒以内に終わらない場合はMLX WorkerまたはLM Studio接続を強制終了します。「すべての生成を停止」では待機中の要求も取り消します。
 - モデルロードは最大10分、生成は最大60分で停止します。長い入力処理中は10秒間隔で生存通知を送ります。生成が上限を超えても、その要求だけを停止してモデルはロードしたまま維持します。Workerが60秒間まったく無応答になった場合だけプロセスを再起動します。
@@ -366,7 +378,7 @@ OpenClaw（`openai-completions`）から使う場合は、カスタムプロバ�
 
 応答の`usage.prompt_tokens_details.cached_tokens`に再利用できたprompt token数を入れるため、OpenClaw側の`cacheRead`にキャッシュの実績がそのまま出ます。
 
-MLXBarは要求を到着順に直列処理します。subagentを並列に開始しても拒否せずキューに入れ、待機中もheartbeatを送ります。ただし別のモデルを指定した要求は、他の要求が実行中・待機中のあいだ`ENGINE_BUSY`（HTTP 429）になります。
+同一モデルへの要求は到着順に直列処理します。subagentを並列に開始しても拒否せずキューに入れ、待機中もheartbeatを送ります。別々の常駐モデルへの要求は`models.pool.generationConcurrency`（既定2）まで並行して処理します。まだ常駐していないモデルを指定した要求は、他の要求が実行中・待機中のあいだ`ENGINE_BUSY`（HTTP 429）になります（生成中のモデル切り替えを避けるため）。同時に使いたいモデルは`keepLoaded`プロファイルか事前ロードで常駐させてください。
 
 ### プロンプトの再利用と中断からの再開
 
@@ -414,7 +426,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.6.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.7.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

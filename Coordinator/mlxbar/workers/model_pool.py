@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..errors import MLXBarError
@@ -30,6 +30,16 @@ class PoolSlot:
     last_released_at: float = 0.0
     state: str = "loading"
     load_future: asyncio.Future | None = None
+    # v1.7.0 cross-model generation: this lane serialises requests to *this*
+    # model (one MLX process is single-threaded) while a pool-wide semaphore
+    # bounds how many lanes run at once.  gen_permit records whether this lane
+    # currently holds one of those semaphore permits, so orphan recovery never
+    # over-releases the semaphore.
+    gen_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    gen_owner: str | None = None
+    gen_permit: bool = False
+    gen_recoveries: int = 0
+    gen_queued: dict[str, QueuedRequest] = field(default_factory=dict)
 
 
 class ModelPoolSupervisor:
@@ -50,8 +60,15 @@ class ModelPoolSupervisor:
         self._primary_model_id: str | None = None
         self._pool_lock = asyncio.Lock()
         self._load_lock = asyncio.Lock()
-        self._generation_lock = asyncio.Lock()
-        self._pool_queued: dict[str, QueuedRequest] = {}
+        # Cross-model concurrent generation (v1.7.0).  concurrency == 1 keeps the
+        # pre-v1.7.0 behaviour: a single permit means exactly one generation at a
+        # time across the whole pool, identical to the old global lock.  The
+        # value is latched for this coordinator lifetime, like `enabled`.
+        self._gen_concurrency = max(1, min(8, int(
+            self.settings.data.get("models", {}).get("pool", {}).get(
+                "generationConcurrency", 2))))
+        self._gen_slots = asyncio.Semaphore(self._gen_concurrency)
+        self._gen_active_lanes = 0
         self._request_workers: dict[str, SingleWorkerSupervisor] = {}
         self._reaper_task: asyncio.Task | None = None
         self.maintenance_engines: set[str] = set()
@@ -98,14 +115,30 @@ class ModelPoolSupervisor:
     def queued_requests(self) -> dict:
         if not self.enabled:
             return self._legacy.queued_requests
-        result = dict(self._pool_queued)
+        result: dict = {}
         for slot in self._slots.values():
+            result.update(slot.gen_queued)
             result.update(slot.worker.queued_requests)
         return result
 
+    def _any_generation_busy(self) -> bool:
+        return (self._gen_active_lanes > 0
+                or any(slot.gen_lock.locked() for slot in self._slots.values()))
+
+    class _LaneLockView:
+        """Read-only ``.locked()`` shim for legacy callers of ``generation_lock``."""
+
+        def __init__(self, pool: "ModelPoolSupervisor"):
+            self._pool = pool
+
+        def locked(self) -> bool:
+            return self._pool._any_generation_busy()
+
     @property
     def generation_lock(self):
-        return self._legacy.generation_lock if not self.enabled else self._generation_lock
+        if not self.enabled:
+            return self._legacy.generation_lock
+        return ModelPoolSupervisor._LaneLockView(self)
 
     @property
     def process(self):
@@ -439,6 +472,40 @@ class ModelPoolSupervisor:
             await self._evict_slot(slot)
         return {"state": "unloaded", "count": len(slots)}
 
+    async def unload_model(self, model_id: str, *, force: bool = False) -> dict:
+        """Free one resident model without disturbing the others.
+
+        The v1.6.x API only had ``unload`` (every model) and per-engine unload;
+        a multi-model workflow needs to drop one pinned model at a time.
+        """
+        if not self.enabled:
+            if self._legacy.loaded and str(self._legacy.loaded.get("id", "")) == model_id:
+                return await self._legacy.unload()
+            return {"state": "unloaded", "count": 0}
+        async with self._load_lock:
+            if self._legacy.loaded and str(self._legacy.loaded.get("id", "")) == model_id:
+                await self._legacy.unload()
+                if self._primary_model_id == model_id:
+                    self._primary_model_id = None
+                return {"state": "unloaded", "count": 1}
+            slot = self._slots.get(model_id)
+            if slot is None:
+                return {"state": "unloaded", "count": 0}
+            if slot.leases and not force:
+                raise MLXBarError("ENGINE_BUSY", "使用中のモデルは解放できません", 409, True)
+            if slot.leases and force:
+                # Cancel only this model's generations, not the whole pool.
+                for queued in list(slot.gen_queued.values()):
+                    queued.cancel_requested.set()
+                for req_id, worker in list(self._request_workers.items()):
+                    if worker is slot.worker:
+                        with contextlib.suppress(Exception):
+                            await worker.cancel(req_id)
+            slot.state = "evicting"
+            slot.session_pinned = False
+            await self._evict_slot(slot)
+            return {"state": "unloaded", "count": 1}
+
     async def unload_engine(self, engine: str) -> dict:
         async with self._load_lock:
             targets = [slot for slot in self._slots.values()
@@ -471,6 +538,123 @@ class ModelPoolSupervisor:
                                            pin=bool(snapshot.get("sessionPinned", False))))
         return results
 
+    def _per_generation_headroom(self, slot: PoolSlot) -> int:
+        configured = float(self._pool_settings().get("perGenerationHeadroomGB", 0) or 0)
+        if configured > 0:
+            return int(configured * GIB)
+        # A conservative default: KV cache + activation peak for one generation
+        # is a fraction of the model's own reservation.
+        return min(int(self._per_model_limit(slot.model) * 0.15), 2 * GIB)
+
+    def _admit_concurrent(self, slot: PoolSlot) -> bool:
+        """Would starting one more generation lane keep the combined peak safe?
+
+        A lone generation is always allowed -- that is exactly what every
+        release before v1.7.0 did.  Only the second and later concurrent lanes
+        are held to the memory head-room and per-model concurrency limits.
+        """
+        if self._gen_active_lanes == 0:
+            return True
+        if self._gen_concurrency <= 1:
+            return False
+        budget = self._global_budget()
+        if budget <= 0:
+            return False
+        charge = self._resident_charge()
+        for other in self._slots.values():
+            if other is slot:
+                continue
+            if other.gen_owner is not None or other.worker.active_requests:
+                charge += self._per_generation_headroom(other)
+        charge += self._per_generation_headroom(slot)
+        return charge <= budget
+
+    async def _concurrent_start_ok(self, slot: PoolSlot) -> bool:
+        if self._gen_active_lanes == 0:
+            return True
+        if not self._admit_concurrent(slot):
+            return False
+        _, pressure = await asyncio.to_thread(self._host_capacity)
+        return pressure < 2
+
+    async def _acquire_lane(self, slot: PoolSlot, request_id: str) -> None:
+        """Serialise this model, then take one pool-wide concurrency permit.
+
+        Robust to cancellation while waiting for the permit: the model lane lock
+        grabbed first is rolled back so a cancelled waiter never strands it.
+        """
+        await slot.gen_lock.acquire()
+        slot.gen_owner = request_id
+        raw_permit = False
+        try:
+            while True:
+                await self._gen_slots.acquire()
+                raw_permit = True
+                # Holding a raw permit is not enough: re-check that adding this
+                # lane keeps the combined memory peak and pressure safe.  If
+                # not, hand the permit back and wait for a lane to free.  Rare
+                # -- only under the head-room guard -- and bounded by the queue
+                # timeout, so a short poll is acceptable here.
+                if await self._concurrent_start_ok(slot):
+                    break
+                self._gen_slots.release()
+                raw_permit = False
+                await asyncio.sleep(0.05)
+        except BaseException:
+            if raw_permit:
+                self._gen_slots.release()
+            if slot.gen_owner == request_id:
+                slot.gen_owner = None
+                if slot.gen_lock.locked():
+                    slot.gen_lock.release()
+            raise
+        self._gen_active_lanes += 1
+        slot.gen_permit = True
+
+    def _release_lane(self, slot: PoolSlot, request_id: str) -> bool:
+        if slot.gen_owner != request_id:
+            return False
+        slot.gen_owner = None
+        if slot.gen_lock.locked():
+            slot.gen_lock.release()
+        if slot.gen_permit:
+            slot.gen_permit = False
+            self._gen_slots.release()
+            self._gen_active_lanes = max(0, self._gen_active_lanes - 1)
+        return True
+
+    def _recover_lane(self, slot: PoolSlot, source: str) -> bool:
+        """Release a lane whose owner vanished after an interrupted stream.
+
+        Mirrors ``WorkerSupervisor._recover_orphaned_generation_slot`` but per
+        model.  The pool's pre-v1.7.0 queue had no equivalent, so a client that
+        disconnected mid-handshake could pin a lane until process exit.
+        """
+        if not slot.gen_lock.locked():
+            if (slot.gen_owner is not None
+                    and slot.gen_owner not in slot.worker.active_requests
+                    and slot.gen_owner not in slot.gen_queued):
+                slot.gen_owner = None
+            return False
+        owner = slot.gen_owner
+        if owner in slot.worker.active_requests or owner in slot.gen_queued:
+            return False
+        # An unowned active request could still be mid-generation; keep this
+        # lane serialised and let that request's own finalizer finish first.
+        if slot.worker.active_requests:
+            return False
+        slot.gen_owner = None
+        if slot.gen_lock.locked():
+            slot.gen_lock.release()
+        if slot.gen_permit:
+            slot.gen_permit = False
+            self._gen_slots.release()
+            self._gen_active_lanes = max(0, self._gen_active_lanes - 1)
+        slot.gen_recoveries += 1
+        LOGGER.error("Recovered orphaned pool generation lane model=%s source=%s",
+                     slot.model.get("id"), source)
+        return True
+
     async def generate_for_model(self, model_id: str, prompt, images: list[str], options: dict,
                                  request_id: str | None = None, image_root: Path | None = None):
         if not self.enabled:
@@ -488,23 +672,33 @@ class ModelPoolSupervisor:
         if slot is None or slot.state != "ready" or not slot.worker.loaded:
             raise MLXBarError("MODEL_NOT_LOADED", "要求されたモデルがロードされていません", 409, True)
         request_id = request_id or hashlib.sha256(os.urandom(16)).hexdigest()
+        self._recover_lane(slot, "new_request")
         slot.leases += 1
-        acquired = False
         queued = None
         acquire_task = None
         cancel_task = None
         try:
-            if self._generation_lock.locked() or self._pool_queued:
-                limits = self.settings.data["generation"]
-                if len(self._pool_queued) >= limits.get("maxQueuedRequests", 16):
+            limits = self.settings.data["generation"]
+            # Fast path only when the whole pool is idle: with no active lane,
+            # `_acquire_lane` runs to completion without hitting an await point,
+            # so there is no window for two callers to both see it as free.
+            # Every concurrent start goes through the queue loop below, which
+            # keeps emitting heartbeats even if `_acquire_lane` blocks on the
+            # semaphore or the memory guard.
+            must_wait = (slot.gen_lock.locked() or slot.gen_queued
+                         or self._gen_active_lanes > 0)
+            if must_wait:
+                total_queued = sum(len(item.gen_queued) for item in self._slots.values())
+                if total_queued >= limits.get("maxQueuedRequests", 16):
                     raise MLXBarError("QUEUE_FULL", "生成待ちが上限に達しています", 429, True)
                 queued = QueuedRequest(asyncio.Event(), time.monotonic())
-                self._pool_queued[request_id] = queued
-                acquire_task = asyncio.create_task(self._generation_lock.acquire())
+                slot.gen_queued[request_id] = queued
+                acquire_task = asyncio.create_task(self._acquire_lane(slot, request_id))
                 cancel_task = asyncio.create_task(queued.cancel_requested.wait())
                 timeout = limits.get("queueTimeoutSeconds", 3600)
                 heartbeat = limits.get("streamHeartbeatSeconds", 10)
                 while not acquire_task.done():
+                    self._recover_lane(slot, "queue_wait")
                     remaining = timeout - (time.monotonic() - queued.enqueued_at)
                     if remaining <= 0:
                         raise MLXBarError("QUEUE_TIMEOUT", "生成待ち時間が上限を超えました", 429, True)
@@ -516,16 +710,17 @@ class ModelPoolSupervisor:
                         return
                     if acquire_task not in done:
                         yield {"type": "queue", "state": "waiting",
-                               "position": list(self._pool_queued).index(request_id) + 1,
+                               "position": list(slot.gen_queued).index(request_id) + 1,
                                "waited_seconds": round(time.monotonic() - queued.enqueued_at, 1)}
                 await acquire_task
-                acquired = True
+                # No longer waiting: stop counting this request as queued the
+                # moment it owns a lane, matching WorkerSupervisor.generate.
+                slot.gen_queued.pop(request_id, None)
                 if queued.cancel_requested.is_set():
                     yield {"type": "completed", "finish_reason": "cancelled"}
                     return
             else:
-                await self._generation_lock.acquire()
-                acquired = True
+                await self._acquire_lane(slot, request_id)
             self._request_workers[request_id] = slot.worker
             async for event in slot.worker.generate(prompt, images, options, request_id,
                                                     image_root=image_root):
@@ -537,10 +732,13 @@ class ModelPoolSupervisor:
                 acquire_task.cancel()
             await asyncio.gather(*(task for task in (cancel_task, acquire_task) if task),
                                  return_exceptions=True)
-            self._pool_queued.pop(request_id, None)
+            slot.gen_queued.pop(request_id, None)
             self._request_workers.pop(request_id, None)
-            if acquired and self._generation_lock.locked():
-                self._generation_lock.release()
+            # Unconditional: _release_lane is a no-op unless gen_owner matches
+            # this request, so it also covers the race where `acquire_task`
+            # finished acquiring the lane but the awaiting frame was cancelled
+            # before `lane = True` ran.
+            self._release_lane(slot, request_id)
             slot.leases = max(0, slot.leases - 1)
             slot.last_released_at = time.monotonic()
 
@@ -553,33 +751,42 @@ class ModelPoolSupervisor:
                                                    options, request_id, image_root):
             yield event
 
+    def _total_queued(self) -> int:
+        return sum(len(slot.gen_queued) for slot in self._slots.values())
+
     def raise_if_queue_full(self) -> None:
         if not self.enabled:
             return self._legacy.raise_if_queue_full()
+        for slot in self._slots.values():
+            self._recover_lane(slot, "capacity_check")
         maximum = self.settings.data["generation"].get("maxQueuedRequests", 16)
-        if ((self._generation_lock.locked() or self._pool_queued)
-                and len(self._pool_queued) >= maximum):
+        total_queued = self._total_queued()
+        if (self._any_generation_busy() or total_queued) and total_queued >= maximum:
             raise MLXBarError("QUEUE_FULL", "生成待ちが上限に達しています", 429, True)
 
     async def cancel(self, request_id: str) -> dict:
         if not self.enabled:
             return await self._legacy.cancel(request_id)
-        queued = self._pool_queued.get(request_id)
-        if queued:
-            queued.cancel_requested.set()
-            return {"cancelled": True, "queued": True, "forced": False}
+        for slot in self._slots.values():
+            queued = slot.gen_queued.get(request_id)
+            if queued:
+                queued.cancel_requested.set()
+                return {"cancelled": True, "queued": True, "forced": False}
         worker = self._request_workers.get(request_id)
         return await worker.cancel(request_id) if worker else {"cancelled": False, "forced": False}
 
     async def cancel_all(self) -> dict:
         if not self.enabled:
             return await self._legacy.cancel_all()
-        for queued in self._pool_queued.values():
-            queued.cancel_requested.set()
+        queued_count = 0
+        for slot in self._slots.values():
+            for queued in slot.gen_queued.values():
+                queued.cancel_requested.set()
+                queued_count += 1
         results = [await worker.cancel(request_id)
                    for request_id, worker in list(self._request_workers.items())]
-        return {"cancelled": bool(self._pool_queued or results),
-                "queuedCancelled": len(self._pool_queued), "activeCancelled": len(results),
+        return {"cancelled": bool(queued_count or results),
+                "queuedCancelled": queued_count, "activeCancelled": len(results),
                 "forced": any(result.get("forced", False) for result in results)}
 
     async def prompt_cache_stats(self) -> dict:
@@ -631,7 +838,7 @@ class ModelPoolSupervisor:
             return await self._legacy.wait_until_idle(timeout)
         try:
             async with asyncio.timeout(timeout):
-                while self.active_requests or self.queued_requests or self._generation_lock.locked():
+                while self.active_requests or self.queued_requests or self._any_generation_busy():
                     await asyncio.sleep(0.1)
             return True
         except TimeoutError:
@@ -657,19 +864,26 @@ class ModelPoolSupervisor:
                 "enabled": False, "configuredEnabled": configured,
                 "restartRequired": configured != self.enabled,
                 "residentCount": int(bool(status.get("loadedModel"))),
+                "generationConcurrency": 1,
+                "activeGenerations": min(1, len(self._legacy.active_requests)),
             }
             status["loadedModels"] = [status["loadedModel"]] if status.get("loadedModel") else []
             return status
         loaded_models = []
         loading = None
+        active_generations = 0
         for slot in list(self._slots.values()):
             child = slot.worker.status()
             slot.keep_loaded = bool(self._profile(str(slot.model.get("id", ""))).get(
                 "keepLoaded", False))
+            if slot.gen_owner is not None or slot.worker.active_requests:
+                active_generations += 1
             if child.get("loadedModel"):
                 loaded_models.append({**child["loadedModel"], "poolState": slot.state,
                                       "memoryReservationBytes": slot.reservation_bytes,
                                       "activeLeases": slot.leases,
+                                      "laneQueueDepth": len(slot.gen_queued),
+                                      "laneRecoveries": slot.gen_recoveries,
                                       "keepLoaded": slot.keep_loaded or slot.session_pinned,
                                       "idleExpiresAt": None if slot.keep_loaded or slot.session_pinned else
                                       time.time() + max(0, self._pool_settings().get("idleTTLSeconds", 900)
@@ -693,15 +907,20 @@ class ModelPoolSupervisor:
             "activeRequestCount": len(self.active_requests),
             "queuedRequestCount": len(self.queued_requests),
             "oldestQueuedSeconds": round(time.monotonic() - min(
-                (item.enqueued_at for item in self._pool_queued.values()), default=time.monotonic())),
-            "generationLockState": "active" if self._generation_lock.locked() else "idle",
-            "generationLockRecoveries": 0,
+                (item.enqueued_at for slot in self._slots.values()
+                 for item in slot.gen_queued.values()), default=time.monotonic())),
+            "generationLockState": "active" if self._any_generation_busy() else "idle",
+            "generationLockRecoveries": sum(slot.gen_recoveries for slot in self._slots.values()),
+            "generationConcurrency": self._gen_concurrency,
+            "activeGenerations": active_generations,
             "maintenanceEngines": sorted(self.maintenance_engines),
             "modelPool": {"enabled": True,
                           "configuredEnabled": bool(self._pool_settings().get("enabled", True)),
                           "restartRequired": not bool(self._pool_settings().get("enabled", True)),
                           "residentCount": len(loaded_models),
                           "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
+                          "generationConcurrency": self._gen_concurrency,
+                          "activeGenerations": active_generations,
                           "reservedBytes": self._resident_charge(),
                           "budgetBytes": self._global_budget()},
         }
