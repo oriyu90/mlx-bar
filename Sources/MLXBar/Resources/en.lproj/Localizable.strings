@@ -292,3 +292,11 @@
 "ロード中" = "Loading";
 "解放中" = "Releasing";
 "固定" = "Pinned";
+
+/* v1.8.0 -- same-model replicas & Anthropic API */
+"並列数" = "Replicas";
+"並列数（replicas）" = "Replicas";
+"並列数は1〜8で指定してください" = "Replicas must be between 1 and 8";
+"Replicas must be between 1 and 8" = "Replicas must be between 1 and 8";
+"Anthropic互換API（/anthropic）を有効化" = "Enable Anthropic-compatible API (/anthropic)";
+"Claude Codeでは ANTHROPIC_BASE_URL に上記URL、ANTHROPIC_AUTH_TOKEN にAPIキーを設定します。有効／無効の切り替えは次回サービス起動時に反映されます。" = "In Claude Code, set ANTHROPIC_BASE_URL to the URL above and ANTHROPIC_AUTH_TOKEN to the API key. Enabling or disabling it takes effect at the next service start.";

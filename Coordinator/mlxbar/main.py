@@ -93,40 +93,70 @@ class PublicRequestGuard:
         headers: dict[str, str] = {}
         for key, value in scope.get("headers", []):
             headers.setdefault(key.decode("latin-1").lower(), value.decode("latin-1"))
-        if not self._authorized(headers):
+        # The Anthropic-compatible surface is isolated under /anthropic: it
+        # accepts `x-api-key` as well as bearer, requires `anthropic-version`,
+        # and every early rejection must use the Anthropic error envelope. The
+        # OpenAI surface (everything else) is byte-for-byte unchanged.
+        anthropic = scope.get("path", "").startswith("/anthropic")
+        if anthropic:
+            if not self._authorized(headers, anthropic=True):
+                await self._reject_anthropic(scope, send, 401, "authentication_error",
+                                             "APIキーが正しくありません。x-api-key または Authorization: Bearer ヘッダーを確認してください")
+                return
+            if not headers.get("anthropic-version", "").strip():
+                await self._reject_anthropic(scope, send, 400, "invalid_request_error",
+                                             "anthropic-version ヘッダーが必要です")
+                return
+        elif not self._authorized(headers):
             await self._reject(scope, send, 401, "AUTHENTICATION_FAILED",
                                "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください")
             return
         limit = max_request_bytes(self.state.settings)
         declared = headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > limit:
-            await self._reject(scope, send, 413, "INPUT_TOO_LARGE",
-                               f"要求が大きすぎます（上限{limit // 1_048_576}MB）")
+            if anthropic:
+                await self._reject_anthropic(scope, send, 413, "invalid_request_error",
+                                             f"要求が大きすぎます（上限{limit // 1_048_576}MB）")
+            else:
+                await self._reject(scope, send, 413, "INPUT_TOO_LARGE",
+                                   f"要求が大きすぎます（上限{limit // 1_048_576}MB）")
             return
         await self.app(scope, _capped_receive(receive, limit), send)
 
-    def _authorized(self, headers: dict) -> bool:
+    def _authorized(self, headers: dict, *, anthropic: bool = False) -> bool:
         try:
             if not self.state.settings.data["api"].get("requireToken", True):
                 return True
-            expected = "Bearer " + self.state.settings.api_token
+            token = self.state.settings.api_token
         except (AttributeError, KeyError, OSError):
             # Anything unexpected about the token or its settings fails closed;
             # the handler's own authorize() then produces the real error.
             return False
-        return secrets.compare_digest(headers.get("authorization", ""), expected)
+        if secrets.compare_digest(headers.get("authorization", ""), "Bearer " + token):
+            return True
+        return anthropic and secrets.compare_digest(headers.get("x-api-key", ""), token)
 
     @staticmethod
-    async def _reject(scope, send, status: int, code: str, message: str) -> None:
-        # The access-log middleware reads this back off the shared scope state.
-        scope.setdefault("state", {})["api_log"] = {"error_code": code}
-        body = json.dumps({"error": {"message": message, "type": "invalid_request_error",
-                                     "param": None, "code": code}}).encode("utf-8")
+    async def _send_json(send, status: int, payload: dict, error_code: str, scope) -> None:
+        scope.setdefault("state", {})["api_log"] = {"error_code": error_code}
+        body = json.dumps(payload).encode("utf-8")
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"),
                                 (b"content-length", str(len(body)).encode("ascii")),
                                 (b"connection", b"close")]})
         await send({"type": "http.response.body", "body": body})
+
+    @classmethod
+    async def _reject(cls, scope, send, status: int, code: str, message: str) -> None:
+        await cls._send_json(send, status, {"error": {
+            "message": message, "type": "invalid_request_error", "param": None, "code": code}},
+            code, scope)
+
+    @classmethod
+    async def _reject_anthropic(cls, scope, send, status: int, kind: str, message: str) -> None:
+        await cls._send_json(send, status, {
+            "type": "error", "error": {"type": kind, "message": message},
+            "request_id": "req_" + secrets.token_hex(12)}, f"HTTP_{status}", scope)
 
 
 def _capped_receive(receive, limit: int):
@@ -306,6 +336,13 @@ def make_public_app(state: AppState) -> FastAPI:
             if error_code:
                 record()
     app.include_router(public_router)
+    # Anthropic Messages compatibility lives in its own sub-app so its auth,
+    # error envelope and SSE encoding never touch the OpenAI surface. The flag
+    # is latched for the coordinator's lifetime (the app is built once at
+    # startup) exactly like `models.pool.enabled`; toggling it needs a restart.
+    if state.settings.data.get("api", {}).get("anthropic", {}).get("enabled", True):
+        from .api.anthropic_compat import make_anthropic_app
+        app.mount("/anthropic", make_anthropic_app(state))
     return app
 
 

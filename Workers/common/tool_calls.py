@@ -107,6 +107,9 @@ class StopSequenceFilter:
                                if isinstance(item, str) and item)
         self.pending = ""
         self.hit = False
+        # Which sequence actually ended output -- the Anthropic Messages API
+        # reports it as `stop_sequence`. Unused by the OpenAI path.
+        self.matched = None
 
     def __bool__(self) -> bool:
         return bool(self.sequences)
@@ -118,7 +121,8 @@ class StopSequenceFilter:
         self.pending += text
         match = IncrementalToolStream._first_marker(self.pending, self.sequences)
         if match is not None:
-            position, _ = match
+            position, sequence = match
+            self.matched = sequence
             visible, self.pending, self.hit = self.pending[:position], "", True
             return visible, True
         safe = IncrementalToolStream._safe_prefix_length(self.pending, self.sequences)

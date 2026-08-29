@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.7.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.8.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -17,6 +17,8 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - GGUFモデルのLM Studio Provider経由利用
 - モデルフォルダの追加と再スキャン
 - OpenAI互換のモデル一覧・モデル詳細・Chat Completions API（Open Interpreter、LibreChat、ZCode、Zed、Cline、OpenCode向け）
+- Anthropic Messages API互換の`/anthropic`入口（Claude Code向け）：messages・streaming・tool use・画像・count_tokens・models
+- 同一モデルの並列常駐&生成（`models.pool.profiles[].replicas`）
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
@@ -41,7 +43,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.7.1.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.8.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -131,7 +133,24 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)にあります。
+
+### 同一モデルの並列常駐（v1.8.0）
+
+1つのMLXプロセスは単一スレッドのため、**同一モデルへの並列生成にはそのモデルのコピーをNプロセス常駐**させます（レプリカ）。`models.pool.profiles`でpin済みのモデルに`replicas`（1〜8、既定1）を指定します。
+
+```json
+{"models":{"pool":{"profiles":[
+  {"modelId":"MODEL_ID","keepLoaded":true,"replicas":2}
+]}}}
+```
+
+- 各レプリカは独立Workerプロセス・独立メモリ予約・独立のmanifest/ログ/ソケットです。`replicas`は`models.pool.maxReplicasPerModel`（既定2、範囲1–8）で頭打ちになります。
+- admissionはレプリカごとに予算をchargeします。2つ合わせて予算に収まらなければ2つ目は`MEMORY_BUDGET_EXCEEDED`で拒否され、ロードできたレプリカだけでモデルは利用可能です。
+- 同一モデルへの並行要求は空きレプリカへ振り分けます。プール全体の同時生成数は従来どおり`generationConcurrency`セマフォが束ね、2レーン目以降のメモリ・ヘッドルームガードも効きます。
+- 明示ロード（GUI・CLI・プリロード）は設定数すべてを今ロードします。API自動ロードは1コピーだけ立ち上げ、reaperがpin済みモデルを背景で`replicas`まで補充します（要求は追加admissionのコストを払いません）。`replicas`を下げると高インデックス側のidleレプリカから解放します。
+- `mlxbarctl model pin <id> --replicas N`、メニューバーの`×N`バッジ、設定画面の「並列数（replicas）」Stepperで指定できます。
+- `replicas > 1`は`models.pool.enabled: true`が必須です。**合算メモリピークの実機計測は未実施です**（`TEST_PLAN_v1.8.0.md §2`）。メモリガードが「直列なら成功する要求」を落とさないよう安全側に倒しています。`replicas`既定1のとき挙動はv1.7.1と完全に同一です。
 
 ### 既定の生成パラメータ
 
@@ -359,6 +378,23 @@ ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒�
 - ストリーミングのtool callでは、OpenAIと同じく`delta.role`を最初のチャンクだけに付けます（一部のSDKの厳格なパーサ対策）。
 - 未対応のパス（`/v1/completions`など）にも、`{"detail": "Not Found"}`ではなくOpenAI形式の`error`オブジェクトで応答します。
 
+### Anthropic互換API / Claude Code（v1.8.0）
+
+`/anthropic`配下にAnthropic Messages API互換の入口を持ちます。OpenAI経路とは認証・エラー形・SSE変換を分離しています（`openai_compat.py`は無変更）。Claude Codeから使うには次を設定します。
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11435/anthropic
+export ANTHROPIC_AUTH_TOKEN="$(cat ~/Library/Application\ Support/MLXBar/control/api-token)"
+export ANTHROPIC_MODEL="<GET /anthropic/v1/models が返すローカルモデル名>"
+```
+
+- エンドポイント: `POST /anthropic/v1/messages`（ストリーム/非ストリーム）、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models[/{id}]`。
+- 認証は`x-api-key`または`Authorization: Bearer`。`anthropic-version`ヘッダ必須。全応答に`request-id`ヘッダ。
+- 変換対象: `system`、text、画像（base64/URL、既存のprivate workspace・容量・SSRF対策を通す）、client tool use と`tool_result`、`tool_choice`（auto/any/tool/none）、`disable_parallel_tool_use`、`stop_sequences`。ストリームは`message_start`→`content_block_*`→`message_delta`→`message_stop`（`[DONE]`なし、`ping` keep-alive）。`stop_reason`は stop→end_turn / length→max_tokens / tool_calls→tool_use / stop文字列検出→stop_sequence。
+- `count_tokens`はロード中モデルの実トークナイザで数えます（未対応ランタイムは501で安全に失敗）。
+- **v1では未対応**（黙って無視せず`invalid_request_error`で拒否）: Anthropicのサーバーサイドツール、extended thinking（署名block）、PDF/`document` content block、Anthropic側MCP実行。`cache_control`は受理して無視し、`usage`にAnthropicの課金用cacheフィールドを出しません。Claudeのモデル名をローカルモデルへリネームせず、一致しない名前は常駐1件へフォールバックし、応答の`model`は実ローカル名です。
+- feature flag `api.anthropic.enabled`（既定ON）。有効／無効の切り替えは次回サービス起動時に反映されます。「設定…」→「APIサーバー」にトグルとURL表示があります。
+
 ### OpenClaw
 
 OpenClaw（`openai-completions`）から使う場合は、カスタムプロバイダとして登録します。**`timeoutSeconds`を必ず指定してください。**
@@ -445,7 +481,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.7.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.8.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

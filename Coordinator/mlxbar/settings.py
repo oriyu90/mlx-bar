@@ -14,7 +14,10 @@ DEFAULTS: dict[str, Any] = {
     "schemaVersion": 1,
     "api": {"enabled": True, "host": "127.0.0.1", "port": 11435, "requireToken": True,
             # 0 derives the ceiling from the generation limits below.
-            "maxRequestBytes": 0, "maxConcurrentConnections": 64},
+            "maxRequestBytes": 0, "maxConcurrentConnections": 64,
+            # Anthropic Messages compatibility (v1.8.0) under /anthropic, for
+            # Claude Code. Isolated from the OpenAI surface; latched at startup.
+            "anthropic": {"enabled": True}},
     "models": {
         "watchFolders": True,
         "autoLoadOnAPIRequest": True,
@@ -33,6 +36,11 @@ DEFAULTS: dict[str, Any] = {
             # Loads are deliberately serial: two simultaneous cold loads have
             # the least predictable combined allocation peak.
             "loadConcurrency": 1,
+            # Hard ceiling on same-model replicas (v1.8.0). A profile's
+            # `replicas` is clamped to this. 1 keeps the pre-v1.8.0 behaviour of
+            # one process per model; raising it lets N copies of one model run
+            # distinct generations at once, at N times the memory.
+            "maxReplicasPerModel": 2,
             # Cross-model concurrent generation cap (v1.7.0).  1 keeps the
             # pre-v1.7.0 behaviour: one generation at a time across the pool.
             # Requests to the *same* model always stay serialised; this only
@@ -214,6 +222,8 @@ class SettingsStore:
         if (isinstance(connections, bool) or not isinstance(connections, int)
                 or not 1 <= connections <= 1024):
             raise ValueError("api.maxConcurrentConnections must be between 1 and 1024")
+        if not isinstance(api.get("anthropic", {}).get("enabled", True), bool):
+            raise ValueError("api.anthropic.enabled must be boolean")
         if not isinstance(data.get("models", {}).get("autoLoadOnAPIRequest"), bool):
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
         pool = data.get("models", {}).get("pool", {})
@@ -224,6 +234,7 @@ class SettingsStore:
             "idleTTLSeconds": (30, 86400),
             "loadConcurrency": (1, 1),
             "generationConcurrency": (1, 8),
+            "maxReplicasPerModel": (1, 8),
         }
         for key, (minimum, maximum) in pool_integer_ranges.items():
             value = pool.get(key)
@@ -256,6 +267,9 @@ class SettingsStore:
             seen_profiles.add(model_id)
             if not isinstance(profile.get("keepLoaded", False), bool):
                 raise ValueError("models.pool profile keepLoaded must be boolean")
+            replicas = profile.get("replicas", 1)
+            if isinstance(replicas, bool) or not isinstance(replicas, int) or not 1 <= replicas <= 8:
+                raise ValueError("models.pool profile replicas must be between 1 and 8")
             maximum = profile.get("maxMemoryGB", pool.get("defaultPerModelMaxGB"))
             if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
                     or not 1 <= float(maximum) <= 512):

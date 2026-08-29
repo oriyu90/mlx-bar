@@ -77,6 +77,27 @@ def test_worker_exposes_prompt_cache_clear_rpc():
     assert adapter.cache_cleared is True
 
 
+class CountingAdapter(ThreadBoundAdapter):
+    def count_tokens(self, params: dict) -> int:
+        return 3 + len(str(params.get("messages", params.get("prompt", ""))))
+
+
+def test_count_tokens_rpc_returns_the_adapter_count():
+    with TestClient(create_app(CountingAdapter())) as client:
+        response = client.post("/rpc", json={"protocol_version": 1, "method": "count_tokens",
+                                             "params": {"prompt": "abcd"}})
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] == 7
+
+
+def test_count_tokens_rpc_fails_cleanly_when_the_adapter_cannot_count():
+    with TestClient(create_app(ThreadBoundAdapter())) as client:  # inherits BaseAdapter default
+        response = client.post("/rpc", json={"protocol_version": 1, "method": "count_tokens",
+                                             "params": {"prompt": "x"}})
+    assert response.status_code == 501
+    assert response.json()["code"] == "COUNT_TOKENS_UNAVAILABLE"
+
+
 class SlowPrefillAdapter(ThreadBoundAdapter):
     def stream(self, request_id: str, params: dict):
         time.sleep(0.12)
@@ -779,7 +800,7 @@ def test_stop_sequence_truncates_output_even_when_split_across_deltas():
     events = [json.loads(line) for line in generated.text.splitlines() if line]
     text = "".join(event["text"] for event in events if event.get("type") == "delta")
     assert text == "Answer: 42 "
-    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+    assert events[-1] == {"type": "completed", "finish_reason": "stop", "stop_sequence": "<<END>>"}
 
 
 class LengthLimitedAdapter(ThreadBoundAdapter):
@@ -968,7 +989,7 @@ def test_text_after_a_stop_sequence_cannot_produce_a_tool_call():
     text = "".join(event["text"] for event in events if event.get("type") == "delta")
     assert text == "visible part "
     assert not [event for event in events if event.get("type") == "tool_calls"]
-    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+    assert events[-1] == {"type": "completed", "finish_reason": "stop", "stop_sequence": "<<END>>"}
 
 
 def test_prompt_cache_rollback_failure_retries_instead_of_failing_the_request():

@@ -163,6 +163,11 @@ struct MenuBarView: View {
                 Text(residentDetail(resident)).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
+            if resident.replicaCount > 1 {
+                Text("×\(resident.replicaCount)").font(.caption2).monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(LS("並列数") + " \(resident.replicaCount)")
+            }
             if resident.activeLeases > 0 {
                 Text(LS("使用中")).font(.caption2).foregroundStyle(.orange)
             }

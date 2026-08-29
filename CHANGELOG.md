@@ -2,6 +2,29 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.8.0] - 2026-08-30
+
+### 追加
+
+- **同一モデルの並列常駐&生成。** `models.pool.profiles[].replicas`（1〜8、既定1）で、pin したモデルを N プロセス常駐させ、同一モデルへの並行生成を可能にしました。各レプリカは独立 Worker・独立メモリ予約で、admission は per-replica に予算を charge します。プール全体の同時生成数は従来どおり `generationConcurrency` セマフォが束ね、`maxReplicasPerModel`（既定2）が上限です。`mlxbarctl model pin <id> --replicas N`、メニューバーの `×N` バッジ、設定画面のレプリカ Stepper を追加。`replicas` 既定1のとき挙動は v1.7.1 と byte-identical。`replicas > 1` は `models.pool.enabled: true` 必須。
+- **Anthropic Messages API 互換（Claude Code 対応）。** `/anthropic` 配下の sub-app として、OpenAI 経路から隔離した認証・エラー形・SSE 変換を持つ入口を追加しました。`POST /anthropic/v1/messages`（ストリーム/非ストリーム）、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models[/{id}]`。認証は `x-api-key` または bearer、`anthropic-version` 必須、全応答に `request-id` ヘッダ。system・text・画像（base64/URL、既存の private workspace・容量・SSRF ガード経由）・client tool use・tool_result・`tool_choice` auto/any/tool/none・`stop_sequences` を変換。ストリームは `message_start`→`content_block_*`→`message_delta`→`message_stop`（`[DONE]` なし、`ping` keep-alive）。`count_tokens` は実トークナイザ計測（Worker RPC 追加）。feature flag `api.anthropic.enabled`（既定 ON、起動時 latch）。
+- Worker RPC に `count_tokens` を追加。`completed` イベントに `stop_sequence`（Anthropic の stop_reason マッピング用、OpenAI 経路は無視）。
+
+### 未対応（明示エラー・偽装なし）
+
+- Anthropic のサーバーサイドツール、extended thinking の署名 block、PDF/`document` content block、Anthropic 側 MCP 実行は v1 では `invalid_request_error` で拒否します。`cache_control` は受理して無視し、`usage` に Anthropic の cache 系フィールドを出しません。Claude のモデル名をローカルモデルへ勝手にリネームせず、一致しない名前は常駐1件へフォールバックし、応答の `model` は実ローカル名です。
+
+### 安全性と互換性
+
+- `openai_compat.py` は 1 行も変更していません。`/v1/models` ルーティング・`/v1/chat/completions`・128 tools 上限・bearer 認証・SSE keep-alive コメント・OpenAI エラー JSON 形は不変。設定 schema は version 1 のまま、v1.7.x config を無変換ロード。
+- `generationConcurrency==1` は v1.6.2 等価、`models.pool.enabled=false` は v1.6.1 バイト等価委譲。`replicas==1` はスロットキー・instance_key・manifest/log/socket パス・全 status フィールドが v1.7.1 と一致。
+- 合算 allocation ピークの実機計測は本リリースでも未実施（`TEST_PLAN_v1.8.0.md §2`）。
+
+### 検証
+
+- Python 回帰テスト 346 件が成功（v1.7.1 の 316 + 新規 30）。Swift Debug / Release ビルド成功。
+- 設計根拠と不変条件は `DESIGN_v1.8.0.md`、実機・配布検証手順は `TEST_PLAN_v1.8.0.md`。
+
 ## [1.7.1] - 2026-08-29
 
 ### 修正

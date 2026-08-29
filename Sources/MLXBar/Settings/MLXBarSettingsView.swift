@@ -230,7 +230,9 @@ struct ModelSourceSettingsView: View {
     @State private var totalMemoryPercent = 75
     @State private var systemReserveGB = 4
     @State private var generationConcurrency = 2
+    @State private var maxReplicasPerModel = 2
     @State private var pinnedModelIds: Set<String> = []
+    @State private var pinnedModelReplicas: [String: Int] = [:]
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
     var body: some View {
@@ -304,6 +306,18 @@ struct ModelSourceSettingsView: View {
                     )) {
                         Text(item.name).lineLimit(1).truncationMode(.middle)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if pinnedModelIds.contains(item.id) {
+                        Stepper("\(LS("並列数（replicas）")): \(pinnedModelReplicas[item.id] ?? 1)",
+                                value: Binding(
+                                    get: { pinnedModelReplicas[item.id] ?? 1 },
+                                    set: { value in
+                                        pinnedModelReplicas[item.id] = value
+                                        Task { await model.setModelReplicas(item.id, replicas: value) }
+                                    }),
+                                in: 1...maxReplicasPerModel)
+                            .font(.caption)
+                            .padding(.leading, 20)
                     }
                 }
                 Text(LS("常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。"))
@@ -407,9 +421,14 @@ struct ModelSourceSettingsView: View {
             totalMemoryPercent = Int(((pool["totalMemoryRatio"] as? NSNumber)?.doubleValue ?? 0.75) * 100)
             systemReserveGB = (pool["minimumSystemReserveGB"] as? NSNumber)?.intValue ?? 4
             generationConcurrency = (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 2
-            pinnedModelIds = Set((pool["profiles"] as? [[String: Any]] ?? [])
+            maxReplicasPerModel = (pool["maxReplicasPerModel"] as? NSNumber)?.intValue ?? 2
+            let profiles = pool["profiles"] as? [[String: Any]] ?? []
+            pinnedModelIds = Set(profiles
                 .filter { ($0["keepLoaded"] as? Bool) ?? false }
                 .compactMap { $0["modelId"] as? String })
+            pinnedModelReplicas = Dictionary(uniqueKeysWithValues: profiles.compactMap { profile in
+                (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
+            })
         }
         }
     }
@@ -505,6 +524,22 @@ struct APISettingsView: View {
                         }
                     }
                 }
+            }
+            Section("Anthropic API (Claude Code)") {
+                Toggle(LS("Anthropic互換API（/anthropic）を有効化"), isOn: Binding(
+                    get: { (((model.settings["api"] as? [String: Any])?["anthropic"] as? [String: Any])?["enabled"] as? Bool) ?? true },
+                    set: { value in Task { await model.setConfig("api.anthropic.enabled", value: value) } }
+                ))
+                if model.anthropicEnabled, !model.anthropicURL.isEmpty {
+                    HStack {
+                        Text(model.anthropicURL).textSelection(.enabled).font(.caption)
+                        Spacer()
+                        Button(LS("コピー")) { model.copyURL(model.anthropicURL) }
+                    }
+                }
+                Text(LS("Claude Codeでは ANTHROPIC_BASE_URL に上記URL、ANTHROPIC_AUTH_TOKEN にAPIキーを設定します。有効／無効の切り替えは次回サービス起動時に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("画像入力")) {
                 Toggle(LS("外部URLの画像取得を許可"), isOn: Binding(

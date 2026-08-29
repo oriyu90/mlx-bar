@@ -104,6 +104,25 @@ class MLXLMAdapter(BaseAdapter):
         add_special_tokens = bos is None or not text.startswith(bos)
         return list(tokenizer.encode(text, add_special_tokens=add_special_tokens))
 
+    def _render_prompt(self, params: dict) -> str:
+        prompt = params.get("messages", params.get("prompt", ""))
+        if not isinstance(prompt, list):
+            return str(prompt)
+        last_error: Exception | None = None
+        for extra_kwargs in tool_template_kwargs_attempts(params):
+            try:
+                rendered = self.processor.apply_chat_template(
+                    prompt, tokenize=False, add_generation_prompt=True, **extra_kwargs)
+                return rendered
+            except Exception as exc:  # noqa: BLE001 - mirror stream()'s fallback
+                last_error = exc
+        raise last_error if last_error else RuntimeError("could not render prompt")
+
+    def count_tokens(self, params: dict) -> int:
+        if self.model is None:
+            raise RuntimeError("model is not loaded")
+        return len(self._encode(self._render_prompt(params)))
+
     def stream(self, request_id: str, params: dict):
         if self.model is None:
             raise RuntimeError("model is not loaded")

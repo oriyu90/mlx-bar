@@ -36,6 +36,31 @@
 - **ストリーミングの`delta.role`は最初の1チャンクのみ（OpenAI準拠）。** `tool_call_delta`分岐にローカル`bool`フラグ。`_tool_call_stream_chunks`（`tool_calls`イベント経路）は元から最初のみroleなので、そこを通ったら同じフラグを立てて後続の`tool_call_delta`が再送しないようにする。
 - **未知パス / `/v1/completions`はOpenAIエラー形式。** `main.py`に`StarletteHTTPException`ハンドラを追加（`fastapi.HTTPException`ハンドラは routing 由来のbare 404 を捕まえない）。`/v1/completions`は明示ルートで`404 UNSUPPORTED_ENDPOINT`。
 
+## v1.8.0で守ること（同一モデルの並列常駐&生成 / Anthropic互換API）
+
+### レプリカ（`models.pool.profiles[].replicas`）
+
+- **`replicas`既定1のとき、`_slots`の内部キーは bare `model_id`（replica 0）。** `_slot_key(model_id, 0) == model_id`。既存の`_slots[model_id]`アクセスと全既存テストがbyte-identical。replica 1..Nだけ`f"{model_id}#{index}"`。ここを「常に`#0`」に変えると316件が壊れる（実際に実装中に踏んだ）。
+- **replica 1..Nの`instance_key`は`f"{digest}-{index}"`。** replica 0は従来どおり素の`digest`（`sha256(model_id)[:12]`）。manifest（`control/worker-<key>.json`）・ログ（`logs/worker-<engine>-<key>.log`）が分離される。orphan回収は`_reap_pool_orphans`のglob（`worker-*.json`）が拾うので rename に強い。per-supervisorの`reap_orphan_worker`（厳密パス）はpool slotが`reap_orphans=False`なので無関係。
+- **admissionはper-replica。** `_admit(model)`はレプリカ1個ぶんの`_cold_estimate`を審査し、`_resident_charge()`は全slotの予約合計。2個目のレプリカは自動的に「合計が予算内か」で判定される。4層（事前予約 / global load lock / allocator上限 / ロード後実測）は不変。`maxResidentModels`は**常駐Workerプロセス総数**の上限（意味を変えない）。`maxReplicasPerModel`（既定2）はper-model-idの上限で`_desired_replicas`がclampする。
+- **コールドロードは直列のまま。** `_load_replica`が`_load_lock`を取る。`load()`はレプリカを`range(desired)`でループ（各回`_load_replica`）。`_desired_replicas`は`pin=True`のときだけプロファイル値、`pin=False`（API autoload）は1。差分は`_scale_up_pinned_replicas()`（reaper）が背景で埋める——**API要求に追加admissionのコストを払わせない**。
+- **ルーティングは`_pick_replica(model_id)`。** ready かつ`gen_lock`非ロック・`gen_queued`空のレプリカを優先（キャッシュが温かい`last_released_at`最大）、無ければ`len(gen_queued)+locked`最小。選んだslotに対して既存のper-slotレーンロジック（`_acquire_lane` / `gen_lock` / プール`_gen_slots`セマフォ / `_concurrent_start_ok` / `_recover_lane`）をそのまま適用。プール全体の同時生成数は`generationConcurrency`が引き続き束ねる。`generationConcurrency=1`なら複数レプリカでも直列（`test_generation_concurrency_one_serialises_even_with_replicas`）。
+- **スケールダウンは replica 0 と leased を除く高インデックスから。** `_reap_once`内。`session_pinned`は per-process pin ではなく容量設定なので、replicas 1..Nは`desired`まで trim してよい（replica 0 は常に残す）。
+- **`unload_model(model_id)`は全レプリカを解放。** `snapshot_resident`はmodel_idで**dedupe**（`reload_resident`→`load()`が全レプリカを再作成するため、per-replicaでsnapshotすると多重ロードになる）。
+- **`pool.enabled=false`はレプリカを完全無視**（`_legacy`単一Worker経路）。`replicas > 1`は`models.pool.enabled: true`必須。
+- **既定値**: `replicas`既定1、`maxReplicasPerModel`は上限値（安全側）。`common rules`の「実測がないなら既定値を動かさない」に沿う。合算allocationピークの実機計測は未実施（`TEST_PLAN_v1.8.0.md §2`）。
+
+### Anthropic互換API（`/anthropic`）
+
+- **`openai_compat.py`は1行も変更していない。** 共通ロジック（`_ensure_requested_model` / `_find_model` / `_is_generatable` / `app_state`）は`anthropic_compat`が`from .openai_compat import`で直接使う。物理的な抽出（`shared_generation.py`）はしていない——回帰リスクを避けるため。`_ensure_requested_model`等の`_`接頭辞名を跨いでimportしているのは意図的。
+- **sub-app。** `make_public_app`が`api.anthropic.enabled`真のとき`app.mount("/anthropic", make_anthropic_app(state))`。フラグはservice生存期にlatch（アプリは起動時1回構築）。`make_anthropic_app`は自前の例外ハンドラでAnthropic形（`{"type":"error","error":{...},"request_id":"req_..."}`）を返す。
+- **`PublicRequestGuard`の`/anthropic`分岐。** 認証は`x-api-key`または`Authorization: Bearer`（`_authorized(headers, anthropic=True)`）。`anthropic-version`必須。早期リジェクトは`_reject_anthropic`でAnthropic形。**非`/anthropic`（OpenAI経路）の`_authorized`は`compare_digest(authorization, "Bearer "+token)`のままでbyte-identical**（`anthropic=False`のとき第2条件が`False and ...`）。`_reject`のOpenAIボディも不変。
+- **出力は`AnthropicMessageBuilder`状態機械（`anthropic_stream.py`）。** content block indexは単調増加・再利用しない、開いたblockは必ず閉じる、`message_stop`は正常完了時のみ（ストリーム中errorは`event: error`で終端し`message_stop`を出さない）、`[DONE]`を出さない。`reasoning_delta`は**転送しない**（署名付きthinking blockを作らない。v1の既知の制限）。
+- **`stop_sequence`。** `StopSequenceFilter.matched`にマッチ文字列を保持し、`server.py`の`completed`イベントに`stop_sequence`を追加（`stopped`真のときのみ）。**OpenAI経路は無視**（`finish_reason`は従来どおり`stop`）。Anthropic経路だけが`stop_reason: "stop_sequence"`へマップ。
+- **偽装なし。** 応答`model`は`loaded.get("name") or id`。`usage`は`input_tokens`/`output_tokens`のみ（`cache_creation_input_tokens`等を出さない）。`cache_control`は受理して捨てる。未対応（server tools / thinking / document block / MCP）は`invalid_request_error`で明示400。
+- **`count_tokens`はWorker RPC。** `BaseAdapter.count_tokens`既定は`NotImplementedError`→worker `/rpc`が501 `COUNT_TOKENS_UNAVAILABLE`。`ModelPoolSupervisor.count_tokens`が`getattr`ガードで古いランタイムを`COUNT_TOKENS_UNAVAILABLE`へ。概算を「正確な値」として返さない。未常駐時は`_ensure_requested_model`でautoload（`autoLoadOnAPIRequest`準拠）。
+- **新しい`MLXBarError` codeを足したら`Sources/MLXBar/Services/ErrorText.swift`と`anthropic_stream._anthropic_error_type`の両方に追加すること。**
+
 ## 未解決の課題
 
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）

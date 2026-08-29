@@ -258,6 +258,15 @@ class BaseAdapter:
     def stream(self, request_id: str, params: dict) -> Iterator[dict]:
         raise NotImplementedError
 
+    def count_tokens(self, params: dict) -> int:
+        """Exact prompt token count for the same input `stream()` would run.
+
+        Used by the Anthropic-compatible `count_tokens` endpoint. Adapters that
+        cannot answer precisely raise NotImplementedError so the caller fails
+        cleanly rather than returning a fabricated estimate.
+        """
+        raise NotImplementedError
+
     def finalize(self, text: str, params: dict) -> dict:
         """Convert buffered model output into public content/tool calls."""
         return {"text": text, "tool_calls": []}
@@ -363,6 +372,14 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             if method == "cancel":
                 adapter.cancelled.add(params.get("request_id", ""))
                 return {"cancelled": True, "forced": False}
+            if method == "count_tokens":
+                try:
+                    count = await on_mlx_thread(adapter.count_tokens, params)
+                except NotImplementedError:
+                    return JSONResponse({"type": "error", "code": "COUNT_TOKENS_UNAVAILABLE",
+                                         "message": "このランタイムはトークン数の計測に対応していません",
+                                         "retryable": False}, status_code=501)
+                return {"type": "completed", "input_tokens": int(count)}
             return JSONResponse({"type": "error", "code": "UNKNOWN_METHOD",
                                  "message": "不明なワーカーメソッドが要求されました",
                                  "detail": str(method), "retryable": False}, status_code=400)
@@ -583,7 +600,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 metrics = {"type": "metrics", "generation_tps": count / elapsed,
                            **upstream_metrics, "finish_reason": finish_reason}
                 yield json.dumps(metrics) + "\n"
-                yield json.dumps({"type": "completed", "finish_reason": finish_reason}) + "\n"
+                completed_event = {"type": "completed", "finish_reason": finish_reason}
+                if stop_filter and getattr(stop_filter, "matched", None):
+                    # The Anthropic Messages path maps this to stop_reason
+                    # "stop_sequence"; the OpenAI path ignores it.
+                    completed_event["stop_sequence"] = stop_filter.matched
+                yield json.dumps(completed_event, ensure_ascii=False) + "\n"
             except Exception as exc:
                 # Upstream runtime exceptions are English; classify into a
                 # Japanese `message` (shown by the GUI) and keep the raw text in
