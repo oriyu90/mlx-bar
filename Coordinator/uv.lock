@@ -196,7 +196,7 @@ wheels = [
 
 [[package]]
 name = "mlxbar"
-version = "1.6.2"
+version = "1.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

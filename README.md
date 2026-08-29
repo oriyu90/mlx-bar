@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.7.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.7.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -16,7 +16,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - mlx-lm非対応モデルをmlx-vlmで自動再試行
 - GGUFモデルのLM Studio Provider経由利用
 - モデルフォルダの追加と再スキャン
-- OpenAI互換のモデル一覧・モデル詳細・Chat Completions API（Open Interpreter、LibreChat、ZCode向け）
+- OpenAI互換のモデル一覧・モデル詳細・Chat Completions API（Open Interpreter、LibreChat、ZCode、Zed、Cline、OpenCode向け）
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
@@ -41,7 +41,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.7.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.7.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -93,6 +93,8 @@ Lagunaのように画像入力を持たないモデルでも、`mlx-vlm`側に�
 
 ZCodeなどがAPI有効上限より大きい`max_tokens`または`max_completion_tokens`を送った場合、400エラーにはせず有効上限まで自動的に下げます。0、負数、数値でない値は入力エラーです。上限を大きくすると生成時間とメモリ使用量が増えるため、モデルとMacのメモリ量に合わせて設定してください。既定値は8,192です。
 
+v1.7.1以降、`max_tokens`と`max_completion_tokens`のどちらも指定しない要求には、512ではなくこのAPI有効上限を既定として適用します。エージェント系クライアント（Zed、Cline、OpenCode など）はこの2つを省略することが多く、512では応答が途中で切れていました。特定の長さに固定したいクライアントは、従来どおり明示的に`max_tokens`を送ってください。
+
 ZCodeのシステム指示、会話履歴、ツール結果が従来の100,000文字を超える場合、ロード中モデルのコンテキスト上限を基に入力事前検査を自動拡張します。目安はモデル上限の4倍、かつ最大10,000,000文字です。Laguna-S-2.1-oQ2eでは4,194,304文字になります。文字数は安全な事前検査であり、正確なトークン化とコンテキスト判定はモデルランタイムが行います。
 
 同じモデルフォルダが「追加フォルダ」とLM Studio既定フォルダの両方から見つかった場合は、正規化した実パスで1件へ統合します。`lms`とLM Studio APIから同じProviderモデルが返った場合もProviderキーで統合します。表示名が同じでも実パスが異なるモデルは別モデルとして保持されます。
@@ -117,6 +119,8 @@ APIが自動ロードした非固定モデルは、最後の要求が終了し�
 
 `DELETE /api/v1/models/loaded`は常駐モデルをすべて解放します。1モデルだけ解放するには`POST /api/v1/models/{id}/unload`（`?force=`、`mlxbarctl model unload MODEL_ID`）を使います。そのモデルに生成中の要求があるときだけ`ENGINE_BUSY`になり、他の常駐モデルには影響しません。
 
+v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します（複数常駐時）。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタンがあります。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。
+
 ### モデル間の同時生成（v1.7.0）
 
 v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。1つのMLXプロセスは単一スレッドのため、**同一モデルへの複数要求は従来どおり到着順に直列**です。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
@@ -127,7 +131,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)にあります。
 
 ### 既定の生成パラメータ
 
@@ -340,6 +344,21 @@ ZCode 3.2.5以降のモデル設定が追加する`extra_body.chat_template_kwar
 
 ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒否せず到着順にキューへ入れます。待機中も同じheartbeatを送るため、subagent接続は生成開始まで維持されます。クライアントが接続を閉じた待機要求は自動削除されます。「設定…」→「モデル」→「並列リクエスト」で最大待機件数と最大待ち時間を変更できます。メニューバーには現在の待機件数を表示します。
 
+### Zed / Cline / OpenCode
+
+いずれも「OpenAI互換」プロバイダとして接続します。
+
+| 設定項目 | 値 |
+|---|---|
+| Base URL | `http://127.0.0.1:11435/v1`（別PCからはLAN用URLの末尾に`/v1`） |
+| API Key | 「設定…」→「APIサーバー」のAPIキー（キー要求をOFFにしている場合は任意の文字列） |
+| Model | `GET /v1/models`が返す表示名または内部ID。MLXBarでモデルをロード（または常駐）しておくと、常駐が1つだけのときはクライアント側のモデル名が一致しなくてもその常駐モデルへ振り分けます。 |
+
+- `max_tokens`を送らないクライアントには、512ではなくAPI有効上限（既定8,192、モデル上限で頭打ち）を適用します。上の「Max token上限」を参照してください。
+- `response_format`は`text`のみ対応です。`json_object` / `json_schema`はHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。
+- ストリーミングのtool callでは、OpenAIと同じく`delta.role`を最初のチャンクだけに付けます（一部のSDKの厳格なパーサ対策）。
+- 未対応のパス（`/v1/completions`など）にも、`{"detail": "Not Found"}`ではなくOpenAI形式の`error`オブジェクトで応答します。
+
 ### OpenClaw
 
 OpenClaw（`openai-completions`）から使う場合は、カスタムプロバイダとして登録します。**`timeoutSeconds`を必ず指定してください。**
@@ -426,7 +445,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.7.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.7.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

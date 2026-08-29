@@ -66,6 +66,23 @@ struct MenuBarView: View {
                 }
             }
 
+            if model.residentModels.count > 1 {
+                Divider()
+                Text("\(LS("常駐モデル")) · \(model.residentModels.count)")
+                    .font(.caption).foregroundStyle(.secondary)
+                // Default max residency is 2 and the ceiling is 8; keep the
+                // popover from growing without bound if it is raised.
+                let rows = ForEach(model.residentModels) { resident in
+                    residentRow(resident)
+                }
+                if model.residentModels.count > 4 {
+                    ScrollView { VStack(alignment: .leading, spacing: 8) { rows } }
+                        .frame(maxHeight: 180)
+                } else {
+                    rows
+                }
+            }
+
             if let error = model.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.red).lineLimit(3)
@@ -76,7 +93,9 @@ struct MenuBarView: View {
                 Button(LS("クイックチャット…")) { open("chat") }.disabled(true)
             } else {
                 Button(LS("クイックチャット…")) { open("chat") }.keyboardShortcut("n")
-                Button(LS("アンロード")) { Task { await model.unload() } }
+                Button(LS(model.residentModels.count > 1 ? "すべてアンロード" : "アンロード")) {
+                    Task { await model.unload() }
+                }
             }
             if model.currentRequestID != nil {
                 Button(LS(model.cancellationInProgress ? "生成を停止処理中…" : "生成をキャンセル")) {
@@ -134,6 +153,54 @@ struct MenuBarView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    @ViewBuilder
+    private func residentRow(_ resident: ResidentModel) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(resident.name).font(.caption).lineLimit(1).truncationMode(.middle)
+                Text(residentDetail(resident)).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if resident.activeLeases > 0 {
+                Text(LS("使用中")).font(.caption2).foregroundStyle(.orange)
+            }
+            if !resident.managedExternally {
+                Button {
+                    Task { await model.setModelPin(resident.id, keepLoaded: !resident.keepLoaded) }
+                } label: {
+                    Image(systemName: resident.keepLoaded ? "pin.fill" : "pin")
+                        .accessibilityLabel(LS("常駐を維持"))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(resident.keepLoaded ? Color.accentColor : Color.secondary)
+                Button {
+                    Task { await model.unloadModel(resident.id) }
+                } label: {
+                    Image(systemName: "eject").accessibilityLabel(LS("このモデルをアンロード"))
+                }
+                .buttonStyle(.plain)
+                .disabled(model.busy)
+            }
+        }
+    }
+
+    private func residentDetail(_ resident: ResidentModel) -> String {
+        var parts: [String] = []
+        if let engine = resident.engine, !engine.isEmpty { parts.append(engine) }
+        if resident.managedExternally {
+            parts.append("LM Studio")
+        } else if resident.poolState == "loading" {
+            parts.append(LS("ロード中"))
+        } else if resident.poolState == "evicting" {
+            parts.append(LS("解放中"))
+        }
+        if let bytes = resident.memoryReservationBytes, bytes > 0 {
+            parts.append(String(format: "%.1f GB", Double(bytes) / 1_073_741_824))
+        }
+        if resident.keepLoaded { parts.append(LS("固定")) }
+        return parts.joined(separator: " · ")
     }
 
     // MLXBar has no Dock icon (LSUIElement), so opening a secondary window from

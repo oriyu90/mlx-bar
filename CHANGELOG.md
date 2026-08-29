@@ -2,6 +2,30 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.7.1] - 2026-08-29
+
+### 修正
+
+- 複数モデルを常駐させても、メニューバーのポップオーバーには1モデルしか表示されていませんでした。`/api/v1/status`の`loadedModels`（v1.6.2から存在）を読み、常駐している全モデルを一覧表示します。各行にエンジン・メモリ予約量・常駐維持（ピン）切り替え・その行だけのアンロードを追加しました。ヘッダーと「アンロード（全解放）」の挙動は不変で、単一常駐時の見た目も変わりません。
+- 日本語設定でもエラーが英語で表示されることがありました。コーディネーターと各Workerの`MLXBarError`は今後も安定した機械可読`code`と日本語`message`を返し、GUIは`code`から表示言語の文言へ解決します（新規 `Sources/MLXBar/Services/ErrorText.swift`）。上流ランタイム（mlx-lm / mlx-vlm / transformers）由来の英語例外は日本語の分類文言に置き換え、原文は`detail`へ退避してログに残します。管理APIの内部エラー・バリデーションエラー・`code`のみだった応答にも日本語`message`を付与しました。OpenAI互換のエラー本文の形と`code`値は不変です。
+
+### 変更
+
+- OpenAI互換APIで`max_tokens`と`max_completion_tokens`のどちらも指定しない要求は、512ではなくAPI有効上限（`generation.maxTokens`、既定8,192、モデル上限で頭打ち）を既定にします。Zed / Cline / OpenCode などエージェント系クライアントで応答が途中終了する問題への対応です。明示指定時の挙動（有効上限へのclamp）は不変です。
+- 常駐モデルがちょうど1つで`models.autoLoadOnAPIRequest`が有効なとき、クライアントが送ったモデル名がどの常駐モデルにも一致しない場合は、別モデルを自動ロードして`ENGINE_BUSY`にする代わりに、その唯一の常駐モデルへ振り分けます。常駐が2つ以上のときの解決ロジックは不変です。
+- ストリーミングのtool callで`delta.role`を最初のチャンクにのみ付けるようにしました（OpenAI準拠。一部SDKの厳格なパーサ対策）。
+- `POST /v1/completions`と未知パスに、`{"detail": "Not Found"}`ではなくOpenAI形式の`error`オブジェクト（`code: UNSUPPORTED_ENDPOINT` / `HTTP_404`）で応答します。
+
+### 安全性と互換性
+
+- `models.pool`の不変条件は不変です。`generationConcurrency=1`はv1.6.2と等価、`enabled=false`はv1.6.1へバイト等価委譲。OpenAI互換の入口（`/v1/models`、Chat Completionsのルーティング、tools 128件上限、bearer認証、SSE keep-aliveコメント）と設定schema version 1も不変です。
+- 外部API利用者に届くエラー応答は従来どおり`code` + `message`の両方を含みます。`message`の内容が日本語になった点だけが変更です。
+
+### 検証
+
+- Python回帰テスト316件が成功（v1.7.0の307 + 新規9）。`max_tokens`省略時の有効上限フォールバック、明示指定の尊重、`/v1/completions`と未知パスのOpenAIエラー形、ストリーミングtool callのrole一回のみ、単一常駐への振り分け、管理API・OpenAI APIエラーの`message`必須を新規テストしました。
+- Swift Debug / Release ビルド成功。
+
 ## [1.7.0] - 2026-08-28
 
 ### 追加

@@ -30,7 +30,10 @@ def authorize(request: Request) -> None:
         return
     expected = "Bearer " + state.settings.api_token
     if not secrets.compare_digest(request.headers.get("authorization", ""), expected):
-        raise HTTPException(401, detail={"code": "AUTHENTICATION_FAILED"})
+        raise HTTPException(401, detail={
+            "code": "AUTHENTICATION_FAILED",
+            "message": "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください",
+        })
 
 
 @router.get("/health")
@@ -83,6 +86,21 @@ async def retrieve_model(request: Request, model_id: str):
     resident = next((item for item in loaded_models
                      if item.get("id") == model.get("id")), None)
     return _model_descriptor(state, model, resident)
+
+
+@router.post("/v1/completions")
+async def legacy_completions(request: Request):
+    """The legacy text-completion endpoint is not implemented.
+
+    Answering in the OpenAI error shape (rather than FastAPI's default
+    ``{"detail": "Not Found"}``) lets a client that probes this path report a
+    useful message instead of a parser error.
+    """
+    authorize(request)
+    raise HTTPException(404, detail={
+        "code": "UNSUPPORTED_ENDPOINT",
+        "message": "/v1/completions は未対応です。/v1/chat/completions を使用してください",
+    })
 
 
 @router.post("/v1/chat/completions")
@@ -174,11 +192,26 @@ async def chat(request: Request, body: dict):
     request.state.api_log.update({"request_id": request_id, "model": body.get("model"),
                                   "stream": bool(body.get("stream")),
                                   "message_count": len(messages), "tool_count": len(tools)})
-    max_tokens = body.get("max_completion_tokens", body.get("max_tokens", 512))
-    if max_tokens is None:
-        max_tokens = 512
+    requested_max_tokens = body.get("max_completion_tokens")
+    if requested_max_tokens is None:
+        requested_max_tokens = body.get("max_tokens")
+    if requested_max_tokens is None:
+        # The client did not ask for a specific budget. Fall back to the
+        # configured generation ceiling (already clamped to the model's own
+        # limit) instead of a fixed 512, which silently truncates agent-style
+        # clients -- Zed, Cline, OpenCode -- that rely on the server default.
+        # 512 stays as the last resort when no worker/limit is available.
+        resolver = getattr(app_state(request).workers, "effective_max_tokens", None)
+        try:
+            max_tokens = int(resolver()) if callable(resolver) else 512
+        except Exception:
+            max_tokens = 512
+        if max_tokens < 1:
+            max_tokens = 512
+    else:
+        max_tokens = requested_max_tokens
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
-        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "max_tokens must be a positive integer", "param": "max_tokens"})
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "max_tokensは正の整数で指定してください", "param": "max_tokens"})
     generation_defaults = app_state(request).settings.data.get("generation", {})
     options = {"temperature": body.get("temperature", generation_defaults.get("defaultTemperature", 0.7)),
                "top_p": body.get("top_p", generation_defaults.get("defaultTopP", 1.0)),
@@ -230,6 +263,11 @@ async def chat(request: Request, body: dict):
             completed = False
             failed = False
             generation = None
+            # OpenAI sends `delta.role` exactly once per choice. Repeating it on
+            # every tool-call delta trips strict parsers (e.g. the Vercel AI SDK
+            # used by OpenCode), so it is emitted only on the first tool-call
+            # chunk here too.
+            tool_call_role_sent = False
 
             def mark_first_token() -> None:
                 if request.state.api_log.get("first_token_ms") is not None:
@@ -268,14 +306,21 @@ async def chat(request: Request, body: dict):
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_calls":
                         mark_first_token()
+                        # `_tool_call_stream_chunks` already puts `role` on its
+                        # first chunk; record that so a later `tool_call_delta`
+                        # does not send it a second time.
+                        tool_call_role_sent = True
                         for chunk in _tool_call_stream_chunks(request_id, response_model, event.get("calls") or [], created):
                             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_call_delta":
                         mark_first_token()
+                        delta = {"tool_calls": event.get("calls") or []}
+                        if not tool_call_role_sent:
+                            delta["role"] = "assistant"
+                            tool_call_role_sent = True
                         chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                                  "model": response_model, "choices": [{"index": 0,
-                                 "delta": {"role": "assistant", "tool_calls": event.get("calls") or []},
-                                 "finish_reason": None}]}
+                                 "delta": delta, "finish_reason": None}]}
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "completed":
                         if completed:
@@ -421,6 +466,17 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
     settings_models = state.settings.data.get("models", {})
     if not settings_models.get("autoLoadOnAPIRequest", True):
         raise MLXBarError("MODEL_NOT_LOADED", "モデルがロードされていません。MLXBarでモデルをロードしてください", 409)
+    # Exactly one model resident, and `requested` matched none of the residents
+    # by id / name / alias: treat the name as an alias for that sole resident
+    # rather than autoloading a different model -- which would fail the caller
+    # with ENGINE_BUSY whenever another model is mid-generation. Only the
+    # single-resident case is unambiguous; with two or more, fall through to the
+    # normal resolve/autoload path below.
+    list_loaded = getattr(state.workers, "loaded_models", None)
+    if callable(list_loaded):
+        residents = [item for item in list_loaded() if item]
+        if len(residents) == 1:
+            return residents[0]
     if state.database.metadata_value("api_autoload_suspended") == "1":
         raise MLXBarError("MODEL_NOT_LOADED", "モデルは手動で停止されています。MLXBarでモデルをロードしてください", 409)
     lock = getattr(state, "model_autoload_lock", None)

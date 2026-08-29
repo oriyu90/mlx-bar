@@ -334,7 +334,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
     async def rpc(message: dict):
         if message.get("protocol_version") != 1:
             return JSONResponse({"type": "error", "code": "PROTOCOL_MISMATCH",
-                                 "message": "unsupported protocol", "retryable": False}, status_code=400)
+                                 "message": "ワーカープロトコルのバージョンが一致しません",
+                                 "detail": f"protocol_version={message.get('protocol_version')!r}",
+                                 "retryable": False}, status_code=400)
         method = message.get("method")
         params = message.get("params") or {}
         try:
@@ -361,16 +363,30 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             if method == "cancel":
                 adapter.cancelled.add(params.get("request_id", ""))
                 return {"cancelled": True, "forced": False}
-            return JSONResponse({"type": "error", "code": "UNKNOWN_METHOD", "message": str(method),
-                                 "retryable": False}, status_code=400)
+            return JSONResponse({"type": "error", "code": "UNKNOWN_METHOD",
+                                 "message": "不明なワーカーメソッドが要求されました",
+                                 "detail": str(method), "retryable": False}, status_code=400)
         except ModuleNotFoundError as exc:
             return JSONResponse({"type": "error", "code": "RUNTIME_NOT_INSTALLED",
                                  "message": f"必要なランタイムがありません: {exc.name}", "retryable": False}, status_code=409)
         except Exception as exc:
+            # The raw exception text is upstream (mlx-lm / mlx-vlm / transformers)
+            # and English. Keep it in `detail` for logs and put a classified
+            # Japanese sentence in `message`, which is what the GUI shows.
             text = str(exc)
-            code = "MODEL_REQUIRES_REMOTE_CODE" if "remote code" in text.lower() else "MODEL_INCOMPATIBLE"
-            return JSONResponse({"type": "error", "code": code, "message": text[-1000:],
-                                 "retryable": False}, status_code=400)
+            lowered = text.lower()
+            if "remote code" in lowered:
+                code, human = "MODEL_REQUIRES_REMOTE_CODE", "このモデルはリモートコードの実行が必要なため読み込めません"
+            elif "out of memory" in lowered or "insufficient memory" in lowered or "metal" in lowered and "memory" in lowered:
+                code, human = "MODEL_INCOMPATIBLE", "メモリ不足のためモデルを読み込めませんでした"
+            elif "safetensors" in lowered or "no such file" in lowered or "not found" in lowered:
+                code, human = "MODEL_INCOMPATIBLE", "モデルファイルを読み込めませんでした。ファイルが揃っているか確認してください"
+            elif "chat template" in lowered or "chat_template" in lowered or "jinja" in lowered:
+                code, human = "MODEL_INCOMPATIBLE", "チャットテンプレートの適用に失敗しました"
+            else:
+                code, human = "MODEL_INCOMPATIBLE", "モデルを読み込めませんでした"
+            return JSONResponse({"type": "error", "code": code, "message": human,
+                                 "detail": text[-1000:], "retryable": False}, status_code=400)
 
     @app.post("/generate")
     async def generate(message: dict):
@@ -569,8 +585,20 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 yield json.dumps(metrics) + "\n"
                 yield json.dumps({"type": "completed", "finish_reason": finish_reason}) + "\n"
             except Exception as exc:
-                yield json.dumps({"type": "error", "code": "GENERATION_FAILED", "message": str(exc)[-1000:],
-                                  "retryable": False}, ensure_ascii=False) + "\n"
+                # Upstream runtime exceptions are English; classify into a
+                # Japanese `message` (shown by the GUI) and keep the raw text in
+                # `detail` for the coordinator log.
+                text = str(exc)
+                lowered = text.lower()
+                if "out of memory" in lowered or "insufficient memory" in lowered or (
+                        "metal" in lowered and "memory" in lowered):
+                    human = "メモリ不足のため生成できませんでした"
+                elif "chat template" in lowered or "chat_template" in lowered or "jinja" in lowered:
+                    human = "チャットテンプレートの適用に失敗しました"
+                else:
+                    human = "生成に失敗しました（ランタイムエラー）"
+                yield json.dumps({"type": "error", "code": "GENERATION_FAILED", "message": human,
+                                  "detail": text[-1000:], "retryable": False}, ensure_ascii=False) + "\n"
             finally:
                 # Reached on normal completion, on error, and -- the case that
                 # matters -- on the GeneratorExit/CancelledError raised when the

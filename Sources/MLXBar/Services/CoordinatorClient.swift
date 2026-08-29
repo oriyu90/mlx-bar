@@ -5,12 +5,19 @@ enum ClientError: LocalizedError {
     case unavailable
     case timedOut
     case command(String)
+    /// A structured coordinator error: a stable machine `code` plus the server's
+    /// own (Japanese) message. The GUI resolves this to the interface language
+    /// via `CoordinatorErrorText`; `errorDescription` is the Japanese-default
+    /// fallback for contexts that read `localizedDescription` directly.
+    case api(code: String?, message: String?)
 
     var errorDescription: String? {
         switch self {
         case .unavailable: "MLXBarサービスを起動できません"
         case .timedOut: "MLXBarサービスが応答しません。しばらくしてからもう一度お試しください。"
         case .command(let message): message
+        case let .api(code, message):
+            CoordinatorErrorText.resolve(code: code, serverMessage: message, language: "ja")
         }
     }
 }
@@ -20,6 +27,7 @@ final class CoordinatorClient: @unchecked Sendable {
         let type: String
         let text: String?
         let message: String?
+        let code: String?
         let generationTPS: Double?
     }
     private let serviceLabel = "com.yukiorita.MLXBar.Coordinator"
@@ -56,26 +64,29 @@ final class CoordinatorClient: @unchecked Sendable {
         } catch ClientError.command(let rawMessage) {
             // curl writes the HTTP body to stdout and its diagnostic to stderr.
             // runProcess joins both, so parse the body as a whole and keep the
-            // structured API error instead of exposing JSON and curl internals.
-            if let detail = Self.apiErrorDetail(in: rawMessage) {
-                throw ClientError.command(detail)
+            // structured API error (code + message) instead of exposing JSON and
+            // curl internals.
+            if let detail = Self.apiError(in: rawMessage) {
+                throw ClientError.api(code: detail.code, message: detail.message)
             }
             throw ClientError.command(rawMessage)
         }
     }
 
-    /// Extracts the coordinator's error message from a mixed stdout/stderr blob.
+    /// Extracts the coordinator's structured error (`code`, `message`) from a
+    /// mixed stdout/stderr blob.
     ///
     /// The body may be pretty-printed across several lines, so the whole text is
     /// tried first and individual lines only as a fallback.
-    static func apiErrorDetail(in raw: String) -> String? {
+    static func apiError(in raw: String) -> (code: String?, message: String?)? {
         for candidate in [raw] + raw.split(separator: "\n").map(String.init) {
             guard let data = candidate.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
             let detail = (object["detail"] as? [String: Any]) ?? (object["error"] as? [String: Any])
             guard let detail else { continue }
-            if let message = detail["message"] as? String, !message.isEmpty { return message }
-            if let code = detail["code"] as? String, !code.isEmpty { return code }
+            let code = (detail["code"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let message = (detail["message"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            if code != nil || message != nil { return (code, message) }
         }
         return nil
     }
@@ -131,8 +142,10 @@ final class CoordinatorClient: @unchecked Sendable {
         guard status == 0 else {
             if status == 28 { throw ClientError.timedOut }
             let raw = buffer.diagnosticText
-            throw ClientError.command(Self.apiErrorDetail(in: raw)
-                                      ?? (raw.isEmpty ? "生成に失敗しました" : raw))
+            if let detail = Self.apiError(in: raw) {
+                throw ClientError.api(code: detail.code, message: detail.message)
+            }
+            throw ClientError.command(raw.isEmpty ? "生成に失敗しました" : raw)
         }
     }
 
@@ -173,6 +186,7 @@ final class CoordinatorClient: @unchecked Sendable {
                 events.append(StreamEvent(type: event["type"] as? String ?? "unknown",
                                           text: event["text"] as? String,
                                           message: event["message"] as? String,
+                                          code: event["code"] as? String,
                                           generationTPS: (event["generation_tps"] as? NSNumber)?.doubleValue))
             }
             lock.unlock()

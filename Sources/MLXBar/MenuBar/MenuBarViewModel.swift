@@ -25,6 +25,36 @@ struct CatalogModel: Identifiable, Hashable {
     }
 }
 
+/// One model currently resident in the coordinator's model pool.
+///
+/// The pool has held several models at once since v1.6.2, and `/api/v1/status`
+/// reports every one of them in `loadedModels`. The single `loadedModel` field
+/// stays the *primary* (most recently used) model for the existing header UI;
+/// this type backs the list of all residents.
+struct ResidentModel: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let engine: String?
+    /// "loading" | "ready" | "evicting" | "external" (LM Studio managed).
+    let poolState: String
+    let memoryReservationBytes: Int64?
+    let activeLeases: Int
+    let keepLoaded: Bool
+    let managedExternally: Bool
+
+    init?(_ value: [String: Any]) {
+        guard let id = value["id"] as? String else { return nil }
+        self.id = id
+        name = value["name"] as? String ?? id
+        engine = value["engine"] as? String
+        poolState = value["poolState"] as? String ?? "ready"
+        memoryReservationBytes = (value["memoryReservationBytes"] as? NSNumber)?.int64Value
+        activeLeases = (value["activeLeases"] as? NSNumber)?.intValue ?? 0
+        keepLoaded = value["keepLoaded"] as? Bool ?? false
+        managedExternally = value["memoryManagedBy"] != nil || (value["poolState"] as? String) == "external"
+    }
+}
+
 struct RuntimeInfo: Identifiable {
     let id: String
     let active: String?
@@ -106,6 +136,7 @@ final class MenuBarViewModel: ObservableObject {
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
     @Published var residentModelCount = 0
+    @Published var residentModels: [ResidentModel] = []
     @Published var modelPoolReservedBytes: Int64 = 0
     @Published var modelPoolBudgetBytes: Int64 = 0
     @Published var generationConcurrency = 1
@@ -164,6 +195,28 @@ final class MenuBarViewModel: ObservableObject {
         guiLanguage == "ja" ? japanese : english
     }
 
+    /// Turns any thrown error into a message in the interface language.
+    ///
+    /// A structured coordinator error (`ClientError.api`) is resolved by its
+    /// machine `code` through `CoordinatorErrorText`, so the text stays in the
+    /// chosen language even when the underlying failure came from an English-only
+    /// upstream runtime. Everything else falls back to its own description, and
+    /// truly unexpected errors get a generic sentence rather than a system-locale
+    /// string the user set out to avoid.
+    func presentError(_ error: Error) -> String {
+        switch error {
+        case let ClientError.api(code, message):
+            return CoordinatorErrorText.resolve(code: code, serverMessage: message, language: guiLanguage)
+        case let clientError as ClientError:
+            return clientError.errorDescription ?? ui("Something went wrong.", "エラーが発生しました")
+        case let urlError as URLError where urlError.code == .cancelled:
+            return ui("The request was cancelled.", "リクエストがキャンセルされました")
+        default:
+            return ui("Communication with the MLXBar service failed.",
+                      "MLXBarサービスとの通信に失敗しました")
+        }
+    }
+
     var icon: String {
         if errorMessage != nil { return "exclamationmark.triangle" }
         if busy || activeRequestCount > 0 || queuedRequestCount > 0 { return "waveform" }
@@ -180,7 +233,7 @@ final class MenuBarViewModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
-        do { try await client.startService() } catch { errorMessage = error.localizedDescription }
+        do { try await client.startService() } catch { errorMessage = presentError(error) }
         await refreshAll()
         polling?.cancel()
         polling = Task { [weak self] in
@@ -246,6 +299,15 @@ final class MenuBarViewModel: ObservableObject {
                              (pool["activeGenerations"] as? NSNumber)?.intValue ?? 0)
             }
             setIfChanged(\.liveGenerationTPS, (json["generationTokensPerSecond"] as? NSNumber)?.doubleValue)
+            // Every resident model, not just the primary. Older coordinators
+            // (pre-v1.6.2) omit `loadedModels`; fall back to the single
+            // `loadedModel` so the list still has one row.
+            let residentRaw = (json["loadedModels"] as? [[String: Any]])
+                ?? [json["loadedModel"]].compactMap { $0 as? [String: Any] }
+            setIfChanged(\.residentModels, residentRaw.compactMap(ResidentModel.init))
+            if json["modelPool"] == nil {
+                setIfChanged(\.residentModelCount, residentRaw.count)
+            }
             if let loaded = json["loadedModel"] as? [String: Any] {
                 setIfChanged(\.loadedName, loaded["name"] as? String)
                 setIfChanged(\.loadedEngine, loaded["engine"] as? String)
@@ -293,7 +355,7 @@ final class MenuBarViewModel: ObservableObject {
             setIfChanged(\.activeRequestCount, 0)
             setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
             setIfChanged(\.liveGenerationTPS, nil)
-            setIfChanged(\.errorMessage, error.localizedDescription)
+            setIfChanged(\.errorMessage, presentError(error))
         }
     }
 
@@ -303,7 +365,7 @@ final class MenuBarViewModel: ObservableObject {
             guard let json = try await json("GET", "/api/v1/models") as? [String: Any],
                   let data = json["data"] as? [[String: Any]] else { return }
             models = data.compactMap(CatalogModel.init)
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = presentError(error) }
     }
 
     func scan() async {
@@ -339,6 +401,20 @@ final class MenuBarViewModel: ObservableObject {
         await perform { _ = try await self.json("DELETE", path); await self.refreshStatus() }
     }
 
+    /// Free one resident model, leaving the rest of the pool alone.
+    ///
+    /// The coordinator's `POST /models/{id}/unload` only blocks on *that*
+    /// model's own in-flight generations (ENGINE_BUSY, surfaced as a localized
+    /// message); other models keep serving. `force` cancels this model's
+    /// generations first.
+    func unloadModel(_ id: String, force: Bool = false) async {
+        let base = "/api/v1/models/\(pathComponent(id))/unload"
+        await perform {
+            _ = try await self.json("POST", force ? base + "?force=true" : base)
+            await self.refreshStatus()
+        }
+    }
+
     func generate(prompt: String, images: [URL], temperature: Double = 0.7, maxTokens: Int = 512) async {
         guard !prompt.isEmpty else { return }
         chatOutput = ""; busy = true; errorMessage = nil; cancellationStatus = nil
@@ -356,13 +432,14 @@ final class MenuBarViewModel: ObservableObject {
                     } else if event.type == "metrics" {
                         self.generationTPS = event.generationTPS
                     } else if event.type == "error" {
-                        self.errorMessage = event.message
+                        self.errorMessage = CoordinatorErrorText.resolve(
+                            code: event.code, serverMessage: event.message, language: self.guiLanguage)
                     }
                 }
             }
         } catch {
             if !requestedCancellations.contains(requestID) {
-                errorMessage = error.localizedDescription
+                errorMessage = presentError(error)
             }
         }
         requestedCancellations.remove(requestID)
@@ -388,7 +465,7 @@ final class MenuBarViewModel: ObservableObject {
             }
         } catch {
             cancellationStatus = ui("Could not stop generation", "停止に失敗しました")
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -404,7 +481,7 @@ final class MenuBarViewModel: ObservableObject {
             await refreshStatus()
         } catch {
             cancellationStatus = ui("Could not stop generation", "停止に失敗しました")
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -426,7 +503,7 @@ final class MenuBarViewModel: ObservableObject {
             for runtime in runtimes {
                 if let job = runtime.activeJob { attachRuntimeJob(runtime.id, job) }
             }
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = presentError(error) }
     }
 
     func refreshRuntimeManager() async {
@@ -448,7 +525,7 @@ final class MenuBarViewModel: ObservableObject {
                 attachRuntimeJob(engine, job)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -462,7 +539,7 @@ final class MenuBarViewModel: ObservableObject {
             guard let value = try await json("POST", "/api/v1/runtimes/\(pathComponent(engine))/check") as? [String: Any] else { return }
             runtimeUpdates[engine] = RuntimeUpdateInfo(value)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -474,7 +551,7 @@ final class MenuBarViewModel: ObservableObject {
                 attachRuntimeJob(engine, job)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -503,7 +580,7 @@ final class MenuBarViewModel: ObservableObject {
                 runtimeUpdates[engine] = RuntimeUpdateInfo(check)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
         await refreshRuntimes()
     }
@@ -534,7 +611,7 @@ final class MenuBarViewModel: ObservableObject {
                 runtimeJobs[engine] = info
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = presentError(error)
         }
     }
 
@@ -545,7 +622,7 @@ final class MenuBarViewModel: ObservableObject {
             effectiveMaxTokens = loadedModelMaxTokens.map { min(configuredMaxTokens, $0) } ?? configuredMaxTokens
             await reconcileLaunchAtLogin()
         }
-        catch { errorMessage = error.localizedDescription }
+        catch { errorMessage = presentError(error) }
     }
 
     /// Applies `general.launchAtLogin` to the actual OS registration.
@@ -793,14 +870,14 @@ final class MenuBarViewModel: ObservableObject {
             if let lm = try await json("GET", "/api/v1/settings/lm-studio-token") as? [String: Any] {
                 lmStudioToken = lm["token"] as? String ?? ""
             }
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = presentError(error) }
     }
 
     func refreshPromptCache() async {
         do {
             promptCacheStatus = try await json("GET", "/api/v1/prompt-cache") as? [String: Any] ?? [:]
         } catch {
-            promptCacheMessage = error.localizedDescription
+            promptCacheMessage = presentError(error)
         }
     }
 
@@ -840,7 +917,7 @@ final class MenuBarViewModel: ObservableObject {
             logStatus = recentLogs.isEmpty
                 ? ui("No API access has been recorded", "記録されたAPIアクセスはありません")
                 : ui("Showing the latest \(recentLogs.count) entries (2,000 retained)", "最新\(recentLogs.count)件を表示中（最大2,000件保存）")
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = presentError(error) }
     }
 
     func clearRecentLogs() async {
@@ -932,7 +1009,7 @@ final class MenuBarViewModel: ObservableObject {
             if enabled { try SMAppService.mainApp.register() }
             else { try await SMAppService.mainApp.unregister() }
             await setConfig("general.launchAtLogin", value: enabled)
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = presentError(error) }
     }
 
     func deleteAllAppDataAndQuit() async {
@@ -1038,7 +1115,7 @@ final class MenuBarViewModel: ObservableObject {
 
     private func perform(_ operation: @escaping @MainActor () async throws -> Void) async {
         busy = true; errorMessage = nil
-        do { try await operation() } catch { errorMessage = error.localizedDescription }
+        do { try await operation() } catch { errorMessage = presentError(error) }
         busy = false
     }
 }
