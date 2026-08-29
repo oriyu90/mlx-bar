@@ -41,6 +41,9 @@ struct ResidentModel: Identifiable, Hashable {
     let activeLeases: Int
     let keepLoaded: Bool
     let managedExternally: Bool
+    /// Number of same-model replica processes (v1.8.0); 1 for the common case.
+    let replicaCount: Int
+    let replicaIndex: Int
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -52,6 +55,8 @@ struct ResidentModel: Identifiable, Hashable {
         activeLeases = (value["activeLeases"] as? NSNumber)?.intValue ?? 0
         keepLoaded = value["keepLoaded"] as? Bool ?? false
         managedExternally = value["memoryManagedBy"] != nil || (value["poolState"] as? String) == "external"
+        replicaCount = (value["replicaCount"] as? NSNumber)?.intValue ?? 1
+        replicaIndex = (value["replicaIndex"] as? NSNumber)?.intValue ?? 0
     }
 }
 
@@ -150,6 +155,8 @@ final class MenuBarViewModel: ObservableObject {
     @Published var localAPIURL = "http://127.0.0.1:11435"
     @Published var lanAPIURLs: [String] = []
     @Published var lanEnabled = false
+    @Published var anthropicEnabled = false
+    @Published var anthropicURL = ""
     @Published var models: [CatalogModel] = []
     @Published var runtimes: [RuntimeInfo] = []
     @Published var runtimeUpdates: [String: RuntimeUpdateInfo] = [:]
@@ -290,7 +297,8 @@ final class MenuBarViewModel: ObservableObject {
             setIfChanged(\.queuedRequestCount, (json["queuedRequestCount"] as? NSNumber)?.intValue ?? 0)
             setIfChanged(\.oldestQueuedSeconds, (json["oldestQueuedSeconds"] as? NSNumber)?.intValue ?? 0)
             if let pool = json["modelPool"] as? [String: Any] {
-                setIfChanged(\.residentModelCount, (pool["residentCount"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.residentModelCount, (pool["residentModelCount"] as? NSNumber)?.intValue
+                             ?? (pool["residentCount"] as? NSNumber)?.intValue ?? 0)
                 setIfChanged(\.modelPoolReservedBytes, (pool["reservedBytes"] as? NSNumber)?.int64Value ?? 0)
                 setIfChanged(\.modelPoolBudgetBytes, (pool["budgetBytes"] as? NSNumber)?.int64Value ?? 0)
                 setIfChanged(\.generationConcurrency,
@@ -304,9 +312,14 @@ final class MenuBarViewModel: ObservableObject {
             // `loadedModel` so the list still has one row.
             let residentRaw = (json["loadedModels"] as? [[String: Any]])
                 ?? [json["loadedModel"]].compactMap { $0 as? [String: Any] }
-            setIfChanged(\.residentModels, residentRaw.compactMap(ResidentModel.init))
+            // One row per distinct model; same-model replicas collapse into a
+            // single row that shows the replica count (see ×N badge).
+            var seenModelIDs = Set<String>()
+            let distinctResidents = residentRaw.compactMap(ResidentModel.init)
+                .filter { seenModelIDs.insert($0.id).inserted }
+            setIfChanged(\.residentModels, distinctResidents)
             if json["modelPool"] == nil {
-                setIfChanged(\.residentModelCount, residentRaw.count)
+                setIfChanged(\.residentModelCount, distinctResidents.count)
             }
             if let loaded = json["loadedModel"] as? [String: Any] {
                 setIfChanged(\.loadedName, loaded["name"] as? String)
@@ -347,6 +360,8 @@ final class MenuBarViewModel: ObservableObject {
                 setIfChanged(\.localAPIURL, api["localUrl"] as? String ?? apiURL)
                 setIfChanged(\.lanAPIURLs, api["lanUrls"] as? [String] ?? [])
                 setIfChanged(\.lanEnabled, api["lanEnabled"] as? Bool ?? false)
+                setIfChanged(\.anthropicEnabled, api["anthropicEnabled"] as? Bool ?? false)
+                setIfChanged(\.anthropicURL, api["anthropicUrl"] as? String ?? "")
             }
         } catch {
             guard token == statusRequestToken else { return }
@@ -816,10 +831,16 @@ final class MenuBarViewModel: ObservableObject {
     /// still needed to make it resident right now.
     func setModelPin(_ modelId: String, keepLoaded: Bool) async {
         let pool = (settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
+        let existing = (pool["profiles"] as? [[String: Any]] ?? [])
+            .first { ($0["modelId"] as? String) == modelId }
         var profiles = (pool["profiles"] as? [[String: Any]] ?? [])
             .filter { ($0["modelId"] as? String) != modelId }
         if keepLoaded {
-            profiles.append(["modelId": modelId, "keepLoaded": true])
+            var profile: [String: Any] = ["modelId": modelId, "keepLoaded": true]
+            if let replicas = (existing?["replicas"] as? NSNumber)?.intValue, replicas > 1 {
+                profile["replicas"] = replicas
+            }
+            profiles.append(profile)
         }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings",
@@ -833,6 +854,28 @@ final class MenuBarViewModel: ObservableObject {
                     ["engine": "auto"], timeoutSeconds: CoordinatorClient.Timeout.modelLoad)
                 await self.refreshStatus()
             }
+        }
+    }
+
+    /// Set the same-model replica count for a pinned model (v1.8.0). The extra
+    /// replicas come up at the next service start (or when the reaper tops the
+    /// model up); 1 keeps the single-process default.
+    func setModelReplicas(_ modelId: String, replicas: Int) async {
+        guard 1...8 ~= replicas else {
+            errorMessage = ui("Replicas must be between 1 and 8", "並列数は1〜8で指定してください")
+            return
+        }
+        let pool = (settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
+        var profiles = (pool["profiles"] as? [[String: Any]] ?? [])
+        if let index = profiles.firstIndex(where: { ($0["modelId"] as? String) == modelId }) {
+            profiles[index]["replicas"] = replicas
+        } else {
+            profiles.append(["modelId": modelId, "keepLoaded": true, "replicas": replicas])
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    ["models": ["pool": ["profiles": profiles]]])
+            await self.refreshSettings()
         }
     }
 

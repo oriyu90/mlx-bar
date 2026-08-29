@@ -24,6 +24,12 @@ class PoolSlot:
     model: dict
     worker: SingleWorkerSupervisor
     reservation_bytes: int
+    # v1.8.0 same-model replicas: several PoolSlots may share one model id, each
+    # its own worker process (one MLX process is single-threaded, so this is the
+    # only way distinct generations of the *same* model run at once). Slot 0 is
+    # byte-for-byte the pre-v1.8.0 slot; replicas 1..N carry a suffixed
+    # instance_key so their manifest, log and socket never collide.
+    replica_index: int = 0
     keep_loaded: bool = False
     session_pinned: bool = False
     leases: int = 0
@@ -89,7 +95,7 @@ class ModelPoolSupervisor:
             return self._legacy.loaded
         if self._legacy.loaded:
             return self._legacy.loaded
-        slot = self._slots.get(self._primary_model_id or "")
+        slot = self._primary_slot()
         if slot and slot.state == "ready":
             return slot.worker.loaded
         ready = next((item for item in self._slots.values() if item.state == "ready"), None)
@@ -160,7 +166,13 @@ class ModelPoolSupervisor:
         return slot.worker.engine if slot else self._legacy.engine
 
     def _primary_slot(self) -> PoolSlot | None:
-        return self._slots.get(self._primary_model_id or "") if self.enabled else None
+        if not self.enabled or not self._primary_model_id:
+            return None
+        replicas = self._replica_slots(self._primary_model_id)
+        # Prefer a ready replica; fall back to replica 0 while it is still
+        # loading so `loading`/`process`/`engine` keep reporting during a load.
+        return next((slot for slot in replicas if slot.state == "ready"),
+                    replicas[0] if replicas else None)
 
     def _pool_settings(self) -> dict:
         return self.settings.data.get("models", {}).get("pool", {})
@@ -170,6 +182,57 @@ class ModelPoolSupervisor:
             if profile.get("modelId") == model_id:
                 return profile
         return {}
+
+    # --- same-model replicas (v1.8.0) ---------------------------------------
+
+    @staticmethod
+    def _slot_key(model_id: str, replica_index: int) -> str:
+        # Replica 0 keeps the bare model id as its key so every pre-v1.8.0 code
+        # path and test that does `_slots[model_id]` is byte-identical when no
+        # extra replicas are configured.
+        return model_id if replica_index == 0 else f"{model_id}#{replica_index}"
+
+    def _replica_slots(self, model_id: str) -> list[PoolSlot]:
+        """Every slot for this model id, ordered by replica index."""
+        return sorted(
+            (slot for slot in self._slots.values()
+             if str(slot.model.get("id", "")) == model_id),
+            key=lambda slot: slot.replica_index,
+        )
+
+    def _desired_replicas(self, model_id: str) -> int:
+        """How many copies of this model the config asks to keep resident.
+
+        Only a pinned profile can raise it above 1, and the pool-wide
+        ``maxReplicasPerModel`` is the hard ceiling. ``replicas == 1`` (the
+        default for every model) leaves the pool byte-identical to v1.7.x.
+        """
+        settings = self._pool_settings()
+        ceiling = max(1, int(settings.get("maxReplicasPerModel", 2)))
+        try:
+            requested = int(self._profile(model_id).get("replicas", 1) or 1)
+        except (TypeError, ValueError):
+            requested = 1
+        return max(1, min(requested, ceiling))
+
+    def _pick_replica(self, model_id: str) -> PoolSlot | None:
+        """Choose the replica a new generation for this model should run on.
+
+        Prefers an idle replica (keeps one worker's prompt cache warm when
+        traffic is light); otherwise the least-loaded one. Returns None when no
+        replica of this model is ready.
+        """
+        ready = [slot for slot in self._replica_slots(model_id)
+                 if slot.state == "ready" and slot.worker.loaded]
+        if not ready:
+            return None
+        idle = [slot for slot in ready
+                if not slot.gen_lock.locked() and not slot.gen_queued]
+        if idle:
+            # Warmest cache first: the most recently released idle replica.
+            return max(idle, key=lambda slot: slot.last_released_at)
+        return min(ready, key=lambda slot: len(slot.gen_queued)
+                   + (1 if slot.gen_lock.locked() else 0))
 
     def _per_model_limit(self, model: dict) -> int:
         profile = self._profile(str(model.get("id", "")))
@@ -294,8 +357,35 @@ class ModelPoolSupervisor:
                 self._primary_model_id = str(model.get("id", ""))
                 return result
         self._ensure_reaper()
+        # An explicit load (GUI / CLI / preload) brings every configured replica
+        # up now. An API autoload only needs one copy resident to answer -- the
+        # reaper tops a pinned model up to its replica count in the background,
+        # so a request never pays the extra admission cost.
+        already = len(self._replica_slots(model_id))
+        desired = max(1, already, self._desired_replicas(model_id) if pin else 1)
+        result: dict | None = None
+        for replica_index in range(desired):
+            try:
+                result = await self._load_replica(model, engine, model_id, replica_index, pin=pin)
+            except MLXBarError:
+                if replica_index == 0 or result is None:
+                    raise
+                # A replica beyond the first failing (memory budget, pressure)
+                # is not fatal: the model is already usable on the replicas that
+                # did load. The reaper will retry the shortfall when room frees.
+                LOGGER.warning("Could not load replica %d of %s; keeping %d replica(s)",
+                               replica_index, model_id, replica_index)
+                break
+        self._primary_model_id = model_id
+        return result
+
+    async def _load_replica(self, model: dict, engine: str | None, model_id: str,
+                            replica_index: int, *, pin: bool) -> dict:
+        """Ensure one copy (replica) of ``model`` is resident. Singleflight per
+        replica; replica 0 is byte-identical to the pre-v1.8.0 single slot."""
+        slot_key = self._slot_key(model_id, replica_index)
         async with self._pool_lock:
-            existing = self._slots.get(model_id)
+            existing = self._slots.get(slot_key)
             if existing:
                 if pin:
                     existing.session_pinned = True
@@ -315,7 +405,7 @@ class ModelPoolSupervisor:
             if self._legacy.loaded:
                 await self._legacy.unload()
             async with self._pool_lock:
-                existing = self._slots.get(model_id)
+                existing = self._slots.get(slot_key)
                 if existing and existing.state == "ready":
                     if pin:
                         existing.session_pinned = True
@@ -330,17 +420,19 @@ class ModelPoolSupervisor:
                     loop = asyncio.get_running_loop()
                     future = loop.create_future()
                     digest = hashlib.sha256(model_id.encode()).hexdigest()[:12]
+                    instance_key = digest if replica_index == 0 else f"{digest}-{replica_index}"
                     worker = SingleWorkerSupervisor(
-                        self.root, self.settings, instance_key=digest,
+                        self.root, self.settings, instance_key=instance_key,
                         memory_limit_bytes=reservation, reap_orphans=False,
                     )
                     profile = self._profile(model_id)
                     existing = PoolSlot(
                         model=dict(model), worker=worker, reservation_bytes=reservation,
+                        replica_index=replica_index,
                         keep_loaded=bool(profile.get("keepLoaded", False)),
                         session_pinned=pin, last_released_at=time.monotonic(), load_future=future,
                     )
-                    self._slots[model_id] = existing
+                    self._slots[slot_key] = existing
             if future.done():
                 return future.result()
             for victim in victims:
@@ -382,7 +474,8 @@ class ModelPoolSupervisor:
             except BaseException as exc:
                 await existing.worker.shutdown()
                 async with self._pool_lock:
-                    self._slots.pop(model_id, None)
+                    if self._slots.get(slot_key) is existing:
+                        self._slots.pop(slot_key, None)
                 if not future.done():
                     future.set_exception(exc)
                 # The caller receives the original exception; retrieving it
@@ -430,6 +523,7 @@ class ModelPoolSupervisor:
 
     async def _evict_slot(self, slot: PoolSlot) -> None:
         model_id = str(slot.model.get("id", ""))
+        slot_key = self._slot_key(model_id, slot.replica_index)
         if slot.leases:
             slot.state = "ready"
             return
@@ -437,9 +531,10 @@ class ModelPoolSupervisor:
             await slot.worker.unload()
         await slot.worker.shutdown()
         async with self._pool_lock:
-            if self._slots.get(model_id) is slot:
-                self._slots.pop(model_id, None)
-            if self._primary_model_id == model_id:
+            if self._slots.get(slot_key) is slot:
+                self._slots.pop(slot_key, None)
+            # Only drop the primary pointer when no replica of it survives.
+            if self._primary_model_id == model_id and not self._replica_slots(model_id):
                 self._primary_model_id = None
 
     async def unload(self) -> dict:
@@ -488,23 +583,25 @@ class ModelPoolSupervisor:
                 if self._primary_model_id == model_id:
                     self._primary_model_id = None
                 return {"state": "unloaded", "count": 1}
-            slot = self._slots.get(model_id)
-            if slot is None:
+            slots = self._replica_slots(model_id)
+            if not slots:
                 return {"state": "unloaded", "count": 0}
-            if slot.leases and not force:
+            if any(slot.leases for slot in slots) and not force:
                 raise MLXBarError("ENGINE_BUSY", "使用中のモデルは解放できません", 409, True)
-            if slot.leases and force:
-                # Cancel only this model's generations, not the whole pool.
-                for queued in list(slot.gen_queued.values()):
-                    queued.cancel_requested.set()
-                for req_id, worker in list(self._request_workers.items()):
-                    if worker is slot.worker:
-                        with contextlib.suppress(Exception):
-                            await worker.cancel(req_id)
-            slot.state = "evicting"
-            slot.session_pinned = False
-            await self._evict_slot(slot)
-            return {"state": "unloaded", "count": 1}
+            for slot in slots:
+                if slot.leases and force:
+                    # Cancel only this model's generations, not the whole pool.
+                    for queued in list(slot.gen_queued.values()):
+                        queued.cancel_requested.set()
+                    for req_id, worker in list(self._request_workers.items()):
+                        if worker is slot.worker:
+                            with contextlib.suppress(Exception):
+                                await worker.cancel(req_id)
+            for slot in slots:
+                slot.state = "evicting"
+                slot.session_pinned = False
+                await self._evict_slot(slot)
+            return {"state": "unloaded", "count": len(slots)}
 
     async def unload_engine(self, engine: str) -> dict:
         async with self._load_lock:
@@ -522,13 +619,23 @@ class ModelPoolSupervisor:
         if not self.enabled:
             loaded = self._legacy.loaded
             return [dict(loaded)] if loaded and loaded.get("engine") == engine else []
-        result = []
-        for slot in self._slots.values():
+        # One entry per distinct model id: reload_resident() calls self.load(),
+        # which re-creates every configured replica, so snapshotting per replica
+        # would multiply the reload.
+        result: list[dict] = []
+        seen: set[str] = set()
+        for slot in self._replica_slots_all():
             loaded = slot.worker.loaded or slot.model
-            if loaded.get("engine") == engine:
+            model_id = str(slot.model.get("id", ""))
+            if loaded.get("engine") == engine and model_id not in seen:
+                seen.add(model_id)
                 result.append({"model": dict(slot.model), "engine": engine,
                                "sessionPinned": slot.session_pinned})
         return result
+
+    def _replica_slots_all(self) -> list[PoolSlot]:
+        return sorted(self._slots.values(),
+                      key=lambda slot: (str(slot.model.get("id", "")), slot.replica_index))
 
     async def reload_resident(self, snapshots: list[dict], engine: str) -> list[dict]:
         results = []
@@ -668,8 +775,8 @@ class ModelPoolSupervisor:
             async for event in self._legacy.generate(prompt, images, options, request_id, image_root):
                 yield event
             return
-        slot = self._slots.get(model_id)
-        if slot is None or slot.state != "ready" or not slot.worker.loaded:
+        slot = self._pick_replica(model_id)
+        if slot is None:
             raise MLXBarError("MODEL_NOT_LOADED", "要求されたモデルがロードされていません", 409, True)
         request_id = request_id or hashlib.sha256(os.urandom(16)).hexdigest()
         self._recover_lane(slot, "new_request")
@@ -793,6 +900,30 @@ class ModelPoolSupervisor:
         slot = self._primary_slot()
         return await (slot.worker.prompt_cache_stats() if slot else self._legacy.prompt_cache_stats())
 
+    async def count_tokens(self, model_id: str, messages, options: dict) -> dict:
+        """Real tokenizer count for the Anthropic ``count_tokens`` endpoint.
+
+        Routes to any ready replica of the model. Old runtimes without the
+        worker RPC fail cleanly rather than returning a fabricated estimate.
+        """
+        if self.enabled:
+            slot = self._pick_replica(model_id) or next(
+                (s for s in self._replica_slots(model_id) if s.worker.loaded), None)
+            worker = slot.worker if slot else None
+        else:
+            worker = self._legacy if self._legacy.loaded else None
+        if worker is None:
+            raise MLXBarError("MODEL_NOT_LOADED", "モデルがロードされていません", 409)
+        params = {"messages": messages, **options}
+        try:
+            response = await worker._call("count_tokens", params, timeout=30)
+        except MLXBarError as exc:
+            if exc.code in {"UNKNOWN_METHOD", "PROTOCOL_MISMATCH", "COUNT_TOKENS_UNAVAILABLE"}:
+                raise MLXBarError("COUNT_TOKENS_UNAVAILABLE",
+                                  "このランタイムはトークン数の計測に対応していません", 503, False) from exc
+            raise
+        return {"input_tokens": int(response.get("input_tokens", 0))}
+
     async def clear_memory_prompt_cache(self) -> dict:
         slot = self._primary_slot()
         return await (slot.worker.clear_memory_prompt_cache()
@@ -879,9 +1010,13 @@ class ModelPoolSupervisor:
             if slot.gen_owner is not None or slot.worker.active_requests:
                 active_generations += 1
             if child.get("loadedModel"):
+                model_id = str(slot.model.get("id", ""))
                 loaded_models.append({**child["loadedModel"], "poolState": slot.state,
                                       "memoryReservationBytes": slot.reservation_bytes,
                                       "activeLeases": slot.leases,
+                                      "replicaIndex": slot.replica_index,
+                                      "replicaCount": len([s for s in self._slots.values()
+                                                           if str(s.model.get("id", "")) == model_id]),
                                       "laneQueueDepth": len(slot.gen_queued),
                                       "laneRecoveries": slot.gen_recoveries,
                                       "keepLoaded": slot.keep_loaded or slot.session_pinned,
@@ -918,7 +1053,9 @@ class ModelPoolSupervisor:
                           "configuredEnabled": bool(self._pool_settings().get("enabled", True)),
                           "restartRequired": not bool(self._pool_settings().get("enabled", True)),
                           "residentCount": len(loaded_models),
+                          "residentModelCount": len({item.get("id") for item in loaded_models}),
                           "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
+                          "maxReplicasPerModel": self._pool_settings().get("maxReplicasPerModel", 2),
                           "generationConcurrency": self._gen_concurrency,
                           "activeGenerations": active_generations,
                           "reservedBytes": self._resident_charge(),
@@ -963,6 +1100,25 @@ class ModelPoolSupervisor:
                         and (expired or pressure_victim)):
                     slot.state = "evicting"
                     victims.append(slot)
+            # Scale down replicas whose configured count was lowered (or whose
+            # ceiling dropped). Never touch replica 0, a leased replica, or the
+            # last remaining replica; drop the highest-index idle unpinned ones
+            # first so a model keeps its warmest slot.
+            for model_id in {str(slot.model.get("id", "")) for slot in self._slots.values()}:
+                desired = self._desired_replicas(model_id)
+                surviving = [s for s in self._replica_slots(model_id)
+                             if s.state == "ready" and s not in victims]
+                # A configured replica count is a capacity setting, not a per-
+                # process pin: replica 0 is always kept, but replicas 1..N are
+                # trimmed to `desired` even when the model is session-pinned.
+                droppable = [s for s in reversed(surviving)
+                             if s.replica_index > 0 and s.leases == 0]
+                for slot in droppable:
+                    if len(surviving) <= desired:
+                        break
+                    slot.state = "evicting"
+                    victims.append(slot)
+                    surviving.remove(slot)
             # Critical pressure overrides keep-loaded for idle models. A
             # keep-loaded profile is a latency preference, never a promise to
             # endanger the rest of the machine.
@@ -993,7 +1149,36 @@ class ModelPoolSupervisor:
                 remaining_count -= 1
         for slot in victims:
             await self._evict_slot(slot)
+        await self._scale_up_pinned_replicas()
         return len(victims)
+
+    async def _scale_up_pinned_replicas(self) -> None:
+        """Top a pinned/kept model up to its configured replica count.
+
+        API autoload only brings one copy up; this is where a model with a
+        `replicas > 1` profile grows to full width once memory allows. Purely
+        best effort -- admission failures are expected and left for the next
+        pass.
+        """
+        for model_id in {str(slot.model.get("id", "")) for slot in list(self._slots.values())}:
+            replicas = self._replica_slots(model_id)
+            if not replicas:
+                continue
+            base = replicas[0]
+            if not (base.keep_loaded or base.session_pinned):
+                continue
+            desired = self._desired_replicas(model_id)
+            ready = [s for s in replicas if s.state == "ready"]
+            if len(ready) >= desired or any(s.state == "loading" for s in replicas):
+                continue
+            present = {s.replica_index for s in replicas}
+            model = dict(base.model)
+            for index in (i for i in range(desired) if i not in present):
+                try:
+                    await self._load_replica(model, model.get("engine"), model_id, index,
+                                             pin=base.session_pinned)
+                except MLXBarError:
+                    break
 
     def _reap_pool_orphans(self) -> None:
         control = self.root / "control"

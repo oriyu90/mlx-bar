@@ -63,6 +63,8 @@ def parser() -> argparse.ArgumentParser:
     model.add_parser("resident")
     pin = model.add_parser("pin"); pin.add_argument("model_id")
     pin.add_argument("--max-memory-gb", type=float, default=None)
+    pin.add_argument("--replicas", type=int, default=None,
+                     help="同一モデルを並列生成用に複数常駐させる数（1〜8、要 models.pool.enabled）")
     unpin = model.add_parser("unpin"); unpin.add_argument("model_id")
     add_folder = model.add_parser("add-folder"); add_folder.add_argument("path")
     remove_folder = model.add_parser("remove-folder"); remove_folder.add_argument("path")
@@ -154,11 +156,15 @@ def execute(args, client: Client):
             status = client.request("GET", "/api/v1/status").json()
             pool = status.get("modelPool", {})
             return {"residentCount": pool.get("residentCount", 0),
+                    "residentModelCount": pool.get("residentModelCount"),
                     "maxResidentModels": pool.get("maxResidentModels"),
+                    "maxReplicasPerModel": pool.get("maxReplicasPerModel"),
                     "generationConcurrency": pool.get("generationConcurrency"),
                     "activeGenerations": pool.get("activeGenerations"),
                     "models": [{"id": item.get("id"), "engine": item.get("engine"),
                                 "poolState": item.get("poolState"),
+                                "replicaIndex": item.get("replicaIndex"),
+                                "replicaCount": item.get("replicaCount"),
                                 "keepLoaded": item.get("keepLoaded"),
                                 "activeLeases": item.get("activeLeases"),
                                 "laneQueueDepth": item.get("laneQueueDepth")}
@@ -172,6 +178,8 @@ def execute(args, client: Client):
                 profile = {"modelId": args.model_id, "keepLoaded": True}
                 if getattr(args, "max_memory_gb", None) is not None:
                     profile["maxMemoryGB"] = args.max_memory_gb
+                if getattr(args, "replicas", None) is not None:
+                    profile["replicas"] = args.replicas
                 profiles.append(profile)
             client.request("PUT", "/api/v1/settings",
                            {"models": {"pool": {"profiles": profiles}}})

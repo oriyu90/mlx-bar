@@ -35,11 +35,15 @@ async def status(request: Request):
     local_url = f"http://127.0.0.1:{api['port']}"
     lan_urls = [f"http://{address}:{api['port']}" for address in app.lan_ipv4_addresses()]
     worker_status = app.workers.status()
+    anthropic_enabled = bool(api.get("anthropic", {}).get("enabled", True))
+    base_url = lan_urls[0] if lan_enabled and lan_urls else local_url
     return {"service": "running", **worker_status,
             "api": {"enabled": api["enabled"], "host": api["host"],
-                    "url": lan_urls[0] if lan_enabled and lan_urls else local_url,
+                    "url": base_url,
                     "localUrl": local_url, "lanUrls": lan_urls if lan_enabled else [],
                     "lanEnabled": lan_enabled,
+                    "anthropicEnabled": anthropic_enabled,
+                    "anthropicUrl": f"{base_url}/anthropic" if anthropic_enabled else None,
                     "error": app.public_listener_error},
             "promptCacheHealth": _prompt_cache_health(app, worker_status),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}

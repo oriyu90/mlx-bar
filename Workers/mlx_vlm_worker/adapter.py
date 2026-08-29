@@ -550,6 +550,43 @@ class MLXVLMAdapter(BaseAdapter):
             self._init_apc(model_path)
             self._init_checkpoints(model_path)
 
+    def count_tokens(self, params: dict) -> int:
+        """Best-effort exact count for the Anthropic count_tokens endpoint.
+
+        Renders the chat template exactly as stream() would, then tokenises with
+        whatever encoder the runtime exposes. Image contribution is not modelled
+        (Anthropic's own image token counts are also estimates); a runtime whose
+        tokenizer cannot be reached fails cleanly via NotImplementedError.
+        """
+        if self.model is None:
+            raise RuntimeError("model is not loaded")
+        from mlx_vlm.prompt_utils import apply_chat_template
+        prompt = params.get("messages", params.get("prompt", ""))
+        images = params.get("images") or []
+        config = getattr(self.model, "config", None)
+        last_error: Exception | None = None
+        rendered = prompt if isinstance(prompt, str) else None
+        if rendered is None:
+            for extra_kwargs in tool_template_kwargs_attempts(params):
+                try:
+                    rendered = apply_chat_template(
+                        self.processor, config, prompt, num_images=len(images), **extra_kwargs)
+                    last_error = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+            if rendered is None:
+                raise last_error if last_error else RuntimeError("could not render prompt")
+        text = rendered if isinstance(rendered, str) else str(rendered)
+        for encoder in (getattr(getattr(self.processor, "tokenizer", None), "encode", None),
+                        getattr(self.processor, "encode", None)):
+            if callable(encoder):
+                try:
+                    return len(list(encoder(text)))
+                except Exception:  # noqa: BLE001 - try the next encoder
+                    continue
+        raise NotImplementedError("no reachable tokenizer for count_tokens")
+
     def stream(self, request_id: str, params: dict):
         if self.model is None:
             raise RuntimeError("model is not loaded")
