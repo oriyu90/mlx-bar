@@ -26,6 +26,16 @@
 - **個別unloadは`POST /api/v1/models/{id}/unload`。** 既存の`DELETE /models/loaded`（全解放）は据え置き。CLIの`model unload`（引数なし）も全解放のまま。`_evict_slot`のlease guardは維持——生成中のWorkerをstreamの下から殺さない。`force=true`はcancel + unpin + best effortで、leaseが落ちた後の次回reapが回収する。
 - **OpenAI互換入口は変えていない。** ルーティングは従来どおり`generate_for_model(str(loaded["id"]), ...)`。`_ensure_requested_model`が生成中の新規モデルautoloadを`ENGINE_BUSY`で拒むのは仕様どおり（生成中のモデル切替を避ける）。同時に使うモデルは事前に常駐させる前提。128 tools上限・bearer認証・SSE keep-aliveコメントは不変。
 
+## v1.7.1で守ること（複数モデル表示 / エラー日本語化 / OpenAI互換）
+
+- **メニューバーの複数モデル表示はバックエンド不変、表示層だけ。** `/api/v1/status`の`loadedModels`（配列、v1.6.2から存在。`poolState` / `memoryReservationBytes` / `activeLeases` / `keepLoaded` / `idleExpiresAt` / `memoryManagedBy`を含む）を`MenuBarViewModel.residentModels`へ復元し、`MenuBarView`で`residentModels.count > 1`のとき一覧表示する。単数`loadedModel`は今後も「プライマリ（直近使用）」でヘッダー専用。GUIは必ず`loadedModels`を読むこと——単数だけ読む実装へ戻さない。個別unloadボタンは`unloadModel(id)` → `POST /api/v1/models/{id}/unload`（既存の`unload_one`ルート）。`poolState == "external"`（LM Studio管理）の行はunload/pinを出さない。
+- **エラー日本語化は「`code`契約 → クライアント側辞書引き」が一次。** `Sources/MLXBar/Services/ErrorText.swift`の`CoordinatorErrorText.table`（`code` → (ja, en)）で解決し、未知`code`はサーバ`message` → `code`の順にフォールバック。`ClientError`に`.api(code:message:)`を追加し、`CoordinatorClient.apiError(in:)`が`detail.code`と`detail.message`の両方を返す。`MenuBarViewModel.presentError(_:)`が全`catch`の共通経路。**新しい`MLXBarError` codeを足したら`ErrorText.swift`の`table`にも足すこと。**
+- **サーバは今後も日本語`message`を返す責務。** `errors.py` / `api/*.py` / `Workers/common/server.py`のMLXBar由来エラーは`code` + 日本語`message`。上流ランタイム（mlx-lm / mlx-vlm / transformers）の英語例外は`message`を日本語の分類文言に置換し、原文は`detail`へ退避（GUIは出さず、`coordinator.log`に残る）。`make_management_app`のcatch-allは`message`固定・クラス名は`detail`へ。`RequestValidationError`も同様。**OpenAI互換のエラー本文の形（`{"error": {...}}`）と`code`値は不変**——`message`の中身だけ日本語化した。外部API利用者には従来どおり`code` + `message`が届く。
+- **`max_tokens`省略時は`effective_max_tokens()`（＝`min(generation.maxTokens, modelMaxTokens)`、既定8192）。512ではない。** `api/openai_compat.py`の`chat()`で、`max_completion_tokens`も`max_tokens`も`None`のときだけこのフォールバック。明示値は従来どおりworker側`_validate_generation`が`min(値, effective_limit)`でclamp。`effective_max_tokens`を持たないworker実装（テストのダミー）では512へ`getattr`フォールバック。オーナー確認済みの意図的な既定変更（`common rules`の「実測がないなら既定を動かさない」に対する例外。エージェント系クライアントの応答途中終了への対応）。
+- **単一常駐フォールバックルーティングは「常駐ちょうど1件」かつ`autoLoadOnAPIRequest`有効のときだけ。** `_ensure_requested_model`で、`find_loaded_model` / `loaded`のいずれにも一致せず`loaded_models()`が1件なら、その1件を返す（autoloadも`ENGINE_BUSY`もしない）。**常駐2件以上のときの解決ロジック（自動ロード / `ENGINE_BUSY` / `MODEL_NOT_FOUND`）は不変。** `getattr(workers, "loaded_models", None)`ガードで旧worker実装は従来動作。回帰: `test_an_unknown_model_is_missing_rather_than_busy_while_another_request_runs`（`make_autoload_client`は`loaded_models`無し＝対象外）、`_TwoModelPool`系（2件＝対象外）。
+- **ストリーミングの`delta.role`は最初の1チャンクのみ（OpenAI準拠）。** `tool_call_delta`分岐にローカル`bool`フラグ。`_tool_call_stream_chunks`（`tool_calls`イベント経路）は元から最初のみroleなので、そこを通ったら同じフラグを立てて後続の`tool_call_delta`が再送しないようにする。
+- **未知パス / `/v1/completions`はOpenAIエラー形式。** `main.py`に`StarletteHTTPException`ハンドラを追加（`fastapi.HTTPException`ハンドラは routing 由来のbare 404 を捕まえない）。`/v1/completions`は明示ルートで`404 UNSUPPORTED_ENDPOINT`。
+
 ## 未解決の課題
 
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）
@@ -271,6 +281,7 @@
 - `CHANGELOG.md`（新バージョンの節を先頭に追加）
 - `RELEASE_NOTES_v{version}.md`（新規作成、SHA-256は実ビルド後に追記）
 - `TEST_PLAN_v{version}.md`（新規作成）
+- `DESIGN_v{version}.md`（新規作成。**v1.6.2以降、`scripts/build-release.sh`のDMGステージングが`DESIGN_v$VERSION.md`を必須で参照するため、無いと`set -e`でビルドが止まる。** バグ修正のみのリリースでも短いもので良いので必ず置く）
 - **紹介サイトはこのリポジトリに無い。** `oriyu90/studio-rizi`の`website/projects/mlx-bar/`で更新する（`softwareVersion`のJSON-LD、kicker、動作環境表の「最新版」、手順のDMG名、`content.js`のリリース版数と日付）。**4言語ぶんあるので箇所数が多い。正確な一覧は非公開メモ側にある。** 共通ルール「htmlの更新は実装後の最終作業」に従い、DMGを公開してから行うこと。
 
 ## ウェブサイトの多言語対応について

@@ -1065,3 +1065,154 @@ def test_an_unknown_model_is_missing_rather_than_busy_while_another_request_runs
         })
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "MODEL_NOT_FOUND"
+
+
+# --- v1.7.1: OpenAI-compatible client interop ---------------------------------
+
+def test_omitted_max_tokens_falls_back_to_the_configured_ceiling():
+    """Agent clients (Zed, Cline, OpenCode) routinely omit max_tokens; a fixed
+    512 truncated them. Fall back to the worker's effective ceiling instead."""
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        worker.effective_max_tokens = lambda: 4096
+        response = client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e",
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert response.status_code == 200
+        assert worker.received[2]["max_tokens"] == 4096
+
+
+def test_explicit_max_tokens_is_still_honoured():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))
+        worker.effective_max_tokens = lambda: 4096
+        response = client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert response.status_code == 200
+        assert worker.received[2]["max_tokens"] == 32
+
+
+def test_max_tokens_without_a_worker_ceiling_still_defaults_to_512():
+    with tempfile.TemporaryDirectory() as directory:
+        client, worker, _ = make_client(Path(directory))  # ToolWorker has no ceiling
+        response = client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e",
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert response.status_code == 200
+        assert worker.received[2]["max_tokens"] == 512
+
+
+def test_legacy_completions_endpoint_returns_an_openai_shaped_error():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        response = client.post("/v1/completions", json={"model": "x", "prompt": "hi"})
+        assert response.status_code == 404
+        body = response.json()
+        assert body["error"]["code"] == "UNSUPPORTED_ENDPOINT"
+        assert body["error"]["message"]
+
+
+def test_unknown_path_uses_the_openai_error_shape_not_starlette_default():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        response = client.get("/v1/does-not-exist")
+        assert response.status_code == 404
+        body = response.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["message"]
+
+
+def test_every_openai_error_response_carries_a_message():
+    with tempfile.TemporaryDirectory() as directory:
+        client, _, _ = make_client(Path(directory))
+        responses = [
+            client.post("/v1/completions", json={}),
+            client.get("/v1/missing"),
+            client.post("/v1/chat/completions", json={"model": "x", "messages": []}),
+            client.post("/v1/chat/completions", json=[]),
+        ]
+        for response in responses:
+            assert response.json()["error"].get("message")
+
+
+class _DeltaToolWorker:
+    loaded = {"id": "Laguna-S-2.1-oQ2e"}
+
+    async def generate(self, messages, images, options, request_id, image_root=None):
+        yield {"type": "tool_call_delta", "calls": [
+            {"index": 0, "id": "call_x", "function": {"name": "read_file", "arguments": ""}}]}
+        yield {"type": "tool_call_delta", "calls": [
+            {"index": 0, "function": {"arguments": '{"path"'}}]}
+        yield {"type": "tool_call_delta", "calls": [
+            {"index": 0, "function": {"arguments": ':"a"}'}}]}
+        yield {"type": "completed", "finish_reason": "tool_calls"}
+
+
+def test_streaming_tool_call_deltas_send_role_only_on_the_first_chunk():
+    """OpenAI sends delta.role once; repeating it trips strict SDK parsers."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=_DeltaToolWorker(),
+            database=Database(Path(directory) / "state.sqlite3"))
+        client = TestClient(make_public_app(state))
+        response = client.post("/v1/chat/completions", json=request_body(stream=True))
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: {")]
+        roles = [event["choices"][0]["delta"].get("role") for event in events
+                 if event.get("choices") and "tool_calls" in event["choices"][0]["delta"]]
+        assert roles.count("assistant") == 1
+
+
+class _SingleResidentPool:
+    loaded = None
+
+    def __init__(self):
+        self.routed = None
+        self._resident = {"id": "resident-1", "name": "Resident One", "engine": "mlx-lm"}
+
+    def find_loaded_model(self, requested):
+        return None
+
+    def loaded_models(self):
+        return [self._resident]
+
+    def raise_if_queue_full(self):
+        return None
+
+    async def generate_for_model(self, model_id, messages, images, options, request_id,
+                                 image_root=None):
+        self.routed = model_id
+        yield {"type": "delta", "text": "ok"}
+        yield {"type": "completed", "finish_reason": "stop"}
+
+
+def test_a_made_up_model_name_routes_to_the_sole_resident_instead_of_erroring():
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False},
+                                           "models": {"autoLoadOnAPIRequest": True}}),
+            workers=_SingleResidentPool(),
+            database=Database(Path(directory) / "state.sqlite3"))
+        client = TestClient(make_public_app(state))
+        response = client.post("/v1/chat/completions", json={
+            "model": "whatever-the-client-configured",
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert response.status_code == 200
+        assert state.workers.routed == "resident-1"
+
+
+def test_management_errors_carry_a_japanese_message_not_a_bare_code():
+    from mlxbar.main import make_management_app
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=SimpleNamespace(),
+            database=Database(Path(directory) / "state.sqlite3"))
+        client = TestClient(make_management_app(state))
+        response = client.post("/api/v1/runtimes/not-an-engine/check")
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "INVALID_ENGINE"
+        assert detail["message"] and detail["message"] != "INVALID_ENGINE"

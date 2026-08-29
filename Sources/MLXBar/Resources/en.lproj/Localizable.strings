@@ -283,3 +283,12 @@
 "常駐させるモデル" = "Models to Keep Resident";
 "モデルが見つかりません。フォルダを追加して再スキャンしてください。" = "No models found. Add a folder and rescan.";
 "常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。" = "Pinned models load automatically at service start and are never released while idle. To make one resident right now, load it from the Models screen.";
+
+/* v1.7.1 -- resident model list in the menu bar */
+"常駐モデル" = "Resident Models";
+"すべてアンロード" = "Unload All";
+"常駐を維持" = "Keep Resident";
+"このモデルをアンロード" = "Unload This Model";
+"ロード中" = "Loading";
+"解放中" = "Releasing";
+"固定" = "Pinned";

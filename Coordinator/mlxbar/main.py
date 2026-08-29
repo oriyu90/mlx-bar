@@ -20,6 +20,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
@@ -94,7 +95,7 @@ class PublicRequestGuard:
             headers.setdefault(key.decode("latin-1").lower(), value.decode("latin-1"))
         if not self._authorized(headers):
             await self._reject(scope, send, 401, "AUTHENTICATION_FAILED",
-                               "AUTHENTICATION_FAILED")
+                               "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください")
             return
         limit = max_request_bytes(self.state.settings)
         declared = headers.get("content-length")
@@ -162,8 +163,13 @@ def make_management_app(state: AppState) -> FastAPI:
         # failing leaves no trace anywhere the user can reach.
         LOGGER.error("Management request failed: %s %s", request.method, request.url.path,
                      exc_info=exc)
+        # `message` is what the GUI shows the user, so it stays a fixed Japanese
+        # sentence rather than an English exception class name; the class name is
+        # kept in `detail` for support/log correlation.
         return JSONResponse(status_code=500, content={"error": {
-            "code": "INTERNAL_ERROR", "message": type(exc).__name__}})
+            "code": "INTERNAL_ERROR",
+            "message": "内部エラーが発生しました。しばらくしてからもう一度お試しください",
+            "detail": type(exc).__name__}})
 
     return app
 
@@ -181,7 +187,7 @@ def make_public_app(state: AppState) -> FastAPI:
         if detail.get("code") or detail.get("parameters"):
             LOGGER.warning("OpenAI request rejected: code=%s parameters=%s path=%s",
                            detail.get("code"), detail.get("parameters"), request.url.path)
-        error = {"message": detail.get("message") or detail.get("code") or "Request failed",
+        error = {"message": detail.get("message") or detail.get("code") or "リクエストを処理できませんでした",
                  "type": detail.get("type", "invalid_request_error"),
                  "param": detail.get("param"), "code": detail.get("code")}
         if detail.get("parameters") is not None:
@@ -190,13 +196,36 @@ def make_public_app(state: AppState) -> FastAPI:
             error["retryable"] = detail["retryable"]
         return JSONResponse(status_code=exc.status_code, content={"error": error}, headers=exc.headers)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def openai_routing_error(request: Request, exc: StarletteHTTPException):
+        # Routing failures (unknown path, wrong method) raise Starlette's bare
+        # HTTPException, which the handler above -- keyed on fastapi.HTTPException
+        # -- does not see. Without this an OpenAI client probing an unsupported
+        # path gets `{"detail": "Not Found"}` and reports a parser error instead
+        # of a useful message.
+        if isinstance(exc, HTTPException):
+            return await openai_http_error(request, exc)
+        api_log = getattr(request.state, "api_log", None)
+        if isinstance(api_log, dict):
+            api_log["error_code"] = f"HTTP_{exc.status_code}"
+        messages = {404: "そのエンドポイントはありません。/v1/chat/completions を使用してください",
+                    405: "そのHTTPメソッドには対応していません"}
+        fallback = (str(exc.detail) if exc.detail else None) or "リクエストを処理できませんでした"
+        return JSONResponse(status_code=exc.status_code, content={"error": {
+            "message": messages.get(exc.status_code, fallback),
+            "type": "invalid_request_error", "param": None,
+            "code": f"HTTP_{exc.status_code}"}}, headers=getattr(exc, "headers", None))
+
     @app.exception_handler(RequestValidationError)
     async def openai_validation_error(_request: Request, exc: RequestValidationError):
         first = exc.errors()[0] if exc.errors() else {}
         location = first.get("loc", ())
         parameter = ".".join(str(item) for item in location if item != "body") or None
+        # `message` is user-facing (the GUI shows it verbatim); keep it a fixed
+        # Japanese sentence and carry pydantic's own English text in `detail`.
         return JSONResponse(status_code=422, content={"error": {
-            "message": first.get("msg", "Invalid request body"),
+            "message": "リクエスト本文が不正です",
+            "detail": first.get("msg", "Invalid request body"),
             "type": "invalid_request_error", "param": parameter, "code": "INVALID_REQUEST",
         }})
 

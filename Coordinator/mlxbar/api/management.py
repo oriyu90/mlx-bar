@@ -94,7 +94,7 @@ async def scan(request: Request):
 async def probe(model_id: str, request: Request):
     model = state(request).database.get_model(model_id)
     if not model:
-        raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND"})
+        raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND", "message": "指定されたモデルが見つかりません。モデル一覧を再スキャンしてください"})
     return {"compatible": model["format"] != "unknown", "model": model,
             "requiresRemoteCode": False}
 
@@ -147,7 +147,7 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
     app = state(request)
     model = app.database.get_model(model_id)
     if not model:
-        raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND"})
+        raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND", "message": "指定されたモデルが見つかりません。モデル一覧を再スキャンしてください"})
     _raise_if_generations_in_flight(app, bool(body.get("force", False)), "モデルを切り替え")
     try:
         loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None)
@@ -242,7 +242,7 @@ async def runtimes(request: Request):
 @router.post("/runtimes/{engine}/check")
 async def runtime_check(engine: str, request: Request):
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     try:
         result = await state(request).updater.check(engine)
         result["checkedAt"] = time.time()
@@ -256,14 +256,14 @@ async def runtime_check(engine: str, request: Request):
 async def runtime_update(engine: str, request: Request):
     app = state(request)
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     return app.runtime_update_job(engine)
 
 
 @router.get("/runtimes/{engine}/history")
 async def runtime_history(engine: str, request: Request):
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     return {"data": state(request).database.list_runtime_history(engine, 50)}
 
 
@@ -271,7 +271,7 @@ async def runtime_history(engine: str, request: Request):
 async def runtime_stage(engine: str, request: Request, body: dict = Body(default_factory=dict)):
     app = state(request)
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     async def work(update):
         result = await app.updater.stage(engine, update, body.get("version"), body.get("gitRef"))
         app.database.add_runtime_history(engine, result["slotId"], "staged", {
@@ -285,7 +285,7 @@ async def runtime_stage(engine: str, request: Request, body: dict = Body(default
 async def runtime_delete_slot(engine: str, slot_id: str, request: Request):
     app = state(request)
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     if engine in app.database.list_active_runtime_jobs():
         raise HTTPException(409, detail={"code": "ENGINE_BUSY",
                                          "message": "ランタイム更新中はslotを削除できません"})
@@ -301,10 +301,10 @@ async def runtime_delete_slot(engine: str, slot_id: str, request: Request):
 async def runtime_cancel_job(engine: str, job_id: str, request: Request):
     app = state(request)
     if engine not in {"mlx-lm", "mlx-vlm"}:
-        raise HTTPException(400, detail={"code": "INVALID_ENGINE"})
+        raise HTTPException(400, detail={"code": "INVALID_ENGINE", "message": "エンジンは mlx-lm または mlx-vlm を指定してください"})
     job = app.database.get_job(job_id)
     if not job or job.get("kind") not in {f"runtime_update:{engine}", f"runtime_stage:{engine}"}:
-        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND"})
+        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND", "message": "指定されたジョブが見つかりません"})
     result = await app.jobs.cancel(job_id)
     return result
 
@@ -433,7 +433,7 @@ async def suggest_listener(request: Request):
 async def get_job(job_id: str, request: Request):
     job = state(request).database.get_job(job_id)
     if not job:
-        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND"})
+        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND", "message": "指定されたジョブが見つかりません"})
     return job
 
 
