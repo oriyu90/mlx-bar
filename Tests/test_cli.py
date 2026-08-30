@@ -72,6 +72,150 @@ class RuntimeCancelJobTests(unittest.TestCase):
         self.assertFalse(result["cancelled"])
 
 
+class CLIParityTests(unittest.TestCase):
+    """Every GUI mutation must be reachable from mlxbarctl (v1.8.1)."""
+
+    def test_unload_all_forwards_force(self):
+        client = Mock()
+        client.request.return_value = response({"state": "unloaded"})
+        args = argparse.Namespace(command="model", action="unload", model_id=None, force=True)
+        execute(args, client)
+        client.request.assert_called_once_with("DELETE", "/api/v1/models/loaded?force=true")
+
+    def test_unload_all_without_force_is_unchanged(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="model", action="unload", model_id=None, force=False)
+        execute(args, client)
+        client.request.assert_called_once_with("DELETE", "/api/v1/models/loaded")
+
+    def test_set_replicas_updates_existing_profile_without_loading(self):
+        client = Mock()
+        client.request.side_effect = [
+            response({"models": {"pool": {"profiles": [{"modelId": "m1", "keepLoaded": True}]}}}),
+            response({}),
+        ]
+        args = argparse.Namespace(command="model", action="set-replicas", model_id="m1", count=3)
+        execute(args, client)
+        self.assertEqual(client.request.call_count, 2)  # GET + PUT, never a load
+        method, path, body = client.request.call_args_list[1][0]
+        self.assertEqual((method, path), ("PUT", "/api/v1/settings"))
+        self.assertEqual(body["models"]["pool"]["profiles"][0]["replicas"], 3)
+
+    def test_set_replicas_pins_an_unpinned_model(self):
+        client = Mock()
+        client.request.side_effect = [
+            response({"models": {"pool": {"profiles": []}}}),
+            response({}),
+        ]
+        args = argparse.Namespace(command="model", action="set-replicas", model_id="new", count=2)
+        execute(args, client)
+        _, _, body = client.request.call_args_list[1][0]
+        self.assertEqual(body["models"]["pool"]["profiles"],
+                         [{"modelId": "new", "keepLoaded": True, "replicas": 2}])
+
+    def test_set_replicas_rejects_out_of_range(self):
+        client = Mock()
+        args = argparse.Namespace(command="model", action="set-replicas", model_id="m1", count=9)
+        with self.assertRaises(ValueError):
+            execute(args, client)
+        client.request.assert_not_called()
+
+    def test_prompt_cache_actions_hit_the_right_endpoints(self):
+        for action, expected in (
+            ("status", ("GET", "/api/v1/prompt-cache")),
+            ("clear-memory", ("POST", "/api/v1/prompt-cache/memory/clear")),
+            ("clear-disk", ("POST", "/api/v1/prompt-cache/disk/clear")),
+        ):
+            client = Mock()
+            client.request.return_value = response({})
+            args = argparse.Namespace(command="prompt-cache", action=action)
+            execute(args, client)
+            client.request.assert_called_once_with(*expected)
+
+    def test_prompt_cache_set_builds_a_partial_patch(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="prompt-cache", action="set",
+                                  disk_enabled="false", max_gb=None)
+        execute(args, client)
+        client.request.assert_called_once_with(
+            "PUT", "/api/v1/settings", {"promptCache": {"diskEnabled": False}})
+
+    def test_prompt_cache_set_rejects_bad_size_and_empty(self):
+        client = Mock()
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(command="prompt-cache", action="set",
+                                       disk_enabled=None, max_gb=200), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(command="prompt-cache", action="set",
+                                       disk_enabled=None, max_gb=None), client)
+        client.request.assert_not_called()
+
+    def test_set_model_pool_only_sends_provided_options(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="config", action="set-model-pool",
+                                  enabled="true", max_resident=3, idle_ttl_seconds=None,
+                                  per_model_gb=None, total_memory_percent=80,
+                                  system_reserve_gb=None, generation_concurrency=None,
+                                  max_replicas_per_model=4)
+        execute(args, client)
+        _, path, body = client.request.call_args[0]
+        self.assertEqual(path, "/api/v1/settings")
+        self.assertEqual(body, {"models": {"pool": {
+            "enabled": True, "maxResidentModels": 3,
+            "totalMemoryRatio": 0.8, "maxReplicasPerModel": 4}}})
+
+    def test_set_model_pool_rejects_out_of_range_and_empty(self):
+        client = Mock()
+        base = dict(command="config", action="set-model-pool", enabled=None, max_resident=None,
+                    idle_ttl_seconds=None, per_model_gb=None, total_memory_percent=None,
+                    system_reserve_gb=None, generation_concurrency=None, max_replicas_per_model=None)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**{**base, "generation_concurrency": 99}), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**base), client)
+        client.request.assert_not_called()
+
+    def test_set_flag_maps_names_to_dotted_keys(self):
+        cases = {
+            "auto-load-on-api": {"models": {"autoLoadOnAPIRequest": True}},
+            "anthropic-api": {"api": {"anthropic": {"enabled": False}}},
+            "remote-image-urls": {"security": {"allowRemoteImageUrls": True}},
+            "require-token": {"api": {"requireToken": False}},
+            "continue-after-gui-exit": {"general": {"continueAfterGUIExit": True}},
+        }
+        for name, expected in cases.items():
+            value = "true" if True in _flatten(expected) else "false"
+            client = Mock()
+            client.request.return_value = response({})
+            execute(argparse.Namespace(command="config", action="set-flag",
+                                       name=name, value=value), client)
+            client.request.assert_called_once_with("PUT", "/api/v1/settings", expected)
+
+    def test_lmstudio_base_url_and_auto_load(self):
+        client = Mock()
+        client.request.return_value = response({})
+        execute(argparse.Namespace(command="lmstudio", action="set-base-url",
+                                   url="http://127.0.0.1:1234"), client)
+        client.request.assert_called_once_with(
+            "PUT", "/api/v1/settings", {"models": {"lmStudio": {"baseUrl": "http://127.0.0.1:1234"}}})
+        client = Mock()
+        client.request.return_value = response({})
+        execute(argparse.Namespace(command="lmstudio", action="set-auto-load", value="false"), client)
+        client.request.assert_called_once_with(
+            "PUT", "/api/v1/settings", {"models": {"lmStudio": {"autoLoad": False}}})
+
+
+def _flatten(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _flatten(item)
+    else:
+        yield value
+
+
 class RemoveAllDataTests(unittest.TestCase):
     def test_without_yes_never_calls_client(self):
         client = Mock()

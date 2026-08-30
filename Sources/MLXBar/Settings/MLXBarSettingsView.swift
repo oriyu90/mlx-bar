@@ -315,7 +315,7 @@ struct ModelSourceSettingsView: View {
                                         pinnedModelReplicas[item.id] = value
                                         Task { await model.setModelReplicas(item.id, replicas: value) }
                                     }),
-                                in: 1...maxReplicasPerModel)
+                                in: 1...max(1, maxReplicasPerModel))
                             .font(.caption)
                             .padding(.leading, 20)
                     }
@@ -426,9 +426,11 @@ struct ModelSourceSettingsView: View {
             pinnedModelIds = Set(profiles
                 .filter { ($0["keepLoaded"] as? Bool) ?? false }
                 .compactMap { $0["modelId"] as? String })
-            pinnedModelReplicas = Dictionary(uniqueKeysWithValues: profiles.compactMap { profile in
-                (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
-            })
+            pinnedModelReplicas = Dictionary(
+                profiles.compactMap { profile in
+                    (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
+                },
+                uniquingKeysWith: { first, _ in first })
         }
         }
     }

@@ -2,6 +2,35 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.8.1] - 2026-08-30
+
+### 追加
+
+- **GUI の全操作を `mlxbarctl` から実行可能に。** GUI に露出していて CLI に名前付きコマンドが無かった操作へ、追加のみでコマンドを用意しました。既存コマンドの挙動は不変です。
+  - `mlxbarctl prompt-cache status` / `clear-memory` / `clear-disk` / `set --disk-enabled {true,false} --max-gb N`（`GET /prompt-cache`、`POST /prompt-cache/{memory,disk}/clear`、`PUT /settings promptCache.*`）
+  - `mlxbarctl config set-model-pool --enabled … --max-resident … --idle-ttl-seconds … --per-model-gb … --total-memory-percent … --system-reserve-gb … --generation-concurrency … --max-replicas-per-model …`（複数モデル常駐フォーム。指定したオプションだけの部分パッチで `profiles` は保持）
+  - `mlxbarctl config set-flag <name> {true,false}` — `auto-load-on-api` / `anthropic-api` / `remote-image-urls` / `require-token` / `continue-after-gui-exit`
+  - `mlxbarctl model set-replicas <id> <count>` — pin 済みモデルの `replicas` だけ変更（`model pin --replicas` と違い再ロードを起こさない）
+  - `mlxbarctl lmstudio set-base-url <url>` / `set-auto-load {true,false}`
+- `mlxbarctl model unload --force`：モデル ID を省略した全解放でも `--force` を `DELETE /api/v1/models/loaded?force=true` へ転送します（従来は無視されていました）。フラグなしの `model unload` は不変です。
+- 汎用 `mlxbarctl config set <dotted.key> <json-value>` は引き続きエスケープハッチとして利用できます。
+
+### 修正
+
+- Anthropic ストリームの `message_delta.usage` に実 `input_tokens`（Worker のトークナイザ計測）を載せます。`message_start` は生成前の概算のまま、`message_delta` で実数へ補正されます。`metrics` イベントの `prompt_tokens` も採用するため、`usage` イベントを出さないランタイム（mlx_vlm、mlx_lm のフォールバック経路）でも補正されます。
+- ランタイムがトークン数を計測できないときの `count_tokens` 応答を HTTP 503 + `error.type: "api_error"` に統一しました（従来は `invalid_request_error`）。
+- 設定画面のレプリカ Stepper を `1...max(1, maxReplicasPerModel)` で構築し、pin プロファイルの読み込みを `Dictionary(_:uniquingKeysWith:)` に変更。手で壊した設定ファイルでも設定画面がクラッシュしません。
+
+### 安全性と互換性
+
+- 管理 API・OpenAI 互換・Anthropic 互換の各ハンドラは 1 行も変更していません。`/v1/models` ルーティング・128 tools 上限・bearer 認証・両エラー JSON 形は不変。設定 schema は version 1 のまま。
+- `cli.py` の変更は追加のみ。`replicas==1` / `generationConcurrency==1` / `models.pool.enabled=false` の不変条件は v1.8.0 のまま。
+
+### 検証
+
+- Python 回帰テスト 360 件が成功（v1.8.0 の 346 + 新規 14：CLI 12・Anthropic 2）。Swift Debug / Release ビルド成功。`build-release.sh` + `verify-release.sh` 成功。
+- 設計根拠は `DESIGN_v1.8.1.md`、検証手順は `TEST_PLAN_v1.8.1.md`。実機の同一モデル並列・Claude Code 実接続は v1.8.0 から未消化（本リリースの影響を受けません）。
+
 ## [1.8.0] - 2026-08-30
 
 ### 追加

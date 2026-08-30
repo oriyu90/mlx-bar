@@ -61,6 +61,21 @@
 - **`count_tokens`はWorker RPC。** `BaseAdapter.count_tokens`既定は`NotImplementedError`→worker `/rpc`が501 `COUNT_TOKENS_UNAVAILABLE`。`ModelPoolSupervisor.count_tokens`が`getattr`ガードで古いランタイムを`COUNT_TOKENS_UNAVAILABLE`へ。概算を「正確な値」として返さない。未常駐時は`_ensure_requested_model`でautoload（`autoLoadOnAPIRequest`準拠）。
 - **新しい`MLXBarError` codeを足したら`Sources/MLXBar/Services/ErrorText.swift`と`anthropic_stream._anthropic_error_type`の両方に追加すること。**
 
+## v1.8.1で守ること（GUI操作のCLI完全対応）
+
+- **`cli.py`の変更は追加のみ。** GUIの全ミューテーション（`MenuBarViewModel`の44メソッド＋設定画面のトグル）は管理APIを叩く。CLIも同じAPIを叩く。v1.8.1で「名前付きコマンドが無かった」ぶんを埋めた：`prompt-cache {status,clear-memory,clear-disk,set}`、`config set-model-pool`、`config set-flag`、`model set-replicas`、`lmstudio {set-base-url,set-auto-load}`、`model unload --force`の全解放パスへの転送。**必要なエンドポイントはすべて既存**——管理API/openai_compat/anthropic_compatのハンドラは1行も変更していない。
+- **`model unload`（フラグなし・model_id省略）は`DELETE /api/v1/models/loaded`のまま。** `--force`を渡したときだけ`?force=true`を付ける（`--force`引数自体はv1.7.1から定義済み、no-argパスで無視されていたのを転送しただけ）。`test_cli::test_unload_all_without_force_is_unchanged`で固定。
+- **`config set-model-pool` / `prompt-cache set`は部分パッチ。** 指定されたフラグのぶんだけ送る。`models.pool.profiles`や他の`promptCache`キーは送らないのでdeep-mergeで保持される（GUIの`setModelPoolSettings`/`setPromptCacheSettings`と同じ）。空指定と範囲外はクライアント側で`ValueError`（サーバ`_validate`が最終権威なのは不変）。
+- **`config set-flag`の名前マップは5個だけ**（`auto-load-on-api` / `anthropic-api` / `remote-image-urls` / `require-token` / `continue-after-gui-exit`）。増やすときは`execute()`の`keys`辞書と`parser()`の`choices`を両方。汎用`config set <dotted.key> <json>`は`nested_patch`経由でGUI非露出キーにも届くエスケープハッチとして残す。
+- **`model set-replicas`はロードを起こさない**（`model pin --replicas`はpin後に即ロードする）。GET settings → profiles更新（未pinなら`keepLoaded:true`で追加）→ PUT のみ。GUIの`setModelReplicas`と挙動を一致させている。
+- **`SMAppService`（ログイン項目登録）はSwift専用のまま**（`## CLIとGUIの機能パリティにおけるOS API境界`）。`config set-launch-at-login`は設定値だけ、実登録はGUIが次回起動時にreconcileする。READMEの「GUI ↔ CLI 対応」表にこの1点だけ例外と明記。
+
+### v1.8.0レビューの3件修正（v1.8.1同梱）
+
+- **Anthropicストリームのinput token数**（`anthropic_stream.py`、追加のみ）: `handle()`/`stream_events()`の`metrics`分岐でも`prompt_tokens`を採用（実Workerは`usage`イベントを出さず`metrics`にだけ載せる）。`message_delta.usage`に`input_tokens`を含める。`message_start`は生成前概算のまま。
+- **`COUNT_TOKENS_UNAVAILABLE`**: `_anthropic_error_type`で`invalid_request_error`→`api_error`（HTTP 503と整合）。
+- **Swift設定画面**: `Stepper(in: 1...max(1, maxReplicasPerModel))`、pinプロファイル読み込みを`Dictionary(_:uniquingKeysWith:)`に。壊れたconfigでクラッシュしない。
+
 ## 未解決の課題
 
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）

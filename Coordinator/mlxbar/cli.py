@@ -66,6 +66,9 @@ def parser() -> argparse.ArgumentParser:
     pin.add_argument("--replicas", type=int, default=None,
                      help="同一モデルを並列生成用に複数常駐させる数（1〜8、要 models.pool.enabled）")
     unpin = model.add_parser("unpin"); unpin.add_argument("model_id")
+    set_replicas = model.add_parser(
+        "set-replicas", help="pin済みモデルの並列数（replicas）だけ変更（再ロードしない）")
+    set_replicas.add_argument("model_id"); set_replicas.add_argument("count", type=int)
     add_folder = model.add_parser("add-folder"); add_folder.add_argument("path")
     remove_folder = model.add_parser("remove-folder"); remove_folder.add_argument("path")
     gen = sub.add_parser("generate"); gen.add_argument("--prompt", required=True); gen.add_argument("--image", action="append", default=[])
@@ -87,6 +90,20 @@ def parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config").add_subparsers(dest="action", required=True)
     config.add_parser("get")
     set_cmd = config.add_parser("set"); set_cmd.add_argument("key"); set_cmd.add_argument("value")
+    set_pool = config.add_parser(
+        "set-model-pool", help="複数モデル常駐の設定（指定したオプションだけ変更）")
+    set_pool.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_pool.add_argument("--max-resident", type=int, default=None)
+    set_pool.add_argument("--idle-ttl-seconds", type=int, default=None)
+    set_pool.add_argument("--per-model-gb", type=int, default=None)
+    set_pool.add_argument("--total-memory-percent", type=int, default=None)
+    set_pool.add_argument("--system-reserve-gb", type=int, default=None)
+    set_pool.add_argument("--generation-concurrency", type=int, default=None)
+    set_pool.add_argument("--max-replicas-per-model", type=int, default=None)
+    set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
+    set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
+                                           "require-token", "continue-after-gui-exit"])
+    set_flag.add_argument("value", choices=["true", "false"])
     set_language = config.add_parser("set-language"); set_language.add_argument("language", choices=["en", "ja"])
     set_max_tokens = config.add_parser("set-max-tokens"); set_max_tokens.add_argument("value", type=int)
     set_queue = config.add_parser("set-queue-limits")
@@ -116,6 +133,16 @@ def parser() -> argparse.ArgumentParser:
     set_port = network.add_parser("set-port"); set_port.add_argument("port", type=int)
     api = sub.add_parser("api").add_subparsers(dest="action", required=True)
     test = api.add_parser("test-port"); test.add_argument("port", type=int)
+    pcache = sub.add_parser("prompt-cache").add_subparsers(dest="action", required=True)
+    pcache.add_parser("status")
+    pcache.add_parser("clear-memory")
+    pcache.add_parser("clear-disk")
+    pcache_set = pcache.add_parser("set", help="永続（ディスク）プロンプトキャッシュの設定")
+    pcache_set.add_argument("--disk-enabled", choices=["true", "false"], default=None)
+    pcache_set.add_argument("--max-gb", type=int, default=None)
+    lmstudio = sub.add_parser("lmstudio").add_subparsers(dest="action", required=True)
+    lm_base = lmstudio.add_parser("set-base-url"); lm_base.add_argument("url")
+    lm_auto = lmstudio.add_parser("set-auto-load"); lm_auto.add_argument("value", choices=["true", "false"])
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
@@ -151,7 +178,11 @@ def execute(args, client: Client):
                 if args.force:
                     path += "?force=true"
                 return client.request("POST", path).json()
-            return client.request("DELETE", "/api/v1/models/loaded").json()
+            # `--force` also applies to the all-models unload (matches the GUI's
+            # "unload anyway" path); without it the coordinator refuses while a
+            # generation is in flight.
+            path = "/api/v1/models/loaded" + ("?force=true" if args.force else "")
+            return client.request("DELETE", path).json()
         if args.action == "resident":
             status = client.request("GET", "/api/v1/status").json()
             pool = status.get("modelPool", {})
@@ -192,6 +223,26 @@ def execute(args, client: Client):
                 except Exception as exc:  # noqa: BLE001 - report, do not abort the pin
                     result["loadError"] = str(exc)
             return result
+        if args.action == "set-replicas":
+            if not 1 <= args.count <= 8:
+                raise ValueError("並列数（replicas）は1〜8で指定してください")
+            settings = client.request("GET", "/api/v1/settings").json()
+            pool = settings.get("models", {}).get("pool", {})
+            profiles = [dict(item) for item in pool.get("profiles", [])]
+            matched = False
+            for profile in profiles:
+                if profile.get("modelId") == args.model_id:
+                    profile["replicas"] = args.count
+                    matched = True
+            if not matched:
+                # Mirror the GUI: an unpinned model gets pinned as it gains a
+                # replica count (replicas only apply to a resident model).
+                profiles.append({"modelId": args.model_id, "keepLoaded": True,
+                                 "replicas": args.count})
+            client.request("PUT", "/api/v1/settings",
+                           {"models": {"pool": {"profiles": profiles}}})
+            return {"profiles": profiles,
+                    "note": "並列数の変更は次回サービス起動時、またはreaperによる補充時に反映されます"}
         if args.action == "add-folder":
             roots = client.request("GET", "/api/v1/settings").json().get("models", {}).get("roots", [])
             if args.path not in roots: roots.append(args.path)
@@ -242,6 +293,49 @@ def execute(args, client: Client):
             return client.request("POST", f"/api/v1/runtimes/{args.engine}/jobs/{job['id']}/cancel").json()
     if args.command == "config":
         if args.action == "get": return client.request("GET", "/api/v1/settings").json()
+        if args.action == "set-model-pool":
+            pool: dict = {}
+            if args.enabled is not None:
+                pool["enabled"] = args.enabled == "true"
+            if args.max_resident is not None:
+                if not 1 <= args.max_resident <= 8:
+                    raise ValueError("最大常駐モデル数は1〜8で指定してください")
+                pool["maxResidentModels"] = args.max_resident
+            if args.idle_ttl_seconds is not None:
+                if not 30 <= args.idle_ttl_seconds <= 86400:
+                    raise ValueError("非固定モデルの待機時間は30〜86,400秒で指定してください")
+                pool["idleTTLSeconds"] = args.idle_ttl_seconds
+            if args.per_model_gb is not None:
+                if not 1 <= args.per_model_gb <= 512:
+                    raise ValueError("モデルごとの上限は1〜512 GBで指定してください")
+                pool["defaultPerModelMaxGB"] = args.per_model_gb
+            if args.total_memory_percent is not None:
+                if not 50 <= args.total_memory_percent <= 90:
+                    raise ValueError("全体メモリ上限は50〜90%で指定してください")
+                pool["totalMemoryRatio"] = args.total_memory_percent / 100
+            if args.system_reserve_gb is not None:
+                if not 1 <= args.system_reserve_gb <= 128:
+                    raise ValueError("システム用に残すメモリは1〜128 GBで指定してください")
+                pool["minimumSystemReserveGB"] = args.system_reserve_gb
+            if args.generation_concurrency is not None:
+                if not 1 <= args.generation_concurrency <= 8:
+                    raise ValueError("同時生成の上限は1〜8で指定してください")
+                pool["generationConcurrency"] = args.generation_concurrency
+            if args.max_replicas_per_model is not None:
+                if not 1 <= args.max_replicas_per_model <= 8:
+                    raise ValueError("モデルごとの並列数上限は1〜8で指定してください")
+                pool["maxReplicasPerModel"] = args.max_replicas_per_model
+            if not pool:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"models": {"pool": pool}}).json()
+        if args.action == "set-flag":
+            keys = {"auto-load-on-api": "models.autoLoadOnAPIRequest",
+                    "anthropic-api": "api.anthropic.enabled",
+                    "remote-image-urls": "security.allowRemoteImageUrls",
+                    "require-token": "api.requireToken",
+                    "continue-after-gui-exit": "general.continueAfterGUIExit"}
+            return client.request("PUT", "/api/v1/settings",
+                                  nested_patch(keys[args.name], args.value)).json()
         if args.action == "set-language":
             return client.request("PUT", "/api/v1/settings", {"general": {"language": args.language}}).json()
         if args.action == "set-max-tokens":
@@ -298,6 +392,30 @@ def execute(args, client: Client):
                 return result
             return client.request("PUT", "/api/v1/settings", {"api": {"port": args.port}}).json()
     if args.command == "api": return client.request("POST", "/api/v1/settings/api-listener/test", {"port": args.port}).json()
+    if args.command == "prompt-cache":
+        if args.action == "status": return client.request("GET", "/api/v1/prompt-cache").json()
+        if args.action == "clear-memory":
+            return client.request("POST", "/api/v1/prompt-cache/memory/clear").json()
+        if args.action == "clear-disk":
+            return client.request("POST", "/api/v1/prompt-cache/disk/clear").json()
+        if args.action == "set":
+            patch: dict = {}
+            if args.disk_enabled is not None:
+                patch["diskEnabled"] = args.disk_enabled == "true"
+            if args.max_gb is not None:
+                if not 1 <= args.max_gb <= 100:
+                    raise ValueError("ディスクキャッシュ上限は1〜100 GBで指定してください")
+                patch["diskMaxGB"] = args.max_gb
+            if not patch:
+                raise ValueError("--disk-enabled または --max-gb を指定してください")
+            return client.request("PUT", "/api/v1/settings", {"promptCache": patch}).json()
+    if args.command == "lmstudio":
+        if args.action == "set-base-url":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"lmStudio": {"baseUrl": args.url}}}).json()
+        if args.action == "set-auto-load":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"lmStudio": {"autoLoad": args.value == "true"}}}).json()
     if args.command == "diagnostics": return client.request("GET", "/api/v1/diagnostics").json()
     if args.command == "remove-all-data": return remove_all_data(args, client)
 

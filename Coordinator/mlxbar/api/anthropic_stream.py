@@ -119,6 +119,12 @@ class AnthropicMessageBuilder:
             if isinstance(completion, int) and completion >= 0:
                 self._reported_output_tokens = completion
         elif kind == "metrics":
+            # The real worker sends prompt/completion counts on `metrics`
+            # (mlx_vlm and the mlx_lm fallback path never send a separate
+            # `usage` event), so correct the input-token estimate here too.
+            prompt = event.get("prompt_tokens")
+            if isinstance(prompt, int) and prompt > 0:
+                self.input_tokens = prompt
             completion = event.get("completion_tokens")
             if isinstance(completion, int) and completion >= 0:
                 self._reported_output_tokens = completion
@@ -260,7 +266,11 @@ class AnthropicMessageBuilder:
             out.append({"type": "message_delta",
                         "delta": {"stop_reason": self.stop_reason or "end_turn",
                                   "stop_sequence": self.stop_sequence},
-                        "usage": {"output_tokens": self.output_tokens}})
+                        # Anthropic's message_delta carries cumulative usage;
+                        # include input_tokens so a streaming client sees the
+                        # real prompt count (message_start only had the estimate).
+                        "usage": {"input_tokens": self.input_tokens,
+                                  "output_tokens": self.output_tokens}})
             out.append({"type": "message_stop"})
             return out
         if kind == "error":
@@ -285,7 +295,9 @@ def _anthropic_error_type(code: str | None) -> str:
         "INPUT_TOO_LARGE": "invalid_request_error",
         "INVALID_REQUEST": "invalid_request_error",
         "UNSUPPORTED_PARAMETER": "invalid_request_error",
-        "COUNT_TOKENS_UNAVAILABLE": "invalid_request_error",
+        # A runtime that cannot count tokens is a capability limitation, not a
+        # bad request: pair it with the 503 the endpoint already returns.
+        "COUNT_TOKENS_UNAVAILABLE": "api_error",
     }
     return mapping.get(code or "", "api_error")
 
