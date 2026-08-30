@@ -188,6 +188,39 @@ def test_streaming_event_sequence_has_no_done_and_ends_with_message_stop():
         assert types[-2:] == ["message_delta", "message_stop"]
 
 
+def test_streaming_message_delta_reports_the_real_input_token_count():
+    """message_start carries an estimate; message_delta must carry the real
+    prompt-token count once the worker reports it (v1.8.1)."""
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_client(Path(directory))
+        response = client.post("/anthropic/v1/messages", json=body(stream=True),
+                               headers=VERSION_HEADER)
+        frames = _events(response.text)
+        delta = next(f for f in frames if f["type"] == "message_delta")
+        assert delta["usage"]["input_tokens"] == 11  # from the worker's usage event
+        assert delta["usage"]["output_tokens"] >= 1
+
+
+def test_metrics_only_worker_still_corrects_input_tokens():
+    """mlx_vlm and the mlx_lm fallback path emit prompt_tokens on `metrics`,
+    not a separate `usage` event -- the builder must honour both."""
+    class MetricsWorker(FakeWorker):
+        def __init__(self):
+            super().__init__()
+            self.script = [
+                {"type": "delta", "text": "hi"},
+                {"type": "metrics", "prompt_tokens": 23, "completion_tokens": 1,
+                 "finish_reason": "stop"},
+                {"type": "completed", "finish_reason": "stop"},
+            ]
+
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_client(Path(directory), worker=MetricsWorker())
+        payload = client.post("/anthropic/v1/messages", json=body(),
+                              headers=VERSION_HEADER).json()
+        assert payload["usage"]["input_tokens"] == 23
+
+
 def test_streaming_tool_use_uses_input_json_delta_and_tool_use_stop_reason():
     class ToolWorker(FakeWorker):
         def __init__(self):

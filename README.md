@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.8.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.8.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -43,7 +43,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.8.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.8.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -133,7 +133,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -218,13 +218,26 @@ mlxbarctl runtime activate mlx-lm SLOT_ID
 mlxbarctl runtime rollback mlx-lm
 mlxbarctl runtime delete-slot mlx-lm SLOT_ID
 mlxbarctl runtime cancel-job mlx-lm
+mlxbarctl model pin MODEL_ID --replicas 2       # 常駐指定 ＋ 並列数（初回は即ロード）
+mlxbarctl model set-replicas MODEL_ID 3          # pin 済みモデルの並列数だけ変更（再ロードなし）
+mlxbarctl model unload --force                   # 全解放（生成中でも強制）
 mlxbarctl config get
-mlxbarctl config set api.port 12000
+mlxbarctl config set api.port 12000              # 汎用: 任意の設定キーへ JSON 値を書き込み
 mlxbarctl config set-language ja
 mlxbarctl config set-max-tokens 8192
 mlxbarctl config set-queue-limits --max-queued 16 --timeout-seconds 3600
 mlxbarctl config set-sampling-defaults --temperature 0.7 --top-p 1.0 --repetition-penalty 1.0 --repetition-context-size 20
-mlxbarctl config set-launch-at-login true  # デスクトップのGUIが次に起動したときにOS登録へ反映されます
+mlxbarctl config set-model-pool --enabled true --max-resident 3 --idle-ttl-seconds 900 \
+  --per-model-gb 32 --total-memory-percent 75 --system-reserve-gb 4 \
+  --generation-concurrency 2 --max-replicas-per-model 2   # 指定したオプションだけ変更
+mlxbarctl config set-flag auto-load-on-api true  # 他: anthropic-api / remote-image-urls / require-token / continue-after-gui-exit
+mlxbarctl config set-launch-at-login true        # デスクトップのGUIが次に起動したときにOS登録へ反映されます
+mlxbarctl prompt-cache status
+mlxbarctl prompt-cache set --disk-enabled true --max-gb 10
+mlxbarctl prompt-cache clear-memory
+mlxbarctl prompt-cache clear-disk
+mlxbarctl lmstudio set-base-url http://127.0.0.1:1234
+mlxbarctl lmstudio set-auto-load true
 mlxbarctl secrets get-api-token
 mlxbarctl secrets regenerate-api-token
 mlxbarctl secrets set-lmstudio-token TOKEN
@@ -241,7 +254,27 @@ mlxbarctl remove-all-data --yes  # 設定・APIキー・モデルDB・ランタ�
 
 終了コードは、0=成功、2=入力不正、3=未起動、4=競合、5=互換性なし、6=更新失敗、7=認証失敗、8=内部エラーです。
 
-GUIで操作できることはほぼすべて`mlxbarctl`からも操作できます。唯一「ログイン時に起動」だけは、macOSのログイン項目登録API(`SMAppService`)がSwift専用のためCLIから直接は変更できず、CLIは設定値だけを変更します。実際のOS登録は、次にGUIアプリが起動または設定を再取得したタイミングで反映されます。
+### GUI ↔ CLI 対応（v1.8.1）
+
+GUIで操作できることは**すべて**`mlxbarctl`から操作できます。GUIの各画面と対応するコマンドは次のとおりです。
+
+| GUI | CLI |
+|---|---|
+| モデル画面（ロード / アンロード / スキャン / probe） | `model load` / `model unload [MODEL_ID] [--force]` / `model scan` / `model probe` |
+| 設定 > モデル > 常駐させるモデル | `model pin` / `model unpin` / `model set-replicas` / `model resident` |
+| 設定 > モデル > 複数モデル常駐 | `config set-model-pool --…` |
+| 設定 > モデル > Max token上限 / 既定の生成パラメータ / 並列リクエスト | `config set-max-tokens` / `config set-sampling-defaults` / `config set-queue-limits` |
+| 設定 > モデル > 追加フォルダ | `model add-folder` / `model remove-folder` |
+| 設定 > モデル / API > 各種トグル | `config set-flag <name> true|false`（`auto-load-on-api` / `anthropic-api` / `remote-image-urls` / `require-token` / `continue-after-gui-exit`） |
+| 設定 > APIサーバー（ポート / LAN公開 / APIキー） | `network set-port` / `network set-lan` / `secrets set-api-token` / `secrets regenerate-api-token` |
+| 設定 > LM Studio | `lmstudio set-base-url` / `lmstudio set-auto-load` / `secrets set-lmstudio-token` |
+| 設定 > キャッシュ（設定 / 消去 / 状態） | `prompt-cache set` / `prompt-cache clear-memory` / `prompt-cache clear-disk` / `prompt-cache status` |
+| 設定 > 詳細（APIログ） | `logs show` / `logs clear` |
+| 設定 > 一般 > 言語 | `config set-language` |
+| 設定 > 削除（全データ削除） | `remove-all-data --yes` |
+| 上記に無い設定キー | `config set <dotted.key> <json-value>`（汎用） |
+
+唯一「ログイン時に起動」だけは、macOSのログイン項目登録API(`SMAppService`)がSwift専用のためCLIから直接は登録できず、`config set-launch-at-login`は設定値だけを変更します。実際のOS登録は、次にGUIアプリが起動または設定を再取得したタイミングで反映されます。
 
 ## OpenAI互換API
 
@@ -481,7 +514,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.8.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.8.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 
