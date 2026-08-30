@@ -472,11 +472,25 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
     # with ENGINE_BUSY whenever another model is mid-generation. Only the
     # single-resident case is unambiguous; with two or more, fall through to the
     # normal resolve/autoload path below.
+    #
+    # This shortcut only makes sense when the pool cannot usefully hold a
+    # second resident model (maxResidentModels <= 1), or when `requested`
+    # doesn't actually name a distinct known model. Otherwise it silently caps
+    # the pool at exactly one resident forever: every subsequent API-driven
+    # request for a different (real, catalog-known) model would be swallowed
+    # here as an "alias" before ever reaching the autoload path below that
+    # could add a second slot -- so maxResidentModels > 1 would never be
+    # reachable through ordinary sequential API calls.
     list_loaded = getattr(state.workers, "loaded_models", None)
     if callable(list_loaded):
         residents = [item for item in list_loaded() if item]
         if len(residents) == 1:
-            return residents[0]
+            pool_settings_fn = getattr(state.workers, "_pool_settings", None)
+            max_resident = 1
+            if callable(pool_settings_fn):
+                max_resident = int(pool_settings_fn().get("maxResidentModels", 2))
+            if max_resident <= 1 or not _find_model(state, requested):
+                return residents[0]
     if state.database.metadata_value("api_autoload_suspended") == "1":
         raise MLXBarError("MODEL_NOT_LOADED", "モデルは手動で停止されています。MLXBarでモデルをロードしてください", 409)
     lock = getattr(state, "model_autoload_lock", None)

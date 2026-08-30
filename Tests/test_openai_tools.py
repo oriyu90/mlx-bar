@@ -1052,6 +1052,75 @@ def test_real_pool_behind_openai_api_streams_two_models_concurrently():
     asyncio.run(scenario())
 
 
+def test_a_second_distinct_model_actually_loads_when_the_pool_allows_it():
+    """Sequential API calls must be able to reach a second resident model.
+
+    _ensure_requested_model has a shortcut: with exactly one model resident,
+    a request for a name that matches none of the residents is treated as an
+    alias for that sole resident rather than autoloaded, so a caller using a
+    slightly different name for the same model doesn't get ENGINE_BUSY. But
+    if the pool's maxResidentModels allows more than one resident and the
+    requested name is an actual, distinct, catalog-known model, this shortcut
+    must NOT swallow the request -- otherwise the pool can never grow past one
+    resident through ordinary sequential API calls, no matter how high
+    maxResidentModels is configured. Reproduces the mlx-bar issue found via
+    OpenClaw integration testing on 2026-08-30: with one model already
+    resident, requesting a second, different model silently kept answering
+    with the first one, both id-and-content-matched.
+    """
+    from unittest.mock import patch as _patch
+
+    import test_model_pool
+    from mlxbar.workers.model_pool import GIB, ModelPoolSupervisor
+
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.data["api"]["requireToken"] = False
+            store.data["models"]["pool"].update({
+                "enabled": True, "maxResidentModels": 2, "minimumSystemReserveGB": 1,
+                "defaultPerModelMaxGB": 8, "generationConcurrency": 2,
+            })
+            test_model_pool.FakeWorker.instances = []
+            test_model_pool.FakeWorker.load_gate = None
+            database = Database(root / "state.sqlite3")
+            database.replace_models([
+                catalog_model("model-a", "model-a"),
+                catalog_model("model-b", "model-b"),
+            ])
+            with _patch("mlxbar.workers.model_pool.SingleWorkerSupervisor",
+                        test_model_pool.FakeWorker):
+                pool = ModelPoolSupervisor(root, store)
+                pool._physical_memory = lambda: 32 * GIB
+                pool._host_capacity = lambda: (24 * GIB, 1)
+                state = SimpleNamespace(settings=store, workers=pool, database=database,
+                                        model_autoload_lock=asyncio.Lock())
+                transport = httpx.ASGITransport(app=make_public_app(state))
+                try:
+                    async with httpx.AsyncClient(transport=transport,
+                                                 base_url="http://t") as client:
+                        async def ask(name):
+                            body = {"model": name,
+                                    "messages": [{"role": "user", "content": "hi"}]}
+                            response = await client.post("/v1/chat/completions", json=body)
+                            assert response.status_code == 200
+                            return response.json()["model"]
+
+                        # Nothing resident yet: loads model-a. Unambiguous.
+                        assert await ask("model-a") == "model-a"
+                        # Exactly one resident (model-a), but "model-b" names a
+                        # real, distinct, catalog-known model and the pool has
+                        # room for a second resident -- this must load model-b,
+                        # not silently keep answering as model-a.
+                        assert await ask("model-b") == "model-b"
+                        assert {slot for slot in pool._slots} == {"model-a", "model-b"}
+                finally:
+                    await pool.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_an_unknown_model_is_missing_rather_than_busy_while_another_request_runs():
     """A typo is permanent; ENGINE_BUSY invites the client to retry it forever."""
     with tempfile.TemporaryDirectory() as directory:

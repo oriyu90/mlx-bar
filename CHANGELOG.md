@@ -2,6 +2,13 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.8.2] - 2026-08-30
+
+### 修正
+
+- **API経由で2体目のモデルへ切り替えられない不具合を修正。** `models.pool.maxResidentModels`を2以上に設定していても、ちょうど1体が常駐している状態で別のモデルを`/v1/chat/completions`の`model`に指定すると、そのモデルが実際にはロードされず、常駐中の1体目が黙って応答していました（エラーは出ません）。原因は`_ensure_requested_model`にあった「1体だけ常駐しているときは、名前が一致しなくてもその1体のエイリアスとして扱う」という早期returnで、これが本来の自動ロード経路に一度も到達させていませんでした。この早期returnは、プールが2体以上を保持できない場合(`maxResidentModels <= 1`)、または要求されたモデル名がカタログに存在しない場合のみ適用するように修正しました。実在する別モデルへの切り替えは、通常の自動ロード経路（ENGINE_BUSY判定を含む）へ正しく進みます。（`Coordinator/mlxbar/api/openai_compat.py`）
+  - 回帰テスト追加: `Tests/test_openai_tools.py::test_a_second_distinct_model_actually_loads_when_the_pool_allows_it`（修正前は失敗することを確認済み）。
+
 ## [1.8.1] - 2026-08-30
 
 ### 追加
