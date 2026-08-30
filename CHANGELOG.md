@@ -2,6 +2,16 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.8.3] - 2026-08-31
+
+### 修正
+
+- **Ornith 1.5系（35B-A3BとMLXBar上でmlx-lmエンジンに割り当てられた9B）が、tool呼び出しを含む会話で`GENERATION_FAILED`により必ずクラッシュする不具合を修正。** OpenAI互換の`tool_calls[].function.arguments`はJSON文字列で送られてきますが、`mlx_lm_worker`はこれを未加工のまま`self.processor.apply_chat_template()`へ渡していました。Ornith 1.5系のchat templateは各tool callの引数をJinjaの`|items`フィルタでマッピングとして反復するため、文字列を渡すと`TypeError: Can only get item pairs from a mapping.`で失敗していました。`mlx_vlm_worker`は`mlx_vlm.prompt_utils.apply_chat_template`が内部の`_normalize_tool_message`でこの変換を先に行うため影響を受けていませんでした。
+  - 修正: `common/tool_calls.py`に`normalize_tool_call_messages()`を追加し（`mlx_vlm`の変換と同等、JSON文字列→dictへ変換、パース失敗時は空dictへフォールバック）、`mlx_lm_worker/adapter.py`の`stream()`・`_render_prompt()`（`count_tokens`が経由）でchat template適用前に適用するようにしました。tool_callsを含まないメッセージは従来通り無変更で同一オブジェクトのまま渡されます。
+  - 発見の経緯: OpenClawとの実接続テストで発見。実際にクラッシュしたリクエストをプロキシで捕獲し、開発用チェックアウトから実際のCoordinator＋Worker一式（本番と同じ`common/server.py`のHTTP経路、実モデルファイル、実プロンプトキャッシュ）を起動して再現・トレースバック取得まで行った（詳細は`mlx-bar.md`§0-U）。
+  - 実機確認: `Ornith-1.5-9B-MLX-8bit`で同一のtool呼び出しリクエストを5回連続実行し、全て`GENERATION_FAILED`なしで応答。`Ornith-1.5-35B-A3B-MLX-4bit`でも同様に確認。
+  - 回帰テスト追加（`Tests/test_worker_server.py`、計6件）: `normalize_tool_call_messages()`単体4件（文字列引数のパース、不正JSONのフォールバック、既にdictの引数はそのまま、tool_calls無しは完全no-op）、`MLXLMAdapter.stream()`統合2件（`|items`を使う偽テンプレートでのクラッシュ再現→解消、tool_calls無し会話が同一オブジェクトのまま渡ることの確認）。
+
 ## [1.8.2] - 2026-08-30
 
 ### 修正

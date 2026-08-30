@@ -6,7 +6,7 @@ import time
 
 from common import cache_state
 from common.server import BaseAdapter, run
-from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
+from common.tool_calls import normalize_tool_call_messages, parse_tool_markup, tool_template_kwargs_attempts
 
 from .prompt_cache import PromptCacheStore
 
@@ -108,6 +108,7 @@ class MLXLMAdapter(BaseAdapter):
         prompt = params.get("messages", params.get("prompt", ""))
         if not isinstance(prompt, list):
             return str(prompt)
+        prompt = normalize_tool_call_messages(prompt)
         last_error: Exception | None = None
         for extra_kwargs in tool_template_kwargs_attempts(params):
             try:
@@ -130,6 +131,7 @@ class MLXLMAdapter(BaseAdapter):
         prompt = params.get("messages", params.get("prompt", ""))
         tool_support = "none"
         if isinstance(prompt, list):
+            prompt = normalize_tool_call_messages(prompt)
             last_error: Exception | None = None
             for extra_kwargs in tool_template_kwargs_attempts(params):
                 try:

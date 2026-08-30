@@ -134,6 +134,74 @@ class StopSequenceFilter:
         return visible
 
 
+def normalize_tool_call_messages(messages) -> list:
+    """Parse ``function.arguments`` back into a mapping before template rendering.
+
+    The wire format (OpenAI-compatible request bodies, and this project's own
+    round-trip of a previous ``tool_calls`` response) keeps
+    ``assistant.tool_calls[].function.arguments`` as a JSON-encoded *string* --
+    that is the OpenAI spec. Several chat templates (observed on the Ornith
+    1.5 family, both the 35B-A3B and 9B checkpoints) iterate that value with
+    Jinja's ``|items`` filter to render each parameter, which requires an
+    actual mapping and raises ``TypeError: Can only get item pairs from a
+    mapping.`` when handed a string instead.
+
+    ``mlx_vlm_worker`` never hits this: ``mlx_vlm.prompt_utils.apply_chat_template``
+    calls its own private ``_normalize_tool_message`` first, which does exactly
+    this parse. ``mlx_lm_worker`` calls the tokenizer's ``apply_chat_template``
+    directly with no equivalent step, so any model routed through the mlx-lm
+    engine whose template expects a mapping crashes on the very first
+    multi-turn tool-calling request. This mirrors that parse so both engines
+    render the same way.
+
+    A message whose ``arguments`` fails to parse falls back to ``{}`` rather
+    than raising here -- the template gets an empty-but-valid mapping instead
+    of crashing on a call whose arguments were already malformed on the wire,
+    which is the more useful failure for the caller to see (a strange/empty
+    tool call, not a hard 500 unrelated to the actual bad input).
+
+    Only ``assistant`` messages carrying ``tool_calls`` are touched; everything
+    else (including ``tool`` role result messages, whose ``content`` is a
+    plain string already) passes through as the exact same object -- no
+    unnecessary copying on the overwhelmingly common case of a conversation
+    with no tool calls at all.
+    """
+    if not isinstance(messages, list):
+        return messages
+    normalized = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            continue
+        new_calls = []
+        changed = False
+        for call in tool_calls:
+            if not isinstance(call, dict) or "function" not in call:
+                new_calls.append(call)
+                continue
+            function = dict(call["function"])
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
+                changed = True
+            new_call = dict(call)
+            new_call["function"] = function
+            new_calls.append(new_call)
+        if not changed:
+            continue
+        if normalized is None:
+            normalized = list(messages)
+        new_message = dict(message)
+        new_message["tool_calls"] = new_calls
+        normalized[index] = new_message
+    return normalized if normalized is not None else messages
+
+
 def tool_template_kwargs_attempts(params: dict) -> list[dict]:
     """Ordered fallback kwargs for rendering a chat template that may not support tools.
 

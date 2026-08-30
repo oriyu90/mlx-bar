@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "Workers"))
 
 import common.server as worker_server  # noqa: E402
 from common.server import BaseAdapter, create_app  # noqa: E402
-from common.tool_calls import parse_tool_markup  # noqa: E402
+from common.tool_calls import normalize_tool_call_messages, parse_tool_markup  # noqa: E402
 from mlx_lm_worker.adapter import MLXLMAdapter  # noqa: E402
 from mlx_vlm_worker.adapter import MLXVLMAdapter  # noqa: E402
 
@@ -278,6 +278,125 @@ def test_mlx_lm_chat_template_kwargs_are_preserved_with_tools():
     assert events == [{"type": "delta", "text": "ok"}]
     assert captured[-1]["enable_thinking"] is False
     assert "tool_choice" not in captured[-1]
+
+
+def test_normalize_tool_call_messages_parses_string_arguments():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "f", "arguments": '{"a": 1, "b": "two"}'}},
+        ]},
+    ]
+    result = normalize_tool_call_messages(messages)
+    assert result is not messages
+    assert result[1]["tool_calls"][0]["function"]["arguments"] == {"a": 1, "b": "two"}
+    # The input is untouched.
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"a": 1, "b": "two"}'
+
+
+def test_normalize_tool_call_messages_falls_back_to_empty_dict_on_bad_json():
+    messages = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "not json"}},
+    ]}]
+    result = normalize_tool_call_messages(messages)
+    assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+
+def test_normalize_tool_call_messages_passes_through_dict_arguments_unchanged():
+    # A caller that already sends a mapping (not the OpenAI-spec string) must
+    # not be broken by this -- e.g. a client that pre-parsed it itself. Nothing
+    # needed parsing, so this is the exact same object back (no copy).
+    messages = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": {"a": 1}}},
+    ]}]
+    result = normalize_tool_call_messages(messages)
+    assert result is messages
+    assert result[0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+
+
+def test_normalize_tool_call_messages_is_a_noop_without_tool_calls():
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert normalize_tool_call_messages(messages) is messages
+    assert normalize_tool_call_messages("not a list") == "not a list"
+
+
+def test_mlx_lm_parses_tool_call_arguments_back_into_a_mapping():
+    """A template that needs a mapping must not see the wire's JSON string.
+
+    Reproduces the crash found via OpenClaw integration testing on the Ornith
+    1.5 family (35B-A3B and 9B, both routed through mlx-lm): their chat
+    template renders each tool call's arguments with Jinja's `|items` filter,
+    which raises `TypeError: Can only get item pairs from a mapping.` when
+    handed the OpenAI-wire JSON *string* mlx_lm_worker used to pass through
+    unparsed. mlx_vlm_worker never had this problem -- `mlx_vlm.prompt_utils`
+    parses it first via its own private `_normalize_tool_message`; this is the
+    mlx_lm-side equivalent (`normalize_tool_call_messages`, shared code).
+    """
+    mlx_lm = ModuleType("mlx_lm")
+
+    def stream_generate(_model, _processor, **_kwargs):
+        yield SimpleNamespace(text="ok")
+
+    def apply_chat_template(prompt, **_kwargs):
+        # Simulates a template rendering each tool call's arguments with
+        # Jinja's `|items` filter: fails loudly on anything but a mapping,
+        # exactly like the real chat_template.jinja on the Ornith checkpoints.
+        for message in prompt:
+            for call in message.get("tool_calls") or []:
+                arguments = call["function"]["arguments"]
+                if not isinstance(arguments, dict):
+                    raise TypeError("Can only get item pairs from a mapping.")
+        return "prompt"
+
+    mlx_lm.stream_generate = stream_generate
+    adapter = MLXLMAdapter()
+    adapter.model = object()
+    adapter.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the weather in Tokyo?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city":"Tokyo"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 25C"},
+    ]
+    original_arguments = messages[2]["tool_calls"][0]["function"]["arguments"]
+    with patch.dict(sys.modules, {"mlx_lm": mlx_lm}):
+        events = list(adapter.stream("request", {"messages": messages}))
+    assert events == [{"type": "delta", "text": "ok"}]
+    # The caller's own dict is never mutated -- only the copy handed to the
+    # template is touched.
+    assert messages[2]["tool_calls"][0]["function"]["arguments"] is original_arguments
+
+
+def test_mlx_lm_leaves_tool_call_free_messages_untouched():
+    """No tool calls anywhere: the exact same list object reaches the template.
+
+    Guards against the fix reintroducing a copy (and the two-attempt
+    fallback re-running it) on the overwhelmingly common case of a
+    conversation that never used tools.
+    """
+    mlx_lm = ModuleType("mlx_lm")
+
+    def stream_generate(_model, _processor, **_kwargs):
+        yield SimpleNamespace(text="ok")
+
+    seen = []
+
+    def apply_chat_template(prompt, **_kwargs):
+        seen.append(prompt)
+        return "prompt"
+
+    mlx_lm.stream_generate = stream_generate
+    adapter = MLXLMAdapter()
+    adapter.model = object()
+    adapter.processor = SimpleNamespace(apply_chat_template=apply_chat_template)
+    messages = [{"role": "user", "content": "hello"}]
+    with patch.dict(sys.modules, {"mlx_lm": mlx_lm}):
+        list(adapter.stream("request", {"messages": messages}))
+    assert seen[0] is messages
 
 
 def test_mlx_vlm_retries_without_tool_choice_when_template_rejects_it():
