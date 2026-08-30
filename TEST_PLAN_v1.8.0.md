@@ -19,6 +19,12 @@ swift build --disable-sandbox -c release
 
 - Python: **346 passed**（v1.7.1 の 316 + v1.8.0 の 30）
 - Swift Debug / Release: **成功**
+- `sh scripts/build-release.sh` → `sh scripts/verify-release.sh`: **成功**（ad-hoc 署名）。
+  同梱 Coordinator で `version 1.8.0` / `/anthropic/v1/models` 応答 / `/v1/models` 形不変 /
+  `anthropic-version` 欠落 → 400 / `profiles[].replicas=9` → 422 を確認。
+- 実機一部実施（§2・§3 に詳細）: `_admit` メモリ圧ガード発火、replica 0 ロード + 自前予約 +
+  素の manifest、replica 1 の admission 拒否で「非致命」経路、Anthropic 非ストリーム／ストリーム／
+  `stop_sequence`／`count_tokens`／OpenAI 経路無影響 を実 MLX モデルで確認。
 
 v1.8.0 の新規契約:
 
@@ -48,9 +54,39 @@ v1.8.0 の新規契約:
 
 ## 2. 手動: 同一モデルの並列（要 Apple Silicon 実機・要モデル本体）
 
-**このビルド環境には MLX ランタイムもモデル本体も無いため未実施。リリース前に現場で通すこと。**
-合算 allocation ピークの妥当性が確認できるまで `replicas > 1` の実機保証はしない（v1.7.0 の
-`generationConcurrency` 実機項目と同じ扱い）。
+### 2026-08-30 実機一部実施（M-series / 96 GB / mlx-lm 0.31.3 / `Qwen3.5-9B-MLX-8bit`）
+
+隔離した `--home`（別 UDS ソケット・runtimes は既存 slot を symlink・throwaway）で dev coordinator を
+起動して確認した。**実施できた項目:**
+
+- **`_admit` の macOS メモリ圧ガードが実機で end-to-end に発火。** 当時マシンは
+  `kern.memorystatus_vm_pressure_level = 2`（inactive 約 17 GB あるが warning）で、150 MB のモデルすら
+  `MEMORY_PRESSURE` で拒否。設計どおり（サイズ非依存の保守的ガード）。
+- 計測用に報告 pressure を 1 にクランプした状態で **replica 0 がロード**、`set_memory_limit`
+  ≈ 13.6 GB の自前予約を取得。manifest は素の `worker-<digest>.json`（`-index` サフィックス無し
+  ＝ v1.7.1 と同一）。
+- **replica 1 は admission が拒否**（replica 0 が空きメモリを消費し、実空きが `estimate + reserve`
+  に届かず）→ `Could not load replica 1 ... keeping 1 replica(s)` をログし、**replica 0 は `ready`
+  のまま利用可能**。「2 個目以降の失敗は致命的でない」経路が実機で機能。
+- **OpenAI 経路が同一 coordinator 上で無影響**（`Qwen3.5-9B` で `object: chat.completion` /
+  `finish_reason: stop`）。OpenAI の 422 は `INVALID_REQUEST` / `invalid_request_error` のまま
+  （Anthropic エンベロープにならない）。
+
+**実施できなかった項目（このマシンの当時のメモリ状況では 10 GB×2 の同時常駐に必要な約 30 GB の
+実空きが取れなかった。バグではない）:**
+
+- 2 レプリカが同時にストリームし `activeGenerations=2` になること、その間の RSS 合計 /
+  `vm_stat` / `kern.memorystatus_vm_pressure_level` の 1 秒間隔トレース。
+- `generationConcurrency=1` 再起動で複数レプリカでも完全直列になること（実機）。
+
+ルーティング／並行度そのものは fake worker のテスト（`test_model_replicas`）で担保済み。
+合算 allocation ピークの妥当性が実機で確認できるまで `replicas > 1` の実機保証はしない
+（v1.7.0 の `generationConcurrency` 実機項目と同じ扱い）。**メモリに余裕のある実機で下記 1–5 を
+通し、結果をここに追記すること。**
+
+> 注意: dev coordinator の `api.port` は既存の MLXBar アプリと衝突しないポートに変えること
+> （`SO_REUSEADDR` のため 11435 のまま起動すると衝突が silent になり、動作中のアプリの
+> ポート提供を一時的に奪う）。2026-08-30 の確認ではこの点を踏み、以後は別ポート推奨。
 
 1. 小型 mlx-lm モデルを `models.pool.profiles` に `{"modelId": ..., "keepLoaded": true, "replicas": 2}`
    で登録 → サービス再起動 → `mlxbarctl model resident` で `replicaCount=2`、`/bin/ps` で 2 Worker プロセス。
@@ -64,6 +100,25 @@ v1.8.0 の新規契約:
    他モデルは継続。生成中クライアント切断 → `laneRecoveries` 増加または次要求が正常開始。
 
 ## 3. 手動: Anthropic / Claude Code（要実機）
+
+### 2026-08-30 実機実施（`Qwen3.5-9B-MLX-8bit`、上記 §2 と同じ隔離 coordinator）
+
+- `GET /anthropic/v1/models` → Anthropic 形（`data[].type=model` / `display_name` / `has_more:false`
+  / `first_id` / `last_id`）。認証は `x-api-key` で通過。
+- **非ストリーム `POST /anthropic/v1/messages`**: `{"type":"message","role":"assistant",
+  "model":"Qwen3.5-9B-MLX-8bit","content":[{"type":"text","text":"pong"}],
+  "stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":17,"output_tokens":2}}`。
+  cache 系フィールド無し、`model` は実ローカル名。
+- **ストリーム**: イベント列 `message_start → ping → content_block_start →
+  content_block_delta ×N → content_block_stop → message_delta → message_stop`。`[DONE]` 無し。
+- **`stop_sequences:["3"]`** → `stop_reason:"stop_sequence"`, `stop_sequence:"3"`, 本文は "3" の
+  手前で切れる（`"...1, 2, "`）。
+- **`count_tokens`**: 実トークナイザで `{"input_tokens":22}`（文をチャットテンプレートで包んだ値）。
+- `anthropic-version` ヘッダ欠落 → 400（Anthropic 形）。`api.anthropic.enabled=false` で
+  `/anthropic/*` → 404（パッケージ済み Coordinator でも確認、§4）。
+
+**未実施:** Claude Code 本体を `ANTHROPIC_BASE_URL` で繋いだ対話（tool use / `/model` / 中断 /
+並列 subagent）。下記手順で実施すること。
 
 1. `curl -s -H "x-api-key: $(cat ~/Library/Application\ Support/MLXBar/control/api-token)" \
    -H "anthropic-version: 2023-06-01" http://127.0.0.1:11435/anthropic/v1/models` → モデル一覧。
