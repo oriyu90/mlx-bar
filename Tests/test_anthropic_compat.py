@@ -311,6 +311,19 @@ def test_unsupported_features_are_rejected_explicitly():
             assert response.json()["type"] == "error"
 
 
+def test_thinking_disabled_is_accepted_as_a_noop():
+    # v1.9.0: `{"type": "disabled"}` means "no extended thinking", which is
+    # already how local models behave -- it must not 400 like an actual
+    # request to enable thinking does.
+    with tempfile.TemporaryDirectory() as directory:
+        client, _ = make_client(Path(directory))
+        response = client.post("/anthropic/v1/messages",
+                               json=body(thinking={"type": "disabled"}),
+                               headers=VERSION_HEADER)
+        assert response.status_code == 200
+        assert response.json()["content"] == [{"type": "text", "text": "Hello world"}]
+
+
 def test_missing_max_tokens_is_rejected():
     with tempfile.TemporaryDirectory() as directory:
         client, _ = make_client(Path(directory))

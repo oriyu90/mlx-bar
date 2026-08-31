@@ -439,6 +439,33 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
         await t1
         await g1.aclose()
 
+    async def test_status_reports_per_model_generation_rate(self):
+        # v1.9.0: the menu bar shows a live tok/s under every resident model,
+        # not just the primary, so each `loadedModels[]` row carries its own
+        # rate and the top-level field mirrors it for the existing header line.
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        await pool.load(self.model(2))
+        w1 = pool._slots["model-1"].worker
+        base_status = w1.status
+        w1.status = lambda: {**base_status(),
+                             "generationTokensPerSecond": 42.4,
+                             "generatedTokens": 128}
+        status = pool.status()
+        row1 = next(m for m in status["loadedModels"] if m["id"] == "model-1")
+        self.assertEqual(row1["generationTokensPerSecond"], 42.4)
+        self.assertEqual(row1["generatedTokens"], 128)
+        row2 = next(m for m in status["loadedModels"] if m["id"] == "model-2")
+        self.assertNotIn("generationTokensPerSecond", row2)
+        self.assertEqual(status["generationTokensPerSecond"], 42.4)
+
+    async def test_status_has_no_generation_rate_when_idle(self):
+        pool = self.make_pool()
+        await pool.load(self.model(1))
+        status = pool.status()
+        self.assertIsNone(status["generationTokensPerSecond"])
+        self.assertNotIn("generationTokensPerSecond", status["loadedModels"][0])
+
     async def test_unload_one_model_leaves_the_other_resident(self):
         pool = self.make_pool()
         await pool.load(self.model(1))

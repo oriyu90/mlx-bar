@@ -1011,19 +1011,43 @@ class ModelPoolSupervisor:
                 active_generations += 1
             if child.get("loadedModel"):
                 model_id = str(slot.model.get("id", ""))
-                loaded_models.append({**child["loadedModel"], "poolState": slot.state,
-                                      "memoryReservationBytes": slot.reservation_bytes,
-                                      "activeLeases": slot.leases,
-                                      "replicaIndex": slot.replica_index,
-                                      "replicaCount": len([s for s in self._slots.values()
-                                                           if str(s.model.get("id", "")) == model_id]),
-                                      "laneQueueDepth": len(slot.gen_queued),
-                                      "laneRecoveries": slot.gen_recoveries,
-                                      "keepLoaded": slot.keep_loaded or slot.session_pinned,
-                                      "idleExpiresAt": None if slot.keep_loaded or slot.session_pinned else
-                                      time.time() + max(0, self._pool_settings().get("idleTTLSeconds", 900)
-                                                        - (time.monotonic() - slot.last_released_at))})
+                entry = {**child["loadedModel"], "poolState": slot.state,
+                         "memoryReservationBytes": slot.reservation_bytes,
+                         "activeLeases": slot.leases,
+                         "replicaIndex": slot.replica_index,
+                         "replicaCount": len([s for s in self._slots.values()
+                                              if str(s.model.get("id", "")) == model_id]),
+                         "laneQueueDepth": len(slot.gen_queued),
+                         "laneRecoveries": slot.gen_recoveries,
+                         "keepLoaded": slot.keep_loaded or slot.session_pinned,
+                         "idleExpiresAt": None if slot.keep_loaded or slot.session_pinned else
+                         time.time() + max(0, self._pool_settings().get("idleTTLSeconds", 900)
+                                           - (time.monotonic() - slot.last_released_at))}
+                # Per-replica live generation rate, straight from the same
+                # `_live_generation()` the single-model header already uses. The
+                # GUI shows one row per distinct model (replicas collapse), so an
+                # aggregate across this model's replicas is folded in below.
+                rate = child.get("generationTokensPerSecond")
+                if isinstance(rate, (int, float)) and rate > 0:
+                    entry["generationTokensPerSecond"] = round(float(rate), 1)
+                    produced = child.get("generatedTokens")
+                    if isinstance(produced, int) and produced > 0:
+                        entry["generatedTokens"] = produced
+                loaded_models.append(entry)
             loading = loading or child.get("loadingModel")
+        # One rate per distinct model: when a model runs multiple replicas, the
+        # collapsed GUI row shows the fastest replica's current rate rather than
+        # whichever replica happens to sort first.
+        rate_by_model: dict[str, float] = {}
+        for entry in loaded_models:
+            value = entry.get("generationTokensPerSecond")
+            if isinstance(value, (int, float)) and value > 0:
+                key = str(entry.get("id", ""))
+                rate_by_model[key] = max(rate_by_model.get(key, 0.0), float(value))
+        for entry in loaded_models:
+            key = str(entry.get("id", ""))
+            if key in rate_by_model:
+                entry["generationTokensPerSecond"] = round(rate_by_model[key], 1)
         external_status = self._legacy.status()
         if external_status.get("loadedModel"):
             loaded_models.append({**external_status["loadedModel"], "poolState": "external",
@@ -1033,9 +1057,18 @@ class ModelPoolSupervisor:
         primary = self.loaded
         primary_id = primary.get("id") if primary else None
         primary_descriptor = next((item for item in loaded_models if item.get("id") == primary_id), None)
+        # Mirror the single-model header rate for the primary model. The legacy
+        # path emits this via `_live_generation()`; the pool path did not, so
+        # `generationRateText` never appeared while the pool was enabled.
+        header_rate = (primary_descriptor or {}).get("generationTokensPerSecond")
+        if not (isinstance(header_rate, (int, float)) and header_rate > 0):
+            header_rate = next((item.get("generationTokensPerSecond") for item in loaded_models
+                                if isinstance(item.get("generationTokensPerSecond"), (int, float))
+                                and item.get("generationTokensPerSecond") > 0), None)
         return {
             "loadedModel": primary_descriptor,
             "loadedModels": loaded_models,
+            "generationTokensPerSecond": header_rate,
             "worker": primary.get("engine") if primary else None,
             "loadingModel": loading,
             "workerRunning": bool(loaded_models),

@@ -44,6 +44,10 @@ struct ResidentModel: Identifiable, Hashable {
     /// Number of same-model replica processes (v1.8.0); 1 for the common case.
     let replicaCount: Int
     let replicaIndex: Int
+    /// Tokens per second this model is generating right now, or nil when it is
+    /// idle. Reported per-model by `/api/v1/status` `loadedModels[]` (v1.9.0) so
+    /// the menu bar can show a rate under every resident, not just the primary.
+    let generationTokensPerSecond: Double?
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -57,6 +61,20 @@ struct ResidentModel: Identifiable, Hashable {
         managedExternally = value["memoryManagedBy"] != nil || (value["poolState"] as? String) == "external"
         replicaCount = (value["replicaCount"] as? NSNumber)?.intValue ?? 1
         replicaIndex = (value["replicaIndex"] as? NSNumber)?.intValue ?? 0
+        let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
+        generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
+    }
+
+    /// Live rate as a short localized string, or nil when the model is idle.
+    ///
+    /// Coarser above 10 tok/s on purpose, matching the primary rate line: the
+    /// status poll refreshes every second and a digit that changes on every
+    /// tick is the content churn that destabilises `MenuBarExtra`'s window
+    /// style (see mlx-bar.md).
+    func generationRateText(japanese: Bool) -> String? {
+        guard let rate = generationTokensPerSecond, rate > 0 else { return nil }
+        let value = rate >= 10 ? String(Int(rate.rounded())) : String(format: "%.1f", rate)
+        return japanese ? "\(value) tok/秒" : "\(value) tok/s"
     }
 }
 

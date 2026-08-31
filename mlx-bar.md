@@ -76,7 +76,60 @@
 - **`COUNT_TOKENS_UNAVAILABLE`**: `_anthropic_error_type`で`invalid_request_error`→`api_error`（HTTP 503と整合）。
 - **Swift設定画面**: `Stepper(in: 1...max(1, maxReplicasPerModel))`、pinプロファイル読み込みを`Dictionary(_:uniquingKeysWith:)`に。壊れたconfigでクラッシュしない。
 
+## v1.9.0で守ること（モデル別の個別アンロード / 生成中のモデル別トークン速度 / API互換性精査）
+
+- **モデル別トークン速度は `/api/v1/status` への追加のみ。** `ModelPoolSupervisor.status()` は各スロットの
+  `WorkerSupervisor.status()` を集約している。`WorkerSupervisor.status()` は生成中なら
+  `**self._live_generation()` で `generationTokensPerSecond` / `generatedTokens` を **元々** 返しているが、
+  プール側が `child["loadedModel"]` しか取り出しておらず転記していなかった。v1.9.0 で各 `loadedModels[]`
+  エントリへ転記（正の値のときだけ）。**同一モデルの複数レプリカは GUI で1行に畳まれる**ので、
+  `status()` 内で model id ごとにレプリカ横断の最大値を求め、その model id の全エントリへ書き戻す
+  （畳んだ行が「たまたま最初のレプリカ」の値になるのを防ぐ）。fail-safe（欠損でフィールドを出さない）。
+- **トップレベル `generationTokensPerSecond` の追加はプール経路の欠落修正でもある。** 単一Worker経路
+  （`_legacy.status()`）は `_live_generation()` 経由でこのフィールドを出すのに、既定で有効なプール経路は
+  一度も出しておらず、`MenuBarViewModel.generationRateText` が常に nil だった。プール経路で主モデルの
+  現在値（無ければ生成中のいずれか）を同フィールドへ入れる。`enabled=false` 経路は `_legacy.status()`
+  そのままで無変更。
+- **GUI は表示条件を広げただけ。** `MenuBarView` の常駐モデル一覧を `residentModels.count > 1` →
+  `!residentModels.isEmpty`。行ごとの eject / pin は v1.7.1 から不変（`POST /api/v1/models/{id}/unload`、
+  `unloadModel(id)`）。`poolState == "external"`（LM Studio 管理）の行は従来どおり eject / pin を出さない。
+  `ResidentModel.generationRateText(japanese:)` はヘッダー用 `generationRateText` と同じ丸め
+  （10 tok/秒以上は整数、未満は小数1桁。`MenuBarExtra` の `.window` スタイルが高頻度の内容変化で
+  不安定になる既知事項への対策）。サーバ側で 0.1 に丸め済みなので `setIfChanged(\.residentModels, …)` の
+  re-publish は速度が実際に 0.1 動いたときだけ。対象はポップオーバー内の一覧のみで、メニューバー
+  アイコン／`shortStatus` は `residentModels` を読まないため v1.2.1 のアイコンちらつきには無関係。
+- **`POST /api/v1/models/{id}/unload` と `mlxbarctl model unload` は無変更。** `unload_model(force=True)` は
+  当該モデルの生成のみキャンセルして evict（`_load_lock` 下）、他モデルへ波及しない、を維持する。
+- **`Localizable.strings` は `en.lproj` のみ追加**（`"生成速度"`）。`ja.lproj` は「source language は日本語」
+  方針で意図的に最小——日本語リテラルがそのままキー。新しい UI 文字列を足したら `en.lproj` を必ず更新。
+- **Anthropic 互換の唯一の挙動変更: `thinking:{"type":"disabled"}`（budget なし）を no-op 受理。**
+  `_generation_options` の `body.get("thinking") is not None` 一律 400 を、`disabled` だけ `thinking=None` に
+  潰してから判定へ。拡張思考の **有効化**（`enabled` / `adaptive` / `budget_tokens`）・サーバーサイド
+  ツール・`document` ブロック・Anthropic側 MCP は従来どおり 400。**成功経路の応答・`usage`・エラー形は
+  不変**（`test_unsupported_features_are_rejected_explicitly` は `enabled+budget` を引き続き 400 にする）。
+- **互換性精査の結論（`DESIGN_v1.9.0.md §3`）**: Anthropic / OpenAI / ZCode とも、Claude Code・
+  ZCode の実運用に必要な形状は満たしている。重大な非互換は無し。既知の明示エラー（`response_format`
+  非text / `logprobs` / `n>1` / 拡張思考の有効化 / server tools / document / MCP）は仕様上の制約として
+  README §API に記載済み。`top_k`（両API）は黙って無視（低リスク、下記課題へ記録）。
+
 ## 未解決の課題
+
+### Anthropic / OpenAI の `top_k` を黙って無視している（v1.9.0時点・未対応）
+
+Anthropic Messages は `top_k` を正式パラメータとして受ける。MLXBar の `_generation_options`
+（`anthropic_compat.py`）も OpenAI 経路（`openai_compat.py`）も `top_k` をサンプラーへ渡しておらず、
+エラーも出さずに無視している。mlx-lm / mlx-vlm のサンプラーは `top_k` を受けられるバージョンがあるので、
+`options["top_k"]` として通すか、あるいは（`response_format` などと同様に）明示的に
+`UNSUPPORTED_PARAMETER` で拒否するか、どちらかに寄せる価値がある。現状は実害の報告なし。
+
+### tool_parse ハートビートのフレークテスト（v1.9.0時点・据え置き）
+
+`Tests/test_worker_server.py::test_buffered_tool_generation_still_emits_heartbeats` は
+`heartbeat_interval_seconds: 0.03` を使い、並列フル実行時の CPU 負荷で
+`"phase": "tool_parse"` ハートビートが出る前に `TOOL_PARSE_FAILED` が届いて落ちることがある
+（**単体実行では安定して成功**、フル実行で約 1/3）。`common/server.py` のハートビートは
+「間隔との大小関係が意味を持つ」（v1.5.3 の教訓）ので、次に触る人はその関係ごと理解して
+de-flake すること。互換性・機能とは無関係の観測性テスト。
 
 ### tool無しリクエストで推論ブロックが本文へ漏れる（v1.8.4対応）
 

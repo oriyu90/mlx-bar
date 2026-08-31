@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.8.4 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.9.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -43,7 +43,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.8.4.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.9.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -85,6 +85,8 @@ Developer ID署名・公証済みの正式配布版では、手順3は通常不�
 
 生成中は「モデルが応答を生成中」の下に、その時点のトークン毎秒を表示します。ZCodeやLAN内の別PCから届いた要求でも表示されます。値はランタイム自身が各トークンで計算しているもの（prefillを除外した最初のトークンからの平均）で、ランタイムが提供しない場合はWorker側の実測に切り替わります。最初の数トークンは分母がほぼ0で無意味な値になるため表示しません。
 
+v1.9.0以降、複数モデルを常駐させているときは、常駐モデル一覧の各行にもそのモデルが生成中のトークン毎秒を表示します（アイドル中の行には表示しません）。同一モデルを複数レプリカで動かしている場合は、その中で最も速いレプリカの現在値を表示します。
+
 メニューバーを開いている間は1秒間隔で状態を更新します。ZCodeやLAN内の別PCからリクエストを処理している間は「モデルが応答を生成中」、並列要求がある場合は待機件数、生成要求がなくロード済みの場合は「待機中」と表示します。外部API経由の生成でもメニューバーアイコンと表示が切り替わります。
 
 Lagunaのように画像入力を持たないモデルでも、`mlx-vlm`側に専用実装がある場合は`mlx-vlm`へ分類します。また、`mlx-lm`で互換性エラーになったローカルモデルは`mlx-vlm`で一度だけ自動再試行します。画像追加ボタンは、ロード結果が画像入力対応を明示した場合だけ有効になります。
@@ -121,7 +123,7 @@ APIが自動ロードした非固定モデルは、最後の要求が終了し�
 
 `DELETE /api/v1/models/loaded`は常駐モデルをすべて解放します。1モデルだけ解放するには`POST /api/v1/models/{id}/unload`（`?force=`、`mlxbarctl model unload MODEL_ID`）を使います。そのモデルに生成中の要求があるときだけ`ENGINE_BUSY`になり、他の常駐モデルには影響しません。
 
-v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します（複数常駐時）。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタンがあります。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。
+v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタン、生成中はそのモデルのトークン毎秒があります。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。v1.9.0以降、この一覧は常駐が1つのときにも表示し、どの構成でもモデルを1つずつアンロードできます。
 
 ### モデル間の同時生成（v1.7.0）
 
@@ -133,7 +135,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -514,7 +516,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.8.4.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.9.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

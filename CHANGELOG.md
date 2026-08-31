@@ -2,6 +2,29 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.9.0] - 2026-08-31
+
+### 追加
+
+- **常駐モデルを1つずつアンロードできるようにしました。** メニューバーの常駐モデル一覧を、常駐が1つのときにも表示します（従来は複数常駐時のみ）。各行の取り出し（eject）ボタンでそのモデルだけを解放でき、他の常駐モデルの生成には影響しません。バックエンド（`POST /api/v1/models/{id}/unload`、`mlxbarctl model unload <id> [--force]`）はv1.7.0/v1.8.1から変更していません。GUIの表示条件だけを広げた追加です。
+- **複数モデルを常駐させているとき、生成中の各モデルのトークン毎秒を、そのモデルの行の下に表示します。** `/api/v1/status`の`loadedModels[]`各要素に`generationTokensPerSecond`（と`generatedTokens`）をモデルごとに載せます。同一モデルを複数レプリカで動かしている場合は、その中で最速レプリカの現在値を表示します。値は単一モデルのヘッダー表示と同じ`_live_generation()`の測定値で、10 tok/秒以上は整数、未満は小数1桁に丸めます（`MenuBarExtra`のウィンドウ再描画を不安定にしないための既存ルールに合わせています）。
+
+### 修正
+
+- **モデルプール有効時（既定）に、メニューバーの生成速度表示が出ない不具合を修正しました。** `/api/v1/status`のトップレベル`generationTokensPerSecond`は単一Worker経路（`_live_generation()`）でしか付与されておらず、プール経路では常に欠落していました。プール経路でも主モデルの現在値を同フィールドへ反映します。
+
+### API互換性の精査（Anthropic / OpenAI / ZCode）
+
+- **Anthropic互換API（`/anthropic`、Claude Code向け）**: 認証（`x-api-key`／bearer）、`anthropic-version`必須、エラー封筒＋`request-id`、SSEシーケンス（`message_start`→`content_block_*`→`message_delta`→`message_stop`、`ping`、`event: error`）、`tool_use`／`tool_result`の相互変換、`count_tokens`、モデル一覧はいずれも仕様どおりで自動テスト済みであることを確認しました。
+  - 変更: `thinking: {"type": "disabled"}`（budgetなし）を、従来の一律HTTP 400ではなく「拡張思考なし」の指定として受理し、no-opとして扱うようにしました。ローカルモデルはもともとこの挙動のため、成功経路の出力・`usage`・エラー形は一切変わりません。拡張思考の**有効化**（`enabled`／`adaptive`／`budget_tokens`）、サーバーサイドツール、`document`ブロック、Anthropic側MCPは引き続き明示的に400で拒否します（v1の既知の制約）。
+  - 既知の制約（変更なし）: `top_k`は無視、`cache_control`は受理して無視、`usage`にcache系フィールドは出ません。ストリームの`message_delta.usage`に`input_tokens`も載せます（Anthropic本家は`output_tokens`のみ。上位互換の付加情報で、Claude Codeは問題なく解釈します）。
+- **OpenAI互換API / ZCode**: `max_tokens`省略時のフォールバック、`stream_options.include_usage`、`tool_choice`各形、128 tools上限、`delta.role`は1回、`finish_reason=length`の伝達、`/v1/completions`・未知パスのOpenAIエラー形、`thinking`／`reasoning_effort`／`extra_body.chat_template_kwargs`の正規化とmlx-lm・mlx-vlm双方への伝播、SSEキープアライブ、切断時のレーン回復を確認しました。`response_format`（text以外）・`logprobs`・`n>1`は引き続き明示エラーで拒否します（既知の制約）。重大な非互換は見つかりませんでした。
+
+### テスト
+
+- Pythonテスト**376件**（v1.8.4の373＋新規3: モデル別トークン速度がstatusに載ること、アイドル時は載らないこと、`thinking:disabled`のno-op受理）。Swift Debug/Releaseビルド成功。追加した文字列は`en.lproj/Localizable.strings`へ登録（日本語リテラルがキー）。
+- 既知のフレーク: `Tests/test_worker_server.py::test_buffered_tool_generation_still_emits_heartbeats`（heartbeat間隔0.03秒、並列フル実行時の負荷に敏感）。単体実行では安定して成功、フル実行では約1/3で失敗。互換性・機能とは無関係の観測性テストのため本リリースでは据え置き、`mlx-bar.md`の課題へ記録。
+
 ## [1.8.4] - 2026-08-31
 
 ### 修正

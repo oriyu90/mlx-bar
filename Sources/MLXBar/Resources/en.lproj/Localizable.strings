@@ -300,3 +300,6 @@
 "Replicas must be between 1 and 8" = "Replicas must be between 1 and 8";
 "Anthropic互換API（/anthropic）を有効化" = "Enable Anthropic-compatible API (/anthropic)";
 "Claude Codeでは ANTHROPIC_BASE_URL に上記URL、ANTHROPIC_AUTH_TOKEN にAPIキーを設定します。有効／無効の切り替えは次回サービス起動時に反映されます。" = "In Claude Code, set ANTHROPIC_BASE_URL to the URL above and ANTHROPIC_AUTH_TOKEN to the API key. Enabling or disabling it takes effect at the next service start.";
+
+/* v1.9.0 -- per-model unload & per-model generation rate in the menu bar */
+"生成速度" = "Generation speed";

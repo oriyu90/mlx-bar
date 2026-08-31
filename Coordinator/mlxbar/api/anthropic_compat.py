@@ -228,7 +228,16 @@ def _generation_options(body: dict, tools: list, tool_choice) -> dict:
     max_tokens = body.get("max_tokens")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
         raise _bad_request("max_tokens は1以上の整数で指定してください")
-    if body.get("thinking") is not None:
+    thinking = body.get("thinking")
+    # An explicit `{"type": "disabled"}` is a request for *no* extended
+    # thinking, which is already how a local model behaves -- accept it as a
+    # no-op. Only an actual request to turn extended thinking on (enabled /
+    # adaptive, or a budget) is refused, since MLXBar cannot emit signed
+    # thinking blocks in v1.
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled" \
+            and thinking.get("budget_tokens") is None:
+        thinking = None
+    if thinking is not None:
         raise _bad_request(
             "extended thinking（thinking パラメータ）には現時点で対応していません")
     raw_choice = body.get("tool_choice")

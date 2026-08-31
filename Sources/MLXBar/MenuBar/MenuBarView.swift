@@ -66,9 +66,11 @@ struct MenuBarView: View {
                 }
             }
 
-            if model.residentModels.count > 1 {
+            if !model.residentModels.isEmpty {
                 Divider()
-                Text("\(LS("常駐モデル")) · \(model.residentModels.count)")
+                Text(model.residentModels.count > 1
+                     ? "\(LS("常駐モデル")) · \(model.residentModels.count)"
+                     : LS("常駐モデル"))
                     .font(.caption).foregroundStyle(.secondary)
                 // Default max residency is 2 and the ceiling is 8; keep the
                 // popover from growing without bound if it is raised.
@@ -161,6 +163,13 @@ struct MenuBarView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(resident.name).font(.caption).lineLimit(1).truncationMode(.middle)
                 Text(residentDetail(resident)).font(.caption2).foregroundStyle(.secondary)
+                if let rate = resident.generationRateText(japanese: model.guiLanguage == "ja") {
+                    Text(rate)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .accessibilityLabel(LS("生成速度") + " \(rate)")
+                }
             }
             Spacer(minLength: 4)
             if resident.replicaCount > 1 {
