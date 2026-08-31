@@ -28,10 +28,16 @@ class IncrementalToolStream:
     THINK_END = "</think>"
     ASSISTANT_TAGS = ("<assistant>", "</assistant>")
 
-    def __init__(self):
+    def __init__(self, reasoning_only: bool = False):
         self.pending = ""
         self.in_reasoning = False
         self.tool_detected = False
+        # `reasoning_only` is for requests that carry no `tools`: split
+        # `<think>`/`</think>`/`<assistant>` exactly as always, but never treat
+        # `<tool_call>` markup as special. A no-tool response that happens to
+        # contain literal tool markup keeps streaming it as ordinary content --
+        # the same as before this class ran on the non-tool path at all.
+        self._tool_markers = () if reasoning_only else self.TOOL_START
 
     def start_reasoning(self) -> None:
         self.in_reasoning = True
@@ -42,8 +48,8 @@ class IncrementalToolStream:
         self.pending += text
         events: list[dict] = []
         while self.pending and not self.tool_detected:
-            markers = ((self.THINK_END, *self.TOOL_START) if self.in_reasoning else
-                       (*self.TOOL_START, self.THINK_START, self.THINK_END, *self.ASSISTANT_TAGS))
+            markers = ((self.THINK_END, *self._tool_markers) if self.in_reasoning else
+                       (*self._tool_markers, self.THINK_START, self.THINK_END, *self.ASSISTANT_TAGS))
             match = self._first_marker(self.pending, markers)
             if match is None:
                 safe = self._safe_prefix_length(self.pending, markers)

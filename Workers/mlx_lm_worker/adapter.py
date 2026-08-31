@@ -205,8 +205,10 @@ class MLXLMAdapter(BaseAdapter):
             yield {"type": "prefill_estimate",
                    "estimated_prompt_tokens": len(prompt_tokens),
                    "estimated_seconds": round(len(prompt_tokens) / self._cold_prompt_tps, 1)}
-        tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
-        if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
+        # A template that pre-opens `<think>` in the prompt makes the model emit
+        # only the closing `</think>`; tell the splitter it starts inside a
+        # reasoning block. Needed with or without tools.
+        if isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
         last_response = None
         generated: list[int] = []

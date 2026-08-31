@@ -2,6 +2,17 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.8.4] - 2026-08-31
+
+### 修正
+
+- **推論（thinking）対応モデルに`tools`を含まないリクエストを送ると、`<think>…</think>`の中身がそのまま`content`へ混ざる不具合を修正。** `<think>`をプロンプト側で先に開くテンプレート（Ornith 1.5系）では、閉じ側の`</think>`だけが単独タグとして本文へ現れていました。`Workers/common/server.py`の`/generate`イベントループで、`<think>`の切り分けを行う`IncrementalToolStream`が`tools`付きリクエスト（`tool_mode`）のときしか構築・使用されていなかったことが原因です。`tools`無しリクエストでは推論文も閉じタグも生の`delta`（＝`content`）として流れていました。v1.2.0の`parse_tool_markup`側の除去は`tool_mode`内でしか呼ばれず、かつ`<think>`と`</think>`が両方揃っているときにしか中身を消せませんでした。
+  - 修正: `IncrementalToolStream`に`reasoning_only`引数を追加し（`<think>`/`</think>`/`<assistant>`のみ切り分け、`<tool_call>`系マーカーは一切特別扱いしない）、`server.py`で`tools`の有無にかかわらず常に構築するようにしました。`reasoning_start`イベントの処理と末尾の`finish()`フラッシュも`tool_mode`非依存にしました。`mlx_lm_worker`・`mlx_vlm_worker`の`reasoning_start`発火条件（プロンプトが`<think>`で終わる）からも`tool_mode`ガードを外しました。
+  - 不変条件: `tools`付き経路は`IncrementalToolStream(reasoning_only=False)`＝従来の`IncrementalToolStream()`で論理的に不変。`tools`無しで自発的に`<tool_call>`を吐くモデルは従来どおり本文として可視（`TOOL_PARSE_FAILED`経路は増えない）。Coordinator（OpenAI互換／Anthropic互換、stream／non-stream）・管理API・設定schemaは無変更。
+  - 意図した挙動変更: `tools`無しで推論モデルへ問い合わせると、`<think>`の中身は`reasoning_content`（stream）へ分離／破棄（non-stream）され、`content`へは出なくなります。
+  - 発見の経緯: OpenClawとの実接続テストで、Ornith 1.5 35Bをメインモデルに設定した際に生の思考文が配信チャネルへ流出。LM Studio直・mlx-bar（`tools`あり）は正常、mlx-bar（`tools`なし）でのみ再現、という切り分けから根本原因を特定（詳細は`mlx-bar.md`§0-W）。
+  - 回帰テスト追加（`Tests/test_worker_server.py`、計6件）: `tools`無しで先頭`<think>`を開くモデルの分離、分割された`<think>`タグの分離、非推論モデルの無変更ストリーム、`tools`無しでの自発的tool マークアップの可視維持、打ち切られた推論が`content`へ漏れないこと、`IncrementalToolStream(reasoning_only=True)`単体。
+
 ## [1.8.3] - 2026-08-31
 
 ### 修正

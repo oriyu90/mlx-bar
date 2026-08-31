@@ -78,6 +78,20 @@
 
 ## 未解決の課題
 
+### tool無しリクエストで推論ブロックが本文へ漏れる（v1.8.4対応）
+
+**症状はモデルではなくリクエストの形で決まる。** 同一の重み `Ornith-1.5-35B-A3B-MLX-4bit`（mlx-lm）で、`tools` を含まないリクエストだけ `content` に `The user is asking me to…\n</think>\n\nPONG` のように生の思考文＋閉じ `</think>` が漏れ、`tools` ありは stream / non-stream とも正常。LM Studio 直（:1234）も正常。Qwen3.8 は `tools` 無しでも漏れない（テンプレートの `enable_thinking` トグルを尊重して黙るため）が、Ornith 1.5 は `enable_thinking=false` / `/no_think` / `reasoning_effort=none` をすべて無視して常に推論ブロックを出すので露出する。OpenClaw の `tools` を付けない補助呼び出し（memory dreaming、タイトル生成、compaction 要約、パイプラインの整形ステップ）が実害面。
+
+**原因は `Workers/common/server.py` の `tool_mode` ゲート。** `<think>` を切り分ける `IncrementalToolStream` が `tool_stream = IncrementalToolStream() if tool_mode else None` で、`tools` なしだと `None`。`reasoning_start` 処理・`delta` の分離・末尾 `finish()` フラッシュがすべて `tool_mode` 条件下。`tools` 無し経路（`elif event.get("type") == "delta":`）は生パススルーで、推論文も閉じタグもそのまま `content` へ。v1.2.0 の `parse_tool_markup` 側除去は `adapter.finalize` 経由＝`tool_mode` 内でしか走らず、かつ `<think>` と `</think>` が両方揃っているときにしか中身を消せない。テンプレートが先頭 `<think>` をプロンプト側で開くモデルでは出力に閉じタグしか出ないため、正規表現ではタグだけ消えて推論文が残る。
+
+**修正: 切り分けを `tool_mode` 非依存にする。** `IncrementalToolStream(reasoning_only=True)` を追加（`<think>`/`</think>`/`<assistant>` のみ、`<tool_call>` 系は一切特別扱いしない）。`server.py` で `tools` の有無にかかわらず常に構築し、`reasoning_start` と `finish()` フラッシュを `tool_mode` の外へ出す。`adapter.py`（mlx-lm / mlx-vlm 両方）の `reasoning_start` 発火条件（`prompt.rstrip().endswith("<think>")`）からも `tool_mode` ガードを外す。Coordinator（OpenAI / Anthropic、stream / non-stream）は無変更（`reasoning_delta` は既に stream で `reasoning_content` へ、non-stream と Anthropic では破棄）。
+
+**不変条件:** `tools` あり経路は `reasoning_only=False`＝従来と同一。`tools` 無しで自発的に `<tool_call>` を吐くモデルは従来どおり本文として可視（`TOOL_PARSE_FAILED` は増えない）。非推論モデルは末尾 `<` 由来の最大 11 文字・1 デルタの保留を除きバイト等価。
+
+**意図した挙動変更:** `tools` 無しで推論モデルへ問い合わせると `<think>` の中身は `reasoning_content`（stream）へ分離／破棄（non-stream）され `content` へ出ない。
+
+**検証:** Python 373 件（367 + 新規 6）。実機は稼働中の mlx-bar（Ornith 1.5 35B 常駐）へ `tools` 無し合成リクエスト。
+
 ### v1.6.0のprefix再利用が実機で一度も有効になっていなかった（v1.6.1で対応）
 
 **出発点は「テストが通っているのに、実機のAPIログが全部coldになる」**。v1.6.0の37件のテストは全部緑で、実機の191件の生成のうち`cold_reason`が入っている行はゼロ、`shared_prefix_tokens`が0でない行もゼロだった。**その2つが同時に起きているとき、疑うのは機能ではなく計装である。**

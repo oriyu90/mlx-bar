@@ -434,7 +434,11 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 upstream_metrics = {}
                 buffered = ""
                 tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
-                tool_stream = IncrementalToolStream() if tool_mode else None
+                # Always run the incremental splitter: with tools it also detects
+                # `<tool_call>` markup; without tools it only separates
+                # `<think>`/`</think>` so a reasoning model's chain-of-thought
+                # never lands in `content` on a plain chat request.
+                tool_stream = IncrementalToolStream(reasoning_only=not tool_mode)
                 stop_filter = StopSequenceFilter(params.get("stop"))
                 stopped = False
                 live_tokens = 0
@@ -531,15 +535,18 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         # cancellation, because a model that emits no text for a
                         # while makes these the only events in the loop.
                         continue
-                    if tool_mode and event.get("type") == "reasoning_start":
+                    if event.get("type") == "reasoning_start":
                         tool_stream.start_reasoning()
-                    elif tool_mode and event.get("type") == "delta":
+                    elif event.get("type") == "delta":
                         count += 1
-                        if not stopped:
+                        if tool_mode and not stopped:
                             # Anything past the stop sequence was never sent to
                             # the client, so it must not produce a tool call
                             # either.
                             buffered += str(event.get("text", ""))
+                        # Without tools the splitter is in reasoning-only mode:
+                        # it separates `<think>` from visible text and leaves
+                        # any other markup untouched.
                         visible_events = tool_stream.feed(str(event.get("text", "")))
                         for visible in visible_events:
                             if stop_filter and visible.get("type") == "delta":
@@ -553,22 +560,10 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                             last_visible_event = time.monotonic()
                         if stopped:
                             break
-                        if not visible_events and time.monotonic() - last_visible_event >= heartbeat_interval:
+                        if tool_mode and not visible_events and time.monotonic() - last_visible_event >= heartbeat_interval:
                             yield json.dumps({"type": "heartbeat", "phase": "tool_parse",
                                               "elapsed_seconds": round(time.monotonic() - started, 1)}) + "\n"
                             last_visible_event = time.monotonic()
-                    elif event.get("type") == "delta":
-                        count += 1
-                        if stop_filter:
-                            text, stopped = stop_filter.feed(str(event.get("text", "")))
-                            if text:
-                                yield json.dumps({**event, "text": text}, ensure_ascii=False) + "\n"
-                                last_visible_event = time.monotonic()
-                            if stopped:
-                                break
-                            continue
-                        yield json.dumps(event, ensure_ascii=False) + "\n"
-                        last_visible_event = time.monotonic()
                     elif event.get("type") == "metrics":
                         upstream_metrics.update(event)
                     else:
@@ -585,9 +580,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     trailing = stop_filter.finish()
                     if trailing:
                         yield json.dumps({"type": "delta", "text": trailing}, ensure_ascii=False) + "\n"
+                for visible in tool_stream.finish():
+                    yield json.dumps(visible, ensure_ascii=False) + "\n"
                 if tool_mode:
-                    for visible in tool_stream.finish():
-                        yield json.dumps(visible, ensure_ascii=False) + "\n"
                     result = await on_mlx_thread(adapter.finalize, buffered, params)
                     if result.get("tool_calls"):
                         finish_reason = "tool_calls"

@@ -216,6 +216,116 @@ def test_detected_but_unparseable_tool_call_returns_explicit_error():
     assert events[-1]["code"] == "TOOL_PARSE_FAILED"
 
 
+# --- v1.8.4: reasoning is separated even when the request carries no tools ---
+
+
+class NoToolsPreopenedThinkAdapter(ThreadBoundAdapter):
+    """A template that pre-opens `<think>`: the model emits only the closer."""
+
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "reasoning_start"}
+        for text in ("chain ", "of thought", "</think>", "Visible answer."):
+            yield {"type": "delta", "text": text}
+
+
+def test_preopened_reasoning_is_separated_without_tools():
+    adapter = NoToolsPreopenedThinkAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "reason-no-tools", "params": {
+            "prompt": "hello",  # no `tools` key -> tool_mode is False
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert "".join(e["text"] for e in events if e.get("type") == "reasoning_delta") == "chain of thought"
+    assert "".join(e["text"] for e in events if e.get("type") == "delta") == "Visible answer."
+    assert not any("<think>" in str(e) or "</think>" in str(e) for e in events)
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+class NoToolsInlineThinkAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        for text in ("<th", "ink>secret</think>Hello", " there!"):
+            yield {"type": "delta", "text": text}
+
+
+def test_inline_split_think_tags_are_separated_without_tools():
+    adapter = NoToolsInlineThinkAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "inline-no-tools", "params": {
+            "prompt": "hello",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert "".join(e["text"] for e in events if e.get("type") == "reasoning_delta") == "secret"
+    assert "".join(e["text"] for e in events if e.get("type") == "delta") == "Hello there!"
+    assert not any("<think>" in str(e) or "</think>" in str(e) for e in events)
+
+
+class NoToolsPlainAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        for text in ("Hello", " from", " MLXBar"):
+            yield {"type": "delta", "text": text}
+
+
+def test_non_reasoning_model_without_tools_streams_unchanged():
+    adapter = NoToolsPlainAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "plain-no-tools", "params": {
+            "prompt": "hello",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert [e["text"] for e in events if e.get("type") == "delta"] == ["Hello", " from", " MLXBar"]
+    assert not any(e.get("type") == "reasoning_delta" for e in events)
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+class NoToolsSpontaneousToolMarkupAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "delta", "text": '<tool_call>{"name":"x"}</tool_call> done'}
+
+
+def test_spontaneous_tool_markup_without_tools_stays_visible():
+    adapter = NoToolsSpontaneousToolMarkupAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "spont-no-tools", "params": {
+            "prompt": "hello",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert "".join(e["text"] for e in events if e.get("type") == "delta") == '<tool_call>{"name":"x"}</tool_call> done'
+    assert not any(e.get("type") in {"tool_calls", "error"} for e in events)
+    assert events[-1] == {"type": "completed", "finish_reason": "stop"}
+
+
+class NoToolsTruncatedReasoningAdapter(ThreadBoundAdapter):
+    def stream(self, request_id: str, params: dict):
+        yield {"type": "reasoning_start"}
+        yield {"type": "delta", "text": "still thinking when the budget ran out"}
+
+
+def test_truncated_reasoning_without_tools_does_not_leak_into_content():
+    adapter = NoToolsTruncatedReasoningAdapter()
+    with TestClient(create_app(adapter)) as client:
+        generated = client.post("/generate", json={"request_id": "trunc-no-tools", "params": {
+            "prompt": "hello",
+        }})
+    events = [json.loads(line) for line in generated.text.splitlines() if line]
+    assert "".join(e["text"] for e in events if e.get("type") == "reasoning_delta") == "still thinking when the budget ran out"
+    assert not any(e.get("type") == "delta" for e in events)
+
+
+def test_incremental_tool_stream_reasoning_only_ignores_tool_markup():
+    from common.tool_calls import IncrementalToolStream
+
+    stream = IncrementalToolStream(reasoning_only=True)
+    visible = stream.feed('before <tool_call>{"name":"x"}</tool_call> after')
+    assert not stream.tool_detected
+    assert "".join(e["text"] for e in visible) == 'before <tool_call>{"name":"x"}</tool_call> after'
+
+    stream = IncrementalToolStream(reasoning_only=True)
+    stream.start_reasoning()
+    visible = stream.feed("private</think>public")
+    assert [(e["type"], e["text"]) for e in visible] == [
+        ("reasoning_delta", "private"), ("delta", "public")]
+
+
 def test_mlx_lm_sampling_parameters_reach_sampler_and_logits_processors():
     captured = {}
     mlx_lm = ModuleType("mlx_lm")

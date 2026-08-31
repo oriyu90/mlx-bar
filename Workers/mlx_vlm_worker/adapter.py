@@ -654,8 +654,10 @@ class MLXVLMAdapter(BaseAdapter):
         estimate = self._prefill_estimate(prompt)
         if estimate is not None:
             yield {"type": "prefill_estimate", **estimate}
-        tool_mode = bool(params.get("tools")) and params.get("tool_choice") != "none"
-        if tool_mode and isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
+        # A template that pre-opens `<think>` in the prompt makes the model emit
+        # only the closing `</think>`; tell the splitter it starts inside a
+        # reasoning block. Needed with or without tools.
+        if isinstance(prompt, str) and prompt.rstrip().endswith("<think>"):
             yield {"type": "reasoning_start"}
         last_response = None
         completed = False
