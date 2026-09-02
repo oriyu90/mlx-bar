@@ -99,7 +99,7 @@ read the same. **No behavior change.**
 
 ## Checksum
 
-`<filled in after build>`  `MLXBar-1.9.1.dmg`
+`4378e97f4f748a5879df3793c80b74d1ebd2dbba3175885dd270b32c05c43f94`  `MLXBar-1.9.1.dmg`
 
 (Hash of the `dist/MLXBar-1.9.1.dmg` produced by `build-release.sh`; also in
 `dist/MLXBar-1.9.1.dmg.sha256`. DMG packaging is not bit-reproducible — re-hash
