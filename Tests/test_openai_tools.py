@@ -1234,6 +1234,74 @@ def test_streaming_tool_call_deltas_send_role_only_on_the_first_chunk():
         assert roles.count("assistant") == 1
 
 
+class _MultiToolCallsWorker:
+    loaded = {"id": "Laguna-S-2.1-oQ2e"}
+
+    async def generate(self, messages, images, options, request_id, image_root=None):
+        yield {"type": "tool_calls", "calls": [
+            {"id": "call_a", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"a"}'}},
+            {"id": "call_b", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"b"}'}}]}
+        yield {"type": "completed", "finish_reason": "tool_calls"}
+
+
+def test_streaming_two_tool_calls_still_send_role_only_once():
+    """`_tool_call_stream_chunks` must not repeat delta.role per tool call."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=_MultiToolCallsWorker(),
+            database=Database(Path(directory) / "state.sqlite3"))
+        client = TestClient(make_public_app(state))
+        response = client.post("/v1/chat/completions", json=request_body(stream=True))
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: {")]
+        tool_chunk_roles = [event["choices"][0]["delta"].get("role") for event in events
+                            if event.get("choices") and "tool_calls" in event["choices"][0]["delta"]]
+        assert tool_chunk_roles.count("assistant") == 1
+        # Both calls still stream their opening chunk and arguments.
+        names = [call["function"]["name"]
+                 for event in events if event.get("choices")
+                 for call in event["choices"][0]["delta"].get("tool_calls", [])
+                 if call.get("function", {}).get("name")]
+        assert names == ["read_file", "read_file"]
+
+
+def test_merge_tool_call_deltas_tolerates_a_null_index():
+    """A provider streaming `"index": null` must not crash the merge."""
+    from mlxbar.api.openai_compat import _merge_tool_call_deltas
+    merged = _merge_tool_call_deltas([], [
+        {"index": None, "id": "call_x", "function": {"name": "read", "arguments": "{}"}}])
+    assert merged[0]["function"] == {"name": "read", "arguments": "{}"}
+
+
+class _NonStreamReasoningWorker:
+    loaded = {"id": "Laguna-S-2.1-oQ2e"}
+
+    async def generate(self, messages, images, options, request_id, image_root=None):
+        yield {"type": "reasoning_delta", "text": "thinking hard"}
+        yield {"type": "delta", "text": "the answer"}
+        yield {"type": "completed", "finish_reason": "stop"}
+
+
+def test_non_streaming_reasoning_is_returned_not_dropped():
+    """Since v1.8.4 the splitter runs on tool-less requests; the non-stream path
+    used to drop the resulting reasoning_delta entirely."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = SimpleNamespace(
+            settings=SimpleNamespace(data={"api": {"requireToken": False}}),
+            workers=_NonStreamReasoningWorker(),
+            database=Database(Path(directory) / "state.sqlite3"))
+        client = TestClient(make_public_app(state))
+        payload = client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e",
+            "messages": [{"role": "user", "content": "hello"}]}).json()
+        message = payload["choices"][0]["message"]
+        assert message["content"] == "the answer"
+        assert message["reasoning_content"] == "thinking hard"
+
+
 class _SingleResidentPool:
     loaded = None
 

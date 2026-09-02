@@ -112,6 +112,29 @@
   非text / `logprobs` / `n>1` / 拡張思考の有効化 / server tools / document / MCP）は仕様上の制約として
   README §API に記載済み。`top_k`（両API）は黙って無視（低リスク、下記課題へ記録）。
 
+## v1.9.1で守ること（コード監査4件の修正：`role`重複 / 非ストリーム推論欠落 / `index: null`耐性 / 可読性）
+
+- **#1 マルチtool callの`role`重複** — `_tool_call_stream_chunks`（`openai_compat.py`）は
+  `role` を **先頭 call（`index == 0`）だけ**に付ける。単一 call の出力は不変。`tool_call_delta`
+  経路の `tool_call_role_sent` ガードとあわせて、1レスポンス内で `delta.role` は常に1回。
+  2件目以降の call の先頭チャンクは `{"tool_calls":[…]}` のみ（OpenAI 実体と一致）。
+- **#2 非ストリームの推論内容は捨てず `message.reasoning_content` へ** — `chat()` の非ストリーム
+  ループに `reasoning_delta` 分岐を追加し `reasoning_text` に集約、非空なら
+  `message["reasoning_content"]` に載せる。**`content` へは絶対に戻さない**（v1.8.4 の不変条件＝
+  生思考が配信チャネルへ漏れた事故の再発防止）。`first_token_ms` 記録は `delta` 分岐と対称。
+  Anthropic 経路は無変更（v1 は署名なし thinking を出さない既知制約）。v1.8.4 設計書の
+  「non-stream に `reasoning_content` を新設しない」非目的は、データ欠落解消として意図的に撤回。
+- **#3 `index: null` 耐性** — `_merge_tool_call_deltas`（`openai_compat.py`）と
+  `AnthropicMessageBuilder._merge_tool_call_delta`（`anthropic_stream.py`）は、`index` が
+  `int`（`bool` 除く）でなければ位置インデックスへフォールバック（`index` 省略時と同義）。
+  整数 `index` の挙動は不変。`int(None)` による応答途中クラッシュを防ぐ防御。
+- **#4 括弧の追加のみ** — `server.py` の `rpc()` ロード失敗分類の
+  `... or ("metal" in lowered and "memory" in lowered):`。優先順位上は従来から正しく、
+  `/generate` 側の双子（L610-611）に合わせただけ。**挙動は完全に不変。**
+- **Coordinator のルート・設定 schema・管理 API・Swift GUI は1行も変更しない。**
+  `Localizable.strings` 追加なし（GUI 無変更）。詳細は `DESIGN_v1.9.1.md` /
+  `TEST_PLAN_v1.9.1.md`。監査所見5（heartbeat フレーク）は下記「未解決の課題」のとおり据え置き。
+
 ## 未解決の課題
 
 ### Anthropic / OpenAI の `top_k` を黙って無視している（v1.9.0時点・未対応）
@@ -122,7 +145,7 @@ Anthropic Messages は `top_k` を正式パラメータとして受ける。MLXB
 `options["top_k"]` として通すか、あるいは（`response_format` などと同様に）明示的に
 `UNSUPPORTED_PARAMETER` で拒否するか、どちらかに寄せる価値がある。現状は実害の報告なし。
 
-### tool_parse ハートビートのフレークテスト（v1.9.0時点・据え置き）
+### tool_parse ハートビートのフレークテスト（v1.9.1時点も据え置き）
 
 `Tests/test_worker_server.py::test_buffered_tool_generation_still_emits_heartbeats` は
 `heartbeat_interval_seconds: 0.03` を使い、並列フル実行時の CPU 負荷で

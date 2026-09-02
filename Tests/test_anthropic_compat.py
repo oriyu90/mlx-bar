@@ -244,6 +244,18 @@ def test_streaming_tool_use_uses_input_json_delta_and_tool_use_stop_reason():
         assert delta["delta"]["stop_reason"] == "tool_use"
 
 
+def test_tool_call_delta_with_a_null_index_does_not_crash_the_builder():
+    """`int(None)` on a streamed `"index": null` must not take the stream down."""
+    from mlxbar.api.anthropic_stream import AnthropicMessageBuilder
+    builder = AnthropicMessageBuilder("m", 3)
+    builder.handle({"type": "tool_call_delta", "calls": [
+        {"index": None, "id": "toolu_x", "function": {"name": "read", "arguments": "{}"}}]})
+    builder.handle({"type": "completed", "finish_reason": "tool_calls"})
+    message = builder.final_message()
+    tool_use = next(b for b in message["content"] if b["type"] == "tool_use")
+    assert tool_use["name"] == "read"
+
+
 def test_stop_sequence_finish_maps_to_stop_reason_stop_sequence():
     class StopWorker(FakeWorker):
         def __init__(self):

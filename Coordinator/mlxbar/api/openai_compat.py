@@ -392,6 +392,7 @@ async def chat(request: Request, body: dict):
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                                           "X-Accel-Buffering": "no"})
     text = ""
+    reasoning_text = ""
     tool_calls: list[dict] = []
     finish_reason = "stop"
     usage = None
@@ -411,6 +412,20 @@ async def chat(request: Request, body: dict):
                         request.state.api_log["first_token_ms"] = round(
                             (time.monotonic() - origin) * 1000)
                 text += event["text"]
+            elif event.get("type") == "reasoning_delta":
+                # Since v1.8.4 the worker's splitter runs on tool-less requests
+                # too, so a reasoning model's `<think>` block arrives here as
+                # `reasoning_delta` instead of `delta`. Without this branch it
+                # was dropped entirely on the non-stream path -- silent content
+                # loss. Keep it out of `content` (the v1.8.4 invariant) but
+                # return it as `message.reasoning_content`, mirroring the
+                # streaming path's `delta.reasoning_content`.
+                if request.state.api_log.get("first_token_ms") is None:
+                    origin = getattr(request.state, "api_started_monotonic", None)
+                    if origin is not None:
+                        request.state.api_log["first_token_ms"] = round(
+                            (time.monotonic() - origin) * 1000)
+                reasoning_text += str(event.get("text", ""))
             elif event.get("type") == "tool_calls":
                 tool_calls = _normalize_output_tool_calls(event.get("calls") or [])
                 finish_reason = "tool_calls" if tool_calls else finish_reason
@@ -444,6 +459,8 @@ async def chat(request: Request, body: dict):
         if image_workspace:
             image_workspace.cleanup()
     message = {"role": "assistant", "content": text or None if tool_calls else text}
+    if reasoning_text:
+        message["reasoning_content"] = reasoning_text
     if tool_calls:
         message["tool_calls"] = tool_calls
         finish_reason = "tool_calls"
@@ -799,7 +816,11 @@ def _normalize_output_tool_calls(calls: list) -> list[dict]:
 
 def _merge_tool_call_deltas(current: list[dict], deltas: list[dict]) -> list[dict]:
     for position, delta in enumerate(deltas):
-        index = int(delta.get("index", position))
+        raw_index = delta.get("index", position)
+        # A provider that streams `"index": null` (or any non-integer) must not
+        # crash the merge mid-response with `int(None)` -- fall back to this
+        # delta's ordinal position, which is what an absent index already means.
+        index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else position
         while len(current) <= index:
             current.append({"id": "call_" + uuid.uuid4().hex, "type": "function",
                             "function": {"name": "", "arguments": ""}})
@@ -817,8 +838,13 @@ def _tool_call_stream_chunks(request_id: str, model: str, calls: list[dict], cre
     for index, call in enumerate(normalized):
         first = {"index": index, "id": call["id"], "type": "function",
                  "function": {"name": call["function"]["name"], "arguments": ""}}
+        # `delta.role` belongs on the first chunk of the choice only. Repeating it
+        # on the opening chunk of every tool call (2+ calls in one response)
+        # trips strict SSE parsers -- the same Vercel AI SDK / OpenCode breakage
+        # the `tool_call_role_sent` guard exists to prevent on the delta path.
+        opening_delta = {"role": "assistant", "tool_calls": [first]} if index == 0 else {"tool_calls": [first]}
         yield {"id": request_id, "object": "chat.completion.chunk", "created": created, "model": model,
-               "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [first]}, "finish_reason": None}]}
+               "choices": [{"index": 0, "delta": opening_delta, "finish_reason": None}]}
         arguments = call["function"]["arguments"]
         for offset in range(0, len(arguments), 256):
             delta = {"index": index, "function": {"arguments": arguments[offset:offset + 256]}}

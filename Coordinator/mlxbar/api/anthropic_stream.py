@@ -138,7 +138,11 @@ class AnthropicMessageBuilder:
                 self.stop_reason = _FINISH_TO_STOP_REASON.get(reason, "end_turn")
 
     def _merge_tool_call_delta(self, delta: dict) -> None:
-        index = int(delta.get("index", len(self.content)))
+        raw_index = delta.get("index", len(self.content))
+        # `"index": null` (or any non-integer) must not crash the stream with
+        # `int(None)` -- fall back to appending as the next block, which is what
+        # an absent index already means here.
+        index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else len(self.content)
         function = delta.get("function") or {}
         if delta.get("id"):
             self._tool_id_by_index[index] = delta["id"]

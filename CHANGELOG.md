@@ -2,6 +2,19 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [1.9.1] - 2026-09-02
+
+### 修正
+
+- **OpenAI互換のストリーミングで、1レスポンス内にtool callが2つ以上あると`delta.role`が繰り返し送られる不具合を修正。** `_tool_call_stream_chunks`（`Coordinator/mlxbar/api/openai_compat.py`）が各tool callの先頭チャンクで`{"role":"assistant", ...}`を出していたため、`<tool_call>`ブロックを2つ以上出すモデルの応答で`role`がN回流れ、厳格なSSEパーサ（Vercel AI SDK / OpenCode）を壊していました。これは`tool_call_role_sent`ガードとコメント（L266-270）が本来防ごうとしている状態そのものです。`role`を先頭のtool call（`index == 0`）だけに付けるよう修正。単一tool callの出力・`tool_call_delta`経路・非ストリーム経路は不変。
+- **`tools`を含まない非ストリームリクエストで、推論モデルの`<think>`内容が完全に欠落する不具合を修正。** v1.8.4以降、`tools`無しでも`reasoning_only`スプリッタが常時走るため、推論モデルの思考は`reasoning_delta`イベントとしてCoordinatorへ届きます。ところが非ストリームの`/v1/chat/completions`にはこのイベントの分岐が無く、思考内容は`content`にも出ず、どこにも返らず捨てられていました（ストリームでは`delta.reasoning_content`として分離済み）。非ストリームでも集約し、`message.reasoning_content`として返すよう修正。**`content`へは一切出しません**（v1.8.4の不変条件を維持。生の思考文が配信チャネルへ漏れた事故の再発防止）。Anthropic互換経路は「v1では署名なしthinkingブロックを出さない」既知制約のため変更なし。
+- **ストリーミングtool callのマージが`"index": null`でクラッシュする箇所を修正。** `_merge_tool_call_deltas`（openai_compat.py）と`AnthropicMessageBuilder._merge_tool_call_delta`（`anthropic_stream.py`）の`int(delta.get("index", …))`が、`index`にJSONの`null`（=`None`）や非整数が来ると`TypeError`で応答途中に落ちていました。非整数のときはそのデルタの位置インデックスへフォールバックするよう修正（`index`省略時と同じ意味）。整数の`index`に対する挙動は不変。
+- **`Workers/common/server.py`のロード失敗分類で、`or`/`and`が混在した非括弧の条件式に明示括弧を追加。** 演算子優先順位により従来から論理的には正しく、双子の生成側ハンドラ（L610-611）は既に明示括弧でした。挙動は完全に不変で、可読性と一貫性のための変更です。
+
+### テスト
+
+- Pythonテスト**380件**（v1.9.0の376＋新規4）: マルチtool callで`role`が1回だけになること、`_merge_tool_call_deltas`が`index: null`を許容すること、非ストリームで推論内容が`reasoning_content`として返り`content`に混ざらないこと、`AnthropicMessageBuilder`が`index: null`のtool call deltaでクラッシュしないこと。既知フレーク`test_buffered_tool_generation_still_emits_heartbeats`は据え置き（v1.8.4以降と同じ、観測性テストで互換性・機能とは無関係）。
+
 ## [1.9.0] - 2026-08-31
 
 ### 追加

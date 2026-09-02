@@ -394,7 +394,8 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             lowered = text.lower()
             if "remote code" in lowered:
                 code, human = "MODEL_REQUIRES_REMOTE_CODE", "このモデルはリモートコードの実行が必要なため読み込めません"
-            elif "out of memory" in lowered or "insufficient memory" in lowered or "metal" in lowered and "memory" in lowered:
+            elif "out of memory" in lowered or "insufficient memory" in lowered or (
+                    "metal" in lowered and "memory" in lowered):
                 code, human = "MODEL_INCOMPATIBLE", "メモリ不足のためモデルを読み込めませんでした"
             elif "safetensors" in lowered or "no such file" in lowered or "not found" in lowered:
                 code, human = "MODEL_INCOMPATIBLE", "モデルファイルを読み込めませんでした。ファイルが揃っているか確認してください"
