@@ -64,13 +64,20 @@ FAILED test_tool_call_delta_with_a_null_index_does_not_crash_the_builder（同�
 稼働中の `/Applications/MLXBar.app` を v1.9.1 へ入れ替え、coordinator 再起動後、
 LAN の OpenAI 互換エンドポイント（`http://192.168.0.165:11435/v1`、OpenClaw が使う経路と同一）で:
 
+2026-09-02 結果（`/Applications/MLXBar.app` を v1.9.1 へ入れ替え、coordinator 再起動後。
+`Ornith-1.5-35B-A3B-MLX-4bit`＝推論モデル、`enable_thinking=false` 等をすべて無視する。
+`Qwen3.5-9B-MLX-8bit` と2体プール常駐）:
+
 | ケース | 期待 | 結果 |
 |---|---|---|
-| 推論モデル・`tools` **なし**・**非stream** | `content` は本文のみ、`message.reasoning_content` に思考、`<think>`/`</think>` は本文に無し | （実機実行後に追記） |
-| 推論モデル・`tools` **なし**・stream | 従来どおり `delta.reasoning_content` で分離（回帰なし） | （実機実行後に追記） |
-| 通常モデル・`tools` あり・stream（tool call 1件） | v1.9.0 と同一（`role` 1回、引数チャンク、`finish_reason=tool_calls`） | （実機実行後に追記） |
-| `tools` あり ＋ 先行 `tool` ロールメッセージ（v1.8.3 のクラッシュ事例の回帰ガード） | `GENERATION_FAILED` なし | （実機実行後に追記） |
-| `/api/v1/health` が `1.9.1` を返す | バージョン表記の更新漏れ確認 | （実機実行後に追記） |
+| `Ornith-1.5-35B-A3B-MLX-4bit`・`tools` **なし**・**非stream** | `content` は本文のみ、`message.reasoning_content` に思考、`<think>`/`</think>` は本文に無し | ✅ `content='\n\n4'`、`reasoning_content='The user is asking a simple math question…'`、本文に think タグ無し、`finish=stop`（v1.9.0 では `reasoning_content` キー自体が無く思考は消失していた） |
+| `Ornith-1.5-35B-A3B-MLX-4bit`・`tools` **なし**・stream | 従来どおり `delta.reasoning_content` で分離（回帰なし） | ✅ `role` チャンク1回、`content='\n\nPONG'`、`reasoning_content` に CoT、本文に think タグ無し |
+| `Ornith-1.5-35B-A3B-MLX-4bit`・`tools` あり ＋ 先行 `tool` ロールメッセージ（v1.8.3 クラッシュ事例の回帰ガード）・stream | `GENERATION_FAILED` なし、`role` 1回 | ✅ `error=None`、`role` チャンク1回、1文の要約を返す |
+| `/api/v1/health`（管理API）が `1.9.1` を返す | バージョン表記の更新漏れ確認 | ✅ `{"status":"ok","version":"1.9.1"}`、`mlxbarctl diagnostics` も `version: 1.9.1` |
+
+`build-release.sh` + `VERSION=1.9.1 verify-release.sh` は 2026-09-02 に通過（ad-hoc 署名、
+`codesign --verify --deep --strict` OK、DMG `hdiutil verify` VALID）。
+DMG SHA-256: `4378e97f4f748a5879df3793c80b74d1ebd2dbba3175885dd270b32c05c43f94`。
 
 ## 5. ビルド
 
