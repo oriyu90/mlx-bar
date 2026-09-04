@@ -231,6 +231,10 @@ struct ModelSourceSettingsView: View {
     @State private var systemReserveGB = 4
     @State private var generationConcurrency = 2
     @State private var maxReplicasPerModel = 2
+    @State private var contextCompressionEnabled = false
+    @State private var contextCompressionTriggerPercent = 70
+    @State private var contextCompressionKeepTail = 8
+    @State private var contextCompressionSummaryMaxTokens = 800
     @State private var pinnedModelIds: Set<String> = []
     @State private var pinnedModelReplicas: [String: Int] = [:]
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
@@ -286,6 +290,27 @@ struct ModelSourceSettingsView: View {
                 LabeledContent(LS("常駐メモリ予算"), value: ByteCountFormatter.string(
                     fromByteCount: model.modelPoolBudgetBytes, countStyle: .memory))
                 Text(LS("モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("コンテキスト自動圧縮")) {
+                Toggle(LS("長い会話の古い部分を要約して短縮"), isOn: $contextCompressionEnabled)
+                Stepper("\(LS("発火の目安")): \(contextCompressionTriggerPercent)%",
+                        value: $contextCompressionTriggerPercent, in: 50...95, step: 5)
+                Stepper("\(LS("要約後も残す直近ターン数")): \(contextCompressionKeepTail)",
+                        value: $contextCompressionKeepTail, in: 2...50)
+                Stepper("\(LS("要約の最大トークン数")): \(contextCompressionSummaryMaxTokens)",
+                        value: $contextCompressionSummaryMaxTokens, in: 100...4000, step: 100)
+                Button(LS("コンテキスト圧縮設定を適用")) {
+                    Task {
+                        await model.setContextCompressionSettings(
+                            enabled: contextCompressionEnabled,
+                            triggerPercent: contextCompressionTriggerPercent,
+                            keepTailMessages: contextCompressionKeepTail,
+                            summaryMaxTokens: contextCompressionSummaryMaxTokens)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("要約は元の発言そのものではありません。応答が過去の発言の要約に基づくことがあります。既定では無効です。トリガー閾値はモデルのプロンプト上限に対する割合、直近ターン数は要約されずそのまま送られる末尾のメッセージ数です。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -422,6 +447,11 @@ struct ModelSourceSettingsView: View {
             systemReserveGB = (pool["minimumSystemReserveGB"] as? NSNumber)?.intValue ?? 4
             generationConcurrency = (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 2
             maxReplicasPerModel = (pool["maxReplicasPerModel"] as? NSNumber)?.intValue ?? 2
+            let compression = (model.settings["contextCompression"] as? [String: Any]) ?? [:]
+            contextCompressionEnabled = compression["enabled"] as? Bool ?? false
+            contextCompressionTriggerPercent = Int((((compression["triggerRatio"] as? NSNumber)?.doubleValue ?? 0.7) * 100).rounded())
+            contextCompressionKeepTail = (compression["keepTailMessages"] as? NSNumber)?.intValue ?? 8
+            contextCompressionSummaryMaxTokens = (compression["summaryMaxTokens"] as? NSNumber)?.intValue ?? 800
             let profiles = pool["profiles"] as? [[String: Any]] ?? []
             pinnedModelIds = Set(profiles
                 .filter { ($0["keepLoaded"] as? Bool) ?? false }

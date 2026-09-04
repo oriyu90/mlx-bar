@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -25,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import MLXBarError
+from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from .anthropic_stream import AnthropicMessageBuilder, sse, _anthropic_error_type
 from .openai_compat import (
@@ -313,6 +315,11 @@ async def _messages(request: Request):
 
     response_model = loaded.get("name") or loaded.get("id") or requested_model
     request_id = "chatcmpl-" + secrets.token_hex(12)
+    messages, compression = await maybe_compress_messages(
+        state.workers, loaded, messages, tools, state.settings, request_id)
+    if compression:
+        request.state.api_log["context_compressed"] = True
+        state.last_context_compression = {**compression, "at": time.time()}
     builder = AnthropicMessageBuilder(response_model, _estimate_prompt_tokens(messages))
     generate_for_model = getattr(state.workers, "generate_for_model", None)
 

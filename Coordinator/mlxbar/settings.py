@@ -108,6 +108,19 @@ DEFAULTS: dict[str, Any] = {
         # 27B-class hybrid has not been measured; see mlx-bar.md.
         "memoryBlocks": "off",
     },
+    "contextCompression": {
+        # Off by default: the synthetic summary is not a byte-for-byte stand-in
+        # for what the client sent, so this is an explicit opt-in rather than a
+        # default behaviour change for existing ZCode/OpenCode/Claude Code
+        # setups. See DESIGN_v1.9.2.md section 1.5.
+        "enabled": False,
+        # Fraction of effectiveMaxPromptCharacters at which compression fires.
+        "triggerRatio": 0.7,
+        # Messages at the tail always sent verbatim (tool_calls/tool pairs and
+        # image turns extend this automatically; see context_compression.py).
+        "keepTailMessages": 8,
+        "summaryMaxTokens": 800,
+    },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info",
@@ -274,6 +287,20 @@ class SettingsStore:
             if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
                     or not 1 <= float(maximum) <= 512):
                 raise ValueError("models.pool profile maxMemoryGB must be between 1 and 512")
+        compression = data.get("contextCompression", {})
+        if not isinstance(compression.get("enabled", False), bool):
+            raise ValueError("contextCompression.enabled must be boolean")
+        trigger_ratio = compression.get("triggerRatio", 0.7)
+        if (isinstance(trigger_ratio, bool) or not isinstance(trigger_ratio, (int, float))
+                or not 0.5 <= float(trigger_ratio) <= 0.95):
+            raise ValueError("contextCompression.triggerRatio must be between 0.5 and 0.95")
+        keep_tail = compression.get("keepTailMessages", 8)
+        if isinstance(keep_tail, bool) or not isinstance(keep_tail, int) or not 2 <= keep_tail <= 50:
+            raise ValueError("contextCompression.keepTailMessages must be between 2 and 50")
+        summary_max_tokens = compression.get("summaryMaxTokens", 800)
+        if (isinstance(summary_max_tokens, bool) or not isinstance(summary_max_tokens, int)
+                or not 100 <= summary_max_tokens <= 4000):
+            raise ValueError("contextCompression.summaryMaxTokens must be between 100 and 4000")
         if data.get("general", {}).get("language") not in {"en", "ja"}:
             raise ValueError("general.language must be en or ja")
         if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):

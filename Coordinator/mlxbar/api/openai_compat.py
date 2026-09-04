@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..errors import MLXBarError
+from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 
 
@@ -253,6 +254,12 @@ async def chat(request: Request, body: dict):
         if image_workspace:
             image_workspace.cleanup()
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    normalized_messages, compression = await maybe_compress_messages(
+        app_state(request).workers, loaded, normalized_messages,
+        effective_tools, app_state(request).settings, request_id)
+    if compression:
+        request.state.api_log["context_compressed"] = True
+        app_state(request).last_context_compression = {**compression, "at": time.time()}
     if body.get("stream", False):
         async def stream():
             estimated_prompt_tokens = _estimated_prompt_tokens(normalized_messages)

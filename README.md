@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.9.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 1.9.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -43,7 +43,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.9.1.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.9.2.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -135,7 +135,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -516,7 +516,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.9.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-1.9.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

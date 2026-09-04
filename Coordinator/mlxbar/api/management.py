@@ -46,6 +46,7 @@ async def status(request: Request):
                     "anthropicUrl": f"{base_url}/anthropic" if anthropic_enabled else None,
                     "error": app.public_listener_error},
             "promptCacheHealth": _prompt_cache_health(app, worker_status),
+            "contextCompression": getattr(app, "last_context_compression", None),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
 
 

@@ -303,3 +303,16 @@
 
 /* v1.9.0 -- per-model unload & per-model generation rate in the menu bar */
 "生成速度" = "Generation speed";
+
+/* v1.10.0 -- unified model list & context compression */
+"ロード済みモデル" = "Loaded Models";
+"既定" = "Default";
+"クイックチャットの既定モデル" = "Default model for Quick Chat";
+"コンテキスト自動圧縮" = "Automatic Context Compression";
+"長い会話の古い部分を要約して短縮" = "Summarize older turns of long conversations";
+"発火の目安" = "Trigger threshold";
+"要約後も残す直近ターン数" = "Recent turns kept verbatim";
+"要約の最大トークン数" = "Summary max tokens";
+"コンテキスト圧縮設定を適用" = "Apply Context Compression Settings";
+"コンテキスト圧縮の設定値が範囲外です" = "Context compression settings are outside the supported range";
+"要約は元の発言そのものではありません。応答が過去の発言の要約に基づくことがあります。既定では無効です。トリガー閾値はモデルのプロンプト上限に対する割合、直近ターン数は要約されずそのまま送られる末尾のメッセージ数です。" = "The summary is not the original wording. Replies may be based on a summary of earlier turns instead of the verbatim conversation. Off by default. The trigger threshold is a fraction of the model's prompt limit; recent turns are always sent verbatim.";

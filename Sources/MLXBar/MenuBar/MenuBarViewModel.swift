@@ -48,6 +48,11 @@ struct ResidentModel: Identifiable, Hashable {
     /// idle. Reported per-model by `/api/v1/status` `loadedModels[]` (v1.9.0) so
     /// the menu bar can show a rate under every resident, not just the primary.
     let generationTokensPerSecond: Double?
+    /// Requests waiting behind this model's own generation lane (v1.6.2 pool
+    /// field `laneQueueDepth`), distinct from `activeLeases` -- lets the menu
+    /// bar tell "generating" apart from "queued behind another request" per
+    /// row (v1.10.0), without any backend change.
+    let laneQueueDepth: Int
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -61,8 +66,39 @@ struct ResidentModel: Identifiable, Hashable {
         managedExternally = value["memoryManagedBy"] != nil || (value["poolState"] as? String) == "external"
         replicaCount = (value["replicaCount"] as? NSNumber)?.intValue ?? 1
         replicaIndex = (value["replicaIndex"] as? NSNumber)?.intValue ?? 0
+        laneQueueDepth = (value["laneQueueDepth"] as? NSNumber)?.intValue ?? 0
         let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
+    }
+
+    /// One of "loading" | "generating" | "queued" | "idle", the four states the
+    /// v1.10.0 unified model list distinguishes per row.
+    var activityState: String {
+        if poolState == "loading" { return "loading" }
+        if activeLeases > 0 { return "generating" }
+        if laneQueueDepth > 0 { return "queued" }
+        return "idle"
+    }
+
+    /// Localized status line text for `activityState`.
+    func activityText(japanese: Bool) -> String {
+        switch activityState {
+        case "loading": return japanese ? "ロード中…" : "Loading…"
+        case "generating": return japanese ? "応答生成中" : "Generating"
+        case "queued": return japanese ? "順番待ち" : "Queued"
+        default: return japanese ? "待機中" : "Idle"
+        }
+    }
+
+    /// SF Symbol + tint for `activityState`, matching the existing header
+    /// activity line's palette (orange while busy, green once ready).
+    var activitySymbol: (name: String, tint: Color) {
+        switch activityState {
+        case "loading": return ("arrow.triangle.2.circlepath", .secondary)
+        case "generating": return ("waveform.circle.fill", .orange)
+        case "queued": return ("clock", .secondary)
+        default: return ("checkmark.circle.fill", .green)
+        }
     }
 
     /// Live rate as a short localized string, or nil when the model is idle.
@@ -155,6 +191,10 @@ final class MenuBarViewModel: ObservableObject {
     @Published var cacheAffordableTokens = 0
     @Published var cacheDisabledReason: String?
     @Published var cacheRecentTiers: [String] = []
+    /// Most recent context-compression event (v1.10.0), or nil when the last
+    /// request either didn't need compression or the feature is off.
+    @Published var lastContextCompressionOriginalChars: Int?
+    @Published var lastContextCompressionCompressedChars: Int?
     @Published var activeRequestCount = 0
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
@@ -372,6 +412,13 @@ final class MenuBarViewModel: ObservableObject {
                 setIfChanged(\.cacheAffordableTokens, (health["affordableTokens"] as? NSNumber)?.intValue ?? 0)
                 setIfChanged(\.cacheDisabledReason, health["disabledReason"] as? String)
                 setIfChanged(\.cacheRecentTiers, health["recentTiers"] as? [String] ?? [])
+            }
+            if let compression = json["contextCompression"] as? [String: Any] {
+                setIfChanged(\.lastContextCompressionOriginalChars, (compression["originalChars"] as? NSNumber)?.intValue)
+                setIfChanged(\.lastContextCompressionCompressedChars, (compression["compressedChars"] as? NSNumber)?.intValue)
+            } else {
+                setIfChanged(\.lastContextCompressionOriginalChars, nil)
+                setIfChanged(\.lastContextCompressionCompressedChars, nil)
             }
             if let api = json["api"] as? [String: Any] {
                 setIfChanged(\.apiURL, api["url"] as? String ?? apiURL)
@@ -771,6 +818,18 @@ final class MenuBarViewModel: ObservableObject {
             : "The last \(cacheColdStreak) requests re-processed the whole prompt (\(reason))"
     }
 
+    /// Set right after a request triggered context compression (v1.10.0), so
+    /// the model list can say the model's reply is based on a summary of
+    /// earlier turns rather than the verbatim conversation.
+    var contextCompressionSummaryText: String? {
+        guard let original = lastContextCompressionOriginalChars,
+              let compressed = lastContextCompressionCompressedChars else { return nil }
+        let japanese = guiLanguage == "ja"
+        return japanese
+            ? "会話を要約して短縮しました（\(MenuBarViewModel.tokenCount(original))→\(MenuBarViewModel.tokenCount(compressed))文字）"
+            : "Compacted the conversation (\(MenuBarViewModel.tokenCount(original))→\(MenuBarViewModel.tokenCount(compressed)) chars)"
+    }
+
     static func cacheReasonText(_ reason: String?, japanese: Bool) -> String {
         switch reason {
         case "reuse_unsupported":
@@ -840,6 +899,24 @@ final class MenuBarViewModel: ObservableObject {
                 "minimumSystemReserveGB": reserveGB,
                 "generationConcurrency": generationConcurrency,
             ]]])
+            await self.refreshSettings()
+        }
+    }
+
+    func setContextCompressionSettings(enabled: Bool, triggerPercent: Int, keepTailMessages: Int,
+                                       summaryMaxTokens: Int) async {
+        guard 50...95 ~= triggerPercent, 2...50 ~= keepTailMessages, 100...4000 ~= summaryMaxTokens else {
+            errorMessage = ui("Context compression settings are outside the supported range",
+                              "コンテキスト圧縮の設定値が範囲外です")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["contextCompression": [
+                "enabled": enabled,
+                "triggerRatio": Double(triggerPercent) / 100,
+                "keepTailMessages": keepTailMessages,
+                "summaryMaxTokens": summaryMaxTokens,
+            ]])
             await self.refreshSettings()
         }
     }
@@ -1111,8 +1188,14 @@ final class MenuBarViewModel: ObservableObject {
 
     func copyLoadedModelName() {
         guard let loadedName else { return }
+        copyModelName(loadedName)
+    }
+
+    /// Copies any resident model's name, not just the primary one -- each row
+    /// in the v1.10.0 unified model list has its own copy button.
+    func copyModelName(_ name: String) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(loadedName, forType: .string)
+        NSPasteboard.general.setString(name, forType: .string)
         modelCopyStatus = ui("Model name copied", "モデル名をコピーしました")
         let copiedStatus = modelCopyStatus
         Task { [weak self] in

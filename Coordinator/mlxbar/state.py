@@ -40,6 +40,10 @@ class AppState:
         self.management_server = None
         self.public_listener_error: str | None = None
         self.started_at = asyncio.get_event_loop().time()
+        # Last context-compression event (see api/context_compression.py), or
+        # None. In-memory only -- purely informational, not persisted, so a
+        # restart simply forgets it rather than needing a DB migration.
+        self.last_context_compression: dict | None = None
 
     def scan_job(self) -> dict:
         async def work(update):

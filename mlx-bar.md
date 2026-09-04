@@ -135,6 +135,27 @@
   `Localizable.strings` 追加なし（GUI 無変更）。詳細は `DESIGN_v1.9.1.md` /
   `TEST_PLAN_v1.9.1.md`。監査所見5（heartbeat フレーク）は下記「未解決の課題」のとおり据え置き。
 
+## v1.9.2で守ること（コンテキスト自動圧縮 / メニューバーのモデル一覧UI刷新）
+
+- **コンテキスト圧縮は既定無効。** `contextCompression.enabled: false` がデフォルト。理由は
+  「要約は逐語の代替にならない」——ZCode/Claude Code/OpenCodeはモデルが会話全体を実際に見ている
+  前提で動くため、有効化はユーザーの明示的なSettings操作でのみ行う。v1.9.2を適用しただけでは
+  既存運用の挙動は一切変わらない（`config.json`にキーが無ければ無効相当にマージされる）。
+- **発火閾値は「実際に解決されたモデル」基準。** `ModelPoolSupervisor.effective_max_prompt_characters()`
+  はプールの主スロット固定なので使わず、`context_compression.py`の`_effective_max_prompt_characters()`
+  が`WorkerSupervisor`と同じ式（`max(configured, min(modelMaxTokens*4, 10_000_000))`）を、
+  `_ensure_requested_model()`が解決した`loaded`から直接計算する。複数モデル常駐時に主モデルでない
+  モデルへのリクエストでも閾値がずれない。
+- **`tool_calls`/`tool`ペアと画像ターンは圧縮候補から除外。** `_split_point()`が境界を左へ
+  スナップし、要約後もOpenAI/Anthropic互換のメッセージ列として不正な形にならない。`tools`/
+  `tool_choice`自体は`messages`と別に渡るため圧縮の対象外——ツール定義が壊れる経路はない。
+- **要約失敗時は無条件で元のプロンプトへフォールバック。** `prompt_cache.py`と同じ「ディスク
+  操作は失敗しても例外を投げない」設計。`asyncio.CancelledError`は`except Exception`で捕まえず
+  そのまま伝播させる（クライアント切断時に処理を隠さない）。
+- **モデル一覧UIはSwift側のみの変更、Coordinator/Workers（Python）は無変更。** `laneQueueDepth`
+  はすでに`model_pool.py`にあった値をSwiftの`ResidentModel`へ1フィールド追加しただけ。
+  詳細は`DESIGN_v1.9.2.md` / `TEST_PLAN_v1.9.2.md`。
+
 ## 未解決の課題
 
 ### Anthropic / OpenAI の `top_k` を黙って無視している（v1.9.0時点・未対応）
