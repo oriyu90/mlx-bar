@@ -15,8 +15,26 @@ Anthropic streaming reference:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
+
+
+THINKING_SIGNATURE_PREFIX = "mlxbar-local-unsigned:"
+
+
+def _local_thinking_signature(thinking_text: str) -> str:
+    """A locally-computed stand-in for Anthropic's cryptographic block signature.
+
+    Real extended thinking blocks carry a signature Anthropic's own servers
+    issue and later verify, proving the block was not tampered with between
+    turns. MLXBar has no such authority to sign anything, so this is a plain
+    hash tagged with a prefix that makes the difference obvious to anyone who
+    inspects it -- and MLXBar never verifies an incoming `signature` either,
+    so a caller round-tripping one of these back through MLXBar works, while
+    sending it to the real Anthropic API would not.
+    """
+    return THINKING_SIGNATURE_PREFIX + hashlib.sha256(thinking_text.encode("utf-8")).hexdigest()
 
 
 _FINISH_TO_STOP_REASON = {
@@ -46,10 +64,12 @@ class AnthropicMessageBuilder:
     routes cannot drift.
     """
 
-    def __init__(self, model: str, input_tokens: int, *, message_id: str | None = None):
+    def __init__(self, model: str, input_tokens: int, *, message_id: str | None = None,
+                emit_thinking: bool = False):
         self.model = model
         self.message_id = message_id or new_message_id()
         self.input_tokens = max(0, int(input_tokens or 0))
+        self.emit_thinking = emit_thinking
         self.content: list[dict] = []
         self.stop_reason: str | None = None
         self.stop_sequence: str | None = None
@@ -60,6 +80,7 @@ class AnthropicMessageBuilder:
         self._open_kind: str | None = None
         self._tool_args_by_index: dict[int, str] = {}
         self._tool_id_by_index: dict[int, str] = {}
+        self._thinking_text = ""
         self._failed = False
 
     # --- estimation ------------------------------------------------------
@@ -80,6 +101,12 @@ class AnthropicMessageBuilder:
             self.content[-1]["text"] += text
         else:
             self.content.append({"type": "text", "text": text})
+
+    def _append_thinking(self, text: str) -> None:
+        if self.content and self.content[-1]["type"] == "thinking":
+            self.content[-1]["thinking"] += text
+        else:
+            self.content.append({"type": "thinking", "thinking": text})
 
     def _append_tool_use(self, call: dict) -> None:
         function = call.get("function", call)
@@ -104,6 +131,11 @@ class AnthropicMessageBuilder:
             if text:
                 self._note_text(text)
                 self._append_text(text)
+        elif kind == "reasoning_delta" and self.emit_thinking:
+            text = str(event.get("text", ""))
+            if text:
+                self._note_text(text)
+                self._append_thinking(text)
         elif kind == "tool_calls":
             for call in event.get("calls") or []:
                 self._append_tool_use(call)
@@ -165,6 +197,9 @@ class AnthropicMessageBuilder:
         self.stop_reason = self.stop_reason or "tool_use"
 
     def final_message(self) -> dict:
+        for block in self.content:
+            if block.get("type") == "thinking" and "signature" not in block:
+                block["signature"] = _local_thinking_signature(block["thinking"])
         return {
             "id": self.message_id,
             "type": "message",
@@ -189,8 +224,18 @@ class AnthropicMessageBuilder:
     def _close_open_block(self) -> list[dict]:
         if self._open_kind is None:
             return []
+        out = []
+        if self._open_kind == "thinking":
+            # Anthropic signs a thinking block only once it is complete; the
+            # signature therefore arrives as a final delta right before the
+            # block closes, never incrementally like the thinking text itself.
+            signature = _local_thinking_signature(self._thinking_text)
+            out.append({"type": "content_block_delta", "index": self._index,
+                        "delta": {"type": "signature_delta", "signature": signature}})
+            self._thinking_text = ""
         self._open_kind = None
-        return [{"type": "content_block_stop", "index": self._index}]
+        out.append({"type": "content_block_stop", "index": self._index})
+        return out
 
     def _open_text_block(self) -> list[dict]:
         out = self._close_open_block()
@@ -198,6 +243,15 @@ class AnthropicMessageBuilder:
         self._open_kind = "text"
         out.append({"type": "content_block_start", "index": self._index,
                     "content_block": {"type": "text", "text": ""}})
+        return out
+
+    def _open_thinking_block(self) -> list[dict]:
+        out = self._close_open_block()
+        self._index += 1
+        self._open_kind = "thinking"
+        self._thinking_text = ""
+        out.append({"type": "content_block_start", "index": self._index,
+                    "content_block": {"type": "thinking", "thinking": ""}})
         return out
 
     def _open_tool_block(self, tool_id: str, name: str) -> list[dict]:
@@ -214,8 +268,19 @@ class AnthropicMessageBuilder:
         if kind in {"phase", "heartbeat", "queue", "progress"}:
             return [{"type": "ping"}]
         if kind == "reasoning_delta":
-            # v1: internal reasoning is not surfaced as a (signed) thinking block.
-            return []
+            if not self.emit_thinking:
+                return []
+            text = str(event.get("text", ""))
+            if not text:
+                return []
+            self._note_text(text)
+            self._thinking_text += text
+            out: list[dict] = []
+            if self._open_kind != "thinking":
+                out += self._open_thinking_block()
+            out.append({"type": "content_block_delta", "index": self._index,
+                        "delta": {"type": "thinking_delta", "thinking": text}})
+            return out
         if kind == "delta":
             text = str(event.get("text", ""))
             if not text:

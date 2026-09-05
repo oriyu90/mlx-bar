@@ -612,15 +612,25 @@ def test_reasoning_delta_uses_openai_compatible_reasoning_content_field():
         assert {"content": "answer"} in deltas
 
 
-def test_multiple_completions_are_rejected_cleanly():
+def test_multiple_completions_return_n_choices_non_streaming():
+    # Since v2.0.0: n > 1 fans out sequential generations into `choices`.
+    # Combined with `stream=true` it is still rejected cleanly (interleaving
+    # per-choice SSE deltas is out of scope), which the second half checks.
     with tempfile.TemporaryDirectory() as directory:
         client, _, _ = make_autoload_client(Path(directory))
         response = client.post("/v1/chat/completions", json={
             "model": "Laguna-S-2.1-oQ2e", "n": 2,
             "messages": [{"role": "user", "content": "hello"}],
         })
-        assert response.status_code == 422
-        assert response.json()["error"]["code"] == "INVALID_REQUEST"
+        assert response.status_code == 200
+        assert [choice["index"] for choice in response.json()["choices"]] == [0, 1]
+
+        rejected = client.post("/v1/chat/completions", json={
+            "model": "Laguna-S-2.1-oQ2e", "n": 2, "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert rejected.status_code == 400
+        assert rejected.json()["error"]["code"] == "UNSUPPORTED_PARAMETER"
 
 
 def test_full_generation_queue_returns_retryable_http_429_before_stream_starts():
@@ -668,8 +678,14 @@ def test_stream_log_records_body_duration_and_internal_error_code():
         assert log["error_code"] == "SYNTHETIC_TIMEOUT"
 
 
-def test_structured_output_is_refused_rather_than_silently_ignored():
-    """Ignoring an unknown vendor field is right; ignoring JSON mode is not."""
+def test_unsupported_parameters_are_refused_rather_than_silently_ignored():
+    """Ignoring an unknown vendor field is right; ignoring an unsupported standard one is not.
+
+    Since v2.0.0, `response_format: json_object` / `json_schema` are real
+    (best-effort, validated) features -- see test_v2_features.py -- so this
+    test now covers what is still refused up front: an unrecognised
+    response_format type, and `logprobs` (deferred; see DESIGN_v2.0.0.md).
+    """
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         settings = SettingsStore(root)
@@ -682,7 +698,7 @@ def test_structured_output_is_refused_rather_than_silently_ignored():
         with TestClient(app) as client:
             body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
             rejected = client.post("/v1/chat/completions",
-                                   json={**body, "response_format": {"type": "json_object"}})
+                                   json={**body, "response_format": {"type": "markdown"}})
             assert rejected.status_code == 400
             assert rejected.json()["error"]["code"] == "UNSUPPORTED_PARAMETER"
             assert rejected.json()["error"]["param"] == "response_format"
@@ -1172,10 +1188,13 @@ def test_max_tokens_without_a_worker_ceiling_still_defaults_to_512():
         assert worker.received[2]["max_tokens"] == 512
 
 
-def test_legacy_completions_endpoint_returns_an_openai_shaped_error():
+def test_responses_api_endpoint_returns_an_openai_shaped_error():
+    # `/v1/completions` is a real endpoint since v2.0.0 (test_v2_features.py);
+    # `/v1/responses` is the one still answered as an explicit unsupported
+    # endpoint (see DESIGN_v2.0.0.md for the scope decision).
     with tempfile.TemporaryDirectory() as directory:
         client, _, _ = make_client(Path(directory))
-        response = client.post("/v1/completions", json={"model": "x", "prompt": "hi"})
+        response = client.post("/v1/responses", json={"model": "x", "input": "hi"})
         assert response.status_code == 404
         body = response.json()
         assert body["error"]["code"] == "UNSUPPORTED_ENDPOINT"

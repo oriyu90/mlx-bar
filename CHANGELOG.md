@@ -2,6 +2,38 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.0.0rc1] - 2026-09-05
+
+プレリリース（下書き）。OpenAI/Anthropic互換APIの拡充。
+
+### 追加
+
+- **`/v1/completions`（レガシー補完）を実装。** `prompt`文字列をchat templateを通さず
+  そのままモデルへ渡す、Coordinator/Worker間に元々あった生プロンプト経路を初めて公開APIから
+  使えるようにしました。stream/非stream両対応、`n`（後述）にも対応。
+- **`response_format: json_object` / `json_schema`に対応。** 文法制約デコーダを持たないため、
+  プロンプト指示＋生成後バリデーションのベストエフォート実装です。検証に失敗した場合は
+  無効な出力を黙って返さず、HTTP 502 `RESPONSE_FORMAT_INVALID`（`retryable: true`）で拒否
+  します。`json_schema`は`oneOf`/`$ref`など一部キーワード未対応で、該当スキーマは生成前に
+  HTTP 400で拒否します。
+- **`n > 1`（複数候補生成）に対応。** 非stream時のみ、最大8件。`stream: true`との併用は
+  引き続きHTTP 400で拒否します（真の並列生成ができないローカル1レーン構成のため）。
+- **Anthropic Extended Thinking（`thinking`パラメータ）に対応。** 既存の推論分離機構を
+  `thinking` content blockとして返します。`signature`はMLXBarが計算するローカルな印であり、
+  Anthropic本家が発行・検証する暗号署名ではありません（本家APIへの再送では拒否されます）。
+
+### 見送り（理由を明示）
+
+- OpenAI Responses API（`/v1/responses`）: ステートフルな会話管理・組み込みサーバーサイド
+  ツールなど、単一ローカルモデルプロセスに合わない仕様が多く、部分実装による静かな仕様乖離を
+  避けるため見送りました。明示的な`UNSUPPORTED_ENDPOINT`を返すスタブのみ追加。
+- `logprobs`: 語彙全体のlogprobsをIPC経由で毎トークン送るコストがcrash safety / memory safety
+  の既存方針に見合わないため見送りました（挙動は変更なし）。
+- Chat Completionsのテキスト以外の出力: 既存の`modalities`チェックが元々正しく拒否しており、
+  追加の実装は不要と確認しました。
+
+詳細は`DESIGN_v2.0.0rc1.md`を参照してください。
+
 ## [1.9.2] - 2026-09-05
 
 ### 追加

@@ -12,6 +12,9 @@ from fastapi.responses import StreamingResponse
 from ..errors import MLXBarError
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
+from . import response_format as response_format_lib
+
+MAX_N = 8
 
 
 router = APIRouter()
@@ -40,6 +43,26 @@ def authorize(request: Request) -> None:
 @router.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@router.post("/v1/responses")
+async def responses_api(request: Request):
+    """The stateful Responses API is out of scope; answered explicitly, not 404-by-omission.
+
+    Responses is a different contract from Chat Completions -- server-stored
+    conversation state (`previous_response_id`), background mode, encrypted
+    reasoning items, and built-in server-side tools (web search, code
+    interpreter, computer use) -- none of which fit a single local model
+    process with no server-side storage. A partial implementation would
+    silently diverge from the real spec at exactly the corners a client is
+    least likely to test for; that is worse than refusing clearly. Use
+    `/v1/chat/completions` or `/anthropic/v1/messages`, both fully supported.
+    """
+    authorize(request)
+    raise HTTPException(404, detail={
+        "code": "UNSUPPORTED_ENDPOINT",
+        "message": "/v1/responses は未対応です。/v1/chat/completions を使用してください",
+    })
 
 
 def _is_generatable(model: dict) -> bool:
@@ -90,18 +113,198 @@ async def retrieve_model(request: Request, model_id: str):
 
 
 @router.post("/v1/completions")
-async def legacy_completions(request: Request):
-    """The legacy text-completion endpoint is not implemented.
+async def legacy_completions(request: Request, body: dict):
+    """The legacy raw-text completion endpoint.
 
-    Answering in the OpenAI error shape (rather than FastAPI's default
-    ``{"detail": "Not Found"}``) lets a client that probes this path report a
-    useful message instead of a parser error.
+    Unlike `/v1/chat/completions`, the prompt here is sent to the model
+    verbatim -- no chat template, no role wrapping. The worker/coordinator
+    pipeline already has a first-class raw-string prompt path (a plain
+    string, rather than a `messages` list, skips `apply_chat_template`
+    end-to-end); this route is the first thing in the codebase to expose it
+    over the public API. Context compression does not apply here: it operates
+    on message lists, and a raw prompt has no message boundaries to compress
+    around.
     """
     authorize(request)
-    raise HTTPException(404, detail={
-        "code": "UNSUPPORTED_ENDPOINT",
-        "message": "/v1/completions は未対応です。/v1/chat/completions を使用してください",
-    })
+    if not isinstance(body.get("stream", False), bool):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "stream must be a boolean", "param": "stream"})
+    for unsupported in ("echo", "suffix", "logprobs"):
+        if body.get(unsupported):
+            raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+                "message": f"{unsupported}には対応していません", "param": unsupported, "parameters": [unsupported]})
+    if body.get("best_of", 1) != 1:
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "message": "best_ofには対応していません", "param": "best_of", "parameters": ["best_of"]})
+    requested_model = body.get("model")
+    if not isinstance(requested_model, str) or not requested_model.strip():
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "modelを指定してください"})
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "promptは空でない文字列で指定してください（配列のバッチプロンプトは未対応です）", "param": "prompt"})
+    n = body.get("n", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1 or n > MAX_N:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": f"nは1以上{MAX_N}以下の整数で指定してください", "param": "n"})
+    if n > 1 and body.get("stream", False):
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "message": "n>1はstream=trueと同時には指定できません",
+            "param": "n", "parameters": ["n", "stream"]})
+    request_id = "cmpl-" + uuid.uuid4().hex
+    request.state.api_log = {"model": requested_model, "stream": bool(body.get("stream")),
+                             "message_count": 1, "tool_count": 0,
+                             "message_chars": len(prompt), "request_id": request_id}
+    requested_max_tokens = body.get("max_tokens")
+    if requested_max_tokens is None:
+        resolver = getattr(app_state(request).workers, "effective_max_tokens", None)
+        try:
+            max_tokens = int(resolver()) if callable(resolver) else 512
+        except Exception:
+            max_tokens = 512
+        if max_tokens < 1:
+            max_tokens = 512
+    else:
+        max_tokens = requested_max_tokens
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "max_tokensは正の整数で指定してください", "param": "max_tokens"})
+    generation_defaults = app_state(request).settings.data.get("generation", {})
+    options = {"temperature": body.get("temperature", generation_defaults.get("defaultTemperature", 0.7)),
+               "top_p": body.get("top_p", generation_defaults.get("defaultTopP", 1.0)),
+               "repetition_penalty": body.get("repetition_penalty",
+                                               generation_defaults.get("defaultRepetitionPenalty", 1.0)),
+               "repetition_context_size": body.get("repetition_context_size",
+                                                     generation_defaults.get("repetitionContextSize", 20)),
+               "max_tokens": max_tokens, "tools": [], "tool_choice": None}
+    for key in ("frequency_penalty", "presence_penalty", "seed", "stop"):
+        if key in body:
+            options[key] = body[key]
+    request.state.api_log["max_tokens"] = max_tokens
+    try:
+        loaded = await _ensure_requested_model(request, requested_model)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    response_model = loaded.get("name") or loaded.get("id") or requested_model
+    try:
+        capacity_check = getattr(app_state(request).workers, "raise_if_queue_full", None)
+        if capacity_check:
+            capacity_check()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+    if body.get("stream", False):
+        async def stream():
+            created = int(time.time())
+            completed = False
+            failed = False
+            generation = None
+            try:
+                generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
+                generation = (generate_for_model(
+                    str(loaded.get("id", "")), prompt, [], options, request_id) if generate_for_model else
+                    app_state(request).workers.generate(prompt, [], options, request_id))
+                async for event in generation:
+                    kind = event.get("type")
+                    if kind in {"delta", "reasoning_delta"}:
+                        text = event.get("text", "")
+                        if text:
+                            chunk = {"id": request_id, "object": "text_completion", "created": created,
+                                     "model": response_model, "choices": [{"index": 0, "text": text,
+                                     "logprobs": None, "finish_reason": None}]}
+                            yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+                    elif kind == "completed":
+                        if completed:
+                            continue
+                        finish_reason = event.get("finish_reason", "stop")
+                        if finish_reason not in {"stop", "length", "content_filter"}:
+                            finish_reason = "stop"
+                        chunk = {"id": request_id, "object": "text_completion", "created": created,
+                                 "model": response_model, "choices": [{"index": 0, "text": "",
+                                 "logprobs": None, "finish_reason": finish_reason}]}
+                        yield "data: " + json.dumps(chunk) + "\n\n"
+                        completed = True
+                    elif kind in {"phase", "heartbeat", "queue", "progress"}:
+                        yield ": mlxbar keep-alive\n\n"
+                    elif kind == "error":
+                        failed = True
+                        request.state.api_log["error_code"] = event.get("code", "GENERATION_FAILED")
+                        yield "data: " + json.dumps({"error": {"code": event.get("code", "GENERATION_FAILED"),
+                              "message": event.get("message", "生成に失敗しました"),
+                              "retryable": event.get("retryable", False)}}, ensure_ascii=False) + "\n\n"
+                        break
+            except asyncio.CancelledError:
+                request.state.api_log["error_code"] = "CLIENT_DISCONNECTED"
+                raise
+            except MLXBarError as exc:
+                failed = True
+                request.state.api_log["error_code"] = exc.code
+                yield "data: " + json.dumps(exc.as_dict(), ensure_ascii=False) + "\n\n"
+            except Exception as exc:
+                failed = True
+                request.state.api_log["error_code"] = "INTERNAL_ERROR"
+                yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
+                                                         "retryable": False}}, ensure_ascii=False) + "\n\n"
+            finally:
+                if generation is not None:
+                    await generation.aclose()
+            if not failed and not completed:
+                chunk = {"id": request_id, "object": "text_completion", "created": created,
+                         "model": response_model, "choices": [{"index": 0, "text": "",
+                         "logprobs": None, "finish_reason": "stop"}]}
+                yield "data: " + json.dumps(chunk) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
+                                          "X-Accel-Buffering": "no"})
+
+    choices = []
+    prompt_tokens = None
+    completion_tokens_total = 0
+    for index in range(n):
+        sub_request_id = request_id if n == 1 else f"{request_id}-{index}"
+        text, finish_reason, usage = await _run_one_text_completion(
+            request, loaded, prompt, options, sub_request_id)
+        choices.append({"index": index, "text": text, "logprobs": None, "finish_reason": finish_reason})
+        if prompt_tokens is None:
+            prompt_tokens = usage["prompt_tokens"]
+        completion_tokens_total += usage["completion_tokens"]
+    total_usage = {"prompt_tokens": prompt_tokens or 0, "completion_tokens": completion_tokens_total,
+                   "total_tokens": (prompt_tokens or 0) + completion_tokens_total}
+    return {"id": request_id, "object": "text_completion", "created": int(time.time()),
+            "model": response_model, "choices": choices, "usage": total_usage}
+
+
+async def _run_one_text_completion(request: Request, loaded: dict, prompt: str, options: dict,
+                                   request_id: str) -> tuple[str, str, dict]:
+    text = ""
+    finish_reason = "stop"
+    usage = None
+    generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
+    generation = (generate_for_model(
+        str(loaded.get("id", "")), prompt, [], options, request_id) if generate_for_model else
+        app_state(request).workers.generate(prompt, [], options, request_id))
+    try:
+        async for event in generation:
+            kind = event.get("type")
+            if kind in {"delta", "reasoning_delta"}:
+                text += event.get("text", "")
+            elif kind == "completed":
+                finish_reason = event.get("finish_reason") or finish_reason
+            elif kind == "usage":
+                usage = _usage_from_event(event, usage)
+                request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
+            elif kind == "metrics":
+                for key in ("prompt_tokens", "prompt_tps", "generation_tps", "cache_tier"):
+                    if event.get(key) is not None:
+                        request.state.api_log[key] = event[key]
+            elif kind == "error":
+                raise MLXBarError(event.get("code", "GENERATION_FAILED"),
+                                  event.get("message", "生成に失敗しました"), 502,
+                                  event.get("retryable", False))
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    finally:
+        await generation.aclose()
+    return text, finish_reason, usage or _usage([{"role": "user", "content": prompt}], text)
 
 
 @router.post("/v1/chat/completions")
@@ -133,8 +336,14 @@ async def chat(request: Request, body: dict):
     requested_model = body.get("model")
     if not isinstance(requested_model, str) or not requested_model.strip():
         raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "modelを指定してください"})
-    if body.get("n", 1) != 1:
-        raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "nは1のみ対応しています"})
+    n = body.get("n", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1 or n > MAX_N:
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": f"nは1以上{MAX_N}以下の整数で指定してください", "param": "n"})
+    if n > 1 and body.get("stream", False):
+        raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER",
+            "message": "n>1はstream=trueと同時には指定できません",
+            "param": "n", "parameters": ["n", "stream"]})
     modalities = body.get("modalities", ["text"])
     if modalities not in (None, ["text"]):
         raise HTTPException(400, detail={"code": "UNSUPPORTED_PARAMETER", "message": "text以外の出力には対応していません"})
@@ -179,6 +388,13 @@ async def chat(request: Request, body: dict):
         elif content is not None:
             raise HTTPException(422, detail={"code": "INVALID_REQUEST", "message": "contentは文字列、配列、またはnullで指定してください"})
         normalized_messages.append(normalized)
+    response_format = body.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") in {"json_object", "json_schema"}:
+        instruction = response_format_lib.format_instruction(response_format)
+        if instruction:
+            normalized_messages = response_format_lib.inject_into_messages(normalized_messages, instruction)
+    else:
+        response_format = None
     tools = _normalize_tools(body.get("tools"))
     tool_choice = _normalize_tool_choice(body.get("tool_choice"), tools)
     if tool_choice == "required" and not tools:
@@ -275,6 +491,7 @@ async def chat(request: Request, body: dict):
             # used by OpenCode), so it is emitted only on the first tool-call
             # chunk here too.
             tool_call_role_sent = False
+            saw_tool_calls = False
 
             def mark_first_token() -> None:
                 if request.state.api_log.get("first_token_ms") is not None:
@@ -313,6 +530,7 @@ async def chat(request: Request, body: dict):
                         yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_calls":
                         mark_first_token()
+                        saw_tool_calls = True
                         # `_tool_call_stream_chunks` already puts `role` on its
                         # first chunk; record that so a later `tool_call_delta`
                         # does not send it a second time.
@@ -321,6 +539,7 @@ async def chat(request: Request, body: dict):
                             yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
                     elif event.get("type") == "tool_call_delta":
                         mark_first_token()
+                        saw_tool_calls = True
                         delta = {"tool_calls": event.get("calls") or []}
                         if not tool_call_role_sent:
                             delta["role"] = "assistant"
@@ -391,6 +610,18 @@ async def chat(request: Request, body: dict):
                 chunk = {"id": request_id, "object": "chat.completion.chunk", "created": created,
                          "model": response_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                 yield "data: " + json.dumps(chunk) + "\n\n"
+            if not failed and not saw_tool_calls and response_format is not None:
+                # The full text is only known once streaming finishes, so a
+                # response_format violation can only be reported after chunks
+                # that looked fine have already reached the client -- the same
+                # limitation OpenAI's own json_schema mode avoids only because
+                # its decoding is grammar-constrained and cannot fail this way.
+                violations = response_format_lib.validate_output(completion_text, response_format)
+                if violations:
+                    request.state.api_log["error_code"] = "RESPONSE_FORMAT_INVALID"
+                    yield "data: " + json.dumps({"error": {"code": "RESPONSE_FORMAT_INVALID",
+                        "message": "生成結果がresponse_formatに一致しませんでした: " + "; ".join(violations),
+                        "retryable": True}}, ensure_ascii=False) + "\n\n"
             if not failed and (body.get("stream_options") or {}).get("include_usage"):
                 yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                     "created": created, "model": response_model, "choices": [], "usage": usage}) + "\n\n"
@@ -398,6 +629,46 @@ async def chat(request: Request, body: dict):
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                                           "X-Accel-Buffering": "no"})
+    try:
+        choices = []
+        prompt_tokens = None
+        completion_tokens_total = 0
+        prompt_tokens_details = None
+        for index in range(n):
+            sub_request_id = request_id if n == 1 else f"{request_id}-{index}"
+            message, finish_reason, usage = await _run_one_completion(
+                request, loaded, normalized_messages, images, options, sub_request_id, image_root)
+            if response_format is not None and not message.get("tool_calls"):
+                violations = response_format_lib.validate_output(message.get("content") or "", response_format)
+                if violations:
+                    request.state.api_log["error_code"] = "RESPONSE_FORMAT_INVALID"
+                    raise HTTPException(502, detail={"code": "RESPONSE_FORMAT_INVALID",
+                        "message": "生成結果がresponse_formatに一致しませんでした: " + "; ".join(violations),
+                        "retryable": True})
+            choices.append({"index": index, "message": message, "finish_reason": finish_reason})
+            if prompt_tokens is None:
+                prompt_tokens = usage["prompt_tokens"]
+                prompt_tokens_details = usage.get("prompt_tokens_details")
+            completion_tokens_total += usage["completion_tokens"]
+    finally:
+        if image_workspace:
+            image_workspace.cleanup()
+    total_usage = {"prompt_tokens": prompt_tokens or 0, "completion_tokens": completion_tokens_total,
+                   "total_tokens": (prompt_tokens or 0) + completion_tokens_total}
+    if prompt_tokens_details is not None:
+        total_usage["prompt_tokens_details"] = prompt_tokens_details
+    return {"id": request_id, "object": "chat.completion", "created": int(time.time()),
+            "model": response_model, "choices": choices, "usage": total_usage}
+
+
+async def _run_one_completion(request: Request, loaded: dict, normalized_messages: list[dict],
+                              images: list[str], options: dict, request_id: str,
+                              image_root=None) -> tuple[dict, str, dict]:
+    """Run one full (non-streaming) generation and return (message, finish_reason, usage).
+
+    Split out of `chat()` so `n > 1` can call it in a loop without duplicating
+    the event-folding logic that the `n == 1` case also needs.
+    """
     text = ""
     reasoning_text = ""
     tool_calls: list[dict] = []
@@ -463,18 +734,13 @@ async def chat(request: Request, body: dict):
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     finally:
         await generation.aclose()
-        if image_workspace:
-            image_workspace.cleanup()
     message = {"role": "assistant", "content": text or None if tool_calls else text}
     if reasoning_text:
         message["reasoning_content"] = reasoning_text
     if tool_calls:
         message["tool_calls"] = tool_calls
         finish_reason = "tool_calls"
-    return {"id": request_id, "object": "chat.completion", "created": int(time.time()),
-            "model": response_model, "choices": [{"index": 0,
-            "message": message, "finish_reason": finish_reason}],
-            "usage": usage or _usage(normalized_messages, text)}
+    return message, finish_reason, usage or _usage(normalized_messages, text)
 
 
 async def _ensure_requested_model(request: Request, requested: str) -> dict:
@@ -688,12 +954,23 @@ def _reject_unimplemented(body: dict) -> None:
     response_format = body.get("response_format")
     if response_format is not None:
         kind = response_format.get("type") if isinstance(response_format, dict) else None
-        if kind != "text":
+        if kind not in {"text", "json_object", "json_schema"}:
             raise HTTPException(400, detail={
                 "code": "UNSUPPORTED_PARAMETER",
-                "message": "response_formatはtextのみ対応しています。"
-                           "構造化出力はプロンプトとtool callingで指定してください",
+                "message": "response_formatはtext、json_object、json_schemaに対応しています",
                 "param": "response_format", "parameters": ["response_format"]})
+        if kind == "json_schema":
+            spec = response_format.get("json_schema")
+            if not isinstance(spec, dict) or not isinstance(spec.get("name"), str) or not spec.get("name"):
+                raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+                    "message": "response_format.json_schema.nameが必要です", "param": "response_format.json_schema"})
+            try:
+                response_format_lib.check_schema_supported(spec.get("schema"))
+            except response_format_lib.UnsupportedSchemaError as exc:
+                raise HTTPException(400, detail={
+                    "code": "UNSUPPORTED_PARAMETER",
+                    "message": f"response_format.json_schema.schemaに未対応の要素があります: {exc}",
+                    "param": "response_format.json_schema.schema"})
     if body.get("logprobs"):
         raise HTTPException(400, detail={
             "code": "UNSUPPORTED_PARAMETER", "message": "logprobsには対応していません",

@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 1.9.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.0.0rc1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -43,7 +43,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-1.9.2.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.0.0rc1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -135,7 +135,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0rc1の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking）は[`DESIGN_v2.0.0rc1.md`](DESIGN_v2.0.0rc1.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -300,7 +300,9 @@ curl http://127.0.0.1:11435/v1/chat/completions \
 
 APIのモデル指定には、`GET /v1/models`が返す表示名または内部IDを利用できます。この一覧には生成に使えるモデルだけが並びます。スキャンで読み取れなかったフォルダ（拡散モデルの`vae`・`text_encoder`・`transformer`など、外から見るとMLXの重みと区別が付かないもの）は、理由の分かる形で「設定…」→「モデル」には残しますが、公開APIの一覧からは外します。各項目の`modalities`には`text` / `image`が入るので、クライアント側で画像入力の可否をモデル名から推測する必要がありません。存在しないモデル名を指定した場合は、他の要求が実行中でもHTTP 404の`MODEL_NOT_FOUND`を返します（再試行しても直らないものを、再試行すれば直る`ENGINE_BUSY`として返さないためです）。モデルが未ロードでも、既定では最初の要求時にカタログから探してロード完了を待ち、その後に生成します。アプリやモデルWorkerの再起動後も同様に復元します。「設定…」→「モデル」で自動ロードを無効にできます。メニューバーから明示的にアンロードした場合は、意図しない再起動を防ぐためGUIで再ロードするまで自動ロードしません。
 
-OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。`response_format`は`text`のみ対応で、`json_object`・`json_schema`と`logprobs`は黙って無視せずHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。プロンプトキャッシュで再計算を省けたtoken数は、OpenAI標準の`usage.prompt_tokens_details.cached_tokens`に入れて返します。ランタイムが再利用量を報告しなかった場合は0を書かずにフィールドごと省くため、「キャッシュが効かなかった」と「計測していない」を取り違えません。複数候補生成（`n > 1`）とテキスト以外の出力は未対応で、フリーズせず入力エラーとして終了します。
+OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。プロンプトキャッシュで再計算を省けたtoken数は、OpenAI標準の`usage.prompt_tokens_details.cached_tokens`に入れて返します。ランタイムが再利用量を報告しなかった場合は0を書かずにフィールドごと省くため、「キャッシュが効かなかった」と「計測していない」を取り違えません。
+
+v2.0.0rc1から`response_format`の`json_object`・`json_schema`、`n`（複数候補生成、非stream時のみ、最大8）、レガシーの`/v1/completions`（生プロンプト、chat templateなし）に対応しました。`response_format`はMLXBarに文法制約デコーダがないため、プロンプト指示＋生成後バリデーションのベストエフォート実装です（`json_schema`は`oneOf`/`$ref`など一部キーワード未対応、事前にHTTP 400で拒否）。検証に失敗した場合は無効なJSONを黙って返さず、HTTP 502 `RESPONSE_FORMAT_INVALID`（`retryable: true`）で拒否します。`logprobs`とOpenAI Responses API（`/v1/responses`）、Chat Completionsのテキスト以外の出力は引き続き未対応で、フリーズせず入力エラー/HTTP 404として終了します（scope外とした理由は[`DESIGN_v2.0.0rc1.md`](DESIGN_v2.0.0rc1.md)を参照）。
 
 ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルまたは`extra_body`内の`thinking`と`reasoning_effort`も受理し、mlx-lm・mlx-vlmのチャットテンプレートへ渡します。`thinking.type`の`enabled` / `disabled`は`enable_thinking`へ、`budget_tokens`は`thinking_budget`へ、`clear_thinking`は逆値の`preserve_thinking`へ、`thinking.effort`は`reasoning_effort`へ変換します。将来のZCodeやOpenAI互換クライアントが追加する未知の拡張項目は生成へ渡さず安全に無視するため、項目追加だけでHTTP 400になりません。同じ値が`extra_body.chat_template_kwargs`に明示された場合はそちらを優先します。`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`はMLXBarが管理するため、`chat_template_kwargs`内での上書きは受け付けません。
 
@@ -409,9 +411,11 @@ ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒�
 | Model | `GET /v1/models`が返す表示名または内部ID。MLXBarでモデルをロード（または常駐）しておくと、常駐が1つだけのときはクライアント側のモデル名が一致しなくてもその常駐モデルへ振り分けます。 |
 
 - `max_tokens`を送らないクライアントには、512ではなくAPI有効上限（既定8,192、モデル上限で頭打ち）を適用します。上の「Max token上限」を参照してください。
-- `response_format`は`text`のみ対応です。`json_object` / `json_schema`はHTTP 400で拒否します。構造化出力はプロンプトとtool callingで指定してください。
+- `response_format`は`text` / `json_object` / `json_schema`に対応します（v2.0.0rc1〜、プロンプト指示＋生成後バリデーションのベストエフォート。詳細は上を参照）。それ以外のtypeはHTTP 400で拒否します。
+- `n`（複数候補生成、1〜8）に対応します（v2.0.0rc1〜、非stream時のみ。`stream: true`との併用はHTTP 400）。
+- `/v1/completions`（レガシーの生テキスト補完、chat templateなし）に対応します（v2.0.0rc1〜）。
 - ストリーミングのtool callでは、OpenAIと同じく`delta.role`を最初のチャンクだけに付けます（一部のSDKの厳格なパーサ対策）。
-- 未対応のパス（`/v1/completions`など）にも、`{"detail": "Not Found"}`ではなくOpenAI形式の`error`オブジェクトで応答します。
+- 未対応のパス（`/v1/responses`など）にも、`{"detail": "Not Found"}`ではなくOpenAI形式の`error`オブジェクトで応答します。
 
 ### Anthropic互換API / Claude Code（v1.8.0）
 
@@ -427,7 +431,8 @@ export ANTHROPIC_MODEL="<GET /anthropic/v1/models が返すローカルモデル
 - 認証は`x-api-key`または`Authorization: Bearer`。`anthropic-version`ヘッダ必須。全応答に`request-id`ヘッダ。
 - 変換対象: `system`、text、画像（base64/URL、既存のprivate workspace・容量・SSRF対策を通す）、client tool use と`tool_result`、`tool_choice`（auto/any/tool/none）、`disable_parallel_tool_use`、`stop_sequences`。ストリームは`message_start`→`content_block_*`→`message_delta`→`message_stop`（`[DONE]`なし、`ping` keep-alive）。`stop_reason`は stop→end_turn / length→max_tokens / tool_calls→tool_use / stop文字列検出→stop_sequence。
 - `count_tokens`はロード中モデルの実トークナイザで数えます（未対応ランタイムは501で安全に失敗）。
-- **v1では未対応**（黙って無視せず`invalid_request_error`で拒否）: Anthropicのサーバーサイドツール、extended thinking（署名block）、PDF/`document` content block、Anthropic側MCP実行。`cache_control`は受理して無視し、`usage`にAnthropicの課金用cacheフィールドを出しません。Claudeのモデル名をローカルモデルへリネームせず、一致しない名前は常駐1件へフォールバックし、応答の`model`は実ローカル名です。
+- **extended thinking**（`thinking: {type: "enabled", budget_tokens}`）はv2.0.0rc1から対応します。既存の推論分離機構（`reasoning_delta`）をそのまま`thinking` content blockとして返し、stream/非stream双方で`thinking_delta` / `signature_delta`を含みます。ただし`signature`はMLXBarが自前で計算するローカルな印（`mlxbar-local-unsigned:`接頭辞つき）で、Anthropic本家が発行・検証する暗号署名ではありません。MLXBar自身はどんな`signature`が返ってきても検証しないため、MLXBar同士の往復では問題なく動作しますが、そのまま本家Anthropic APIへ送っても本家側では拒否されます。
+- **引き続き未対応**（黙って無視せず`invalid_request_error`で拒否）: Anthropicのサーバーサイドツール、PDF/`document` content block、Anthropic側MCP実行。`cache_control`は受理して無視し、`usage`にAnthropicの課金用cacheフィールドを出しません。Claudeのモデル名をローカルモデルへリネームせず、一致しない名前は常駐1件へフォールバックし、応答の`model`は実ローカル名です。
 - feature flag `api.anthropic.enabled`（既定ON）。有効／無効の切り替えは次回サービス起動時に反映されます。「設定…」→「APIサーバー」にトグルとURL表示があります。
 
 ### OpenClaw
@@ -516,7 +521,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-1.9.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.0.0rc1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

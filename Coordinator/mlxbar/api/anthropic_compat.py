@@ -7,11 +7,20 @@ the exact internal shape the existing worker pool already accepts
 the worker's events are translated back into Anthropic's streaming shape by
 ``anthropic_stream``. The OpenAI surface is not touched.
 
-Deliberately not implemented in v1 (returned as an explicit
-``invalid_request_error`` rather than silently ignored): Anthropic server-side
-tools (web search etc.), extended thinking with signed blocks, PDF/`document`
-content blocks, and Anthropic-side MCP execution. ``cache_control`` hints are
-accepted and ignored; MLXBar never reports Anthropic cache-usage figures.
+Deliberately not implemented (returned as an explicit ``invalid_request_error``
+rather than silently ignored): Anthropic server-side tools (web search etc.),
+PDF/`document` content blocks, and Anthropic-side MCP execution.
+``cache_control`` hints are accepted and ignored; MLXBar never reports
+Anthropic cache-usage figures.
+
+Since v2.0.0, ``thinking`` (extended thinking) is accepted and surfaced as
+real ``thinking`` content blocks, built from the same `reasoning_delta`
+worker events the OpenAI surface already exposes as `reasoning_content`. The
+``signature`` on those blocks is a local, unverified marker (see
+`anthropic_stream.THINKING_SIGNATURE_PREFIX`) -- MLXBar accepts any
+`signature` a caller sends back without checking it, and a real Anthropic API
+would reject one of ours. This is a local-model limitation inherent to
+running extended thinking outside Anthropic's own infrastructure, not a bug.
 """
 
 from __future__ import annotations
@@ -30,7 +39,7 @@ from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from .anthropic_stream import AnthropicMessageBuilder, sse, _anthropic_error_type
 from .openai_compat import (
-    _ensure_requested_model, _find_model, _is_generatable, app_state,
+    _ensure_requested_model, _find_model, _is_generatable, _normalize_thinking, app_state,
 )
 
 
@@ -226,22 +235,28 @@ def _image_ref(source) -> str:
     raise _bad_request("image.source.type は base64 または url です")
 
 
-def _generation_options(body: dict, tools: list, tool_choice) -> dict:
+def _generation_options(body: dict, tools: list, tool_choice) -> tuple[dict, bool]:
     max_tokens = body.get("max_tokens")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
         raise _bad_request("max_tokens は1以上の整数で指定してください")
     thinking = body.get("thinking")
+    thinking_enabled = False
+    chat_template_kwargs: dict = {}
     # An explicit `{"type": "disabled"}` is a request for *no* extended
     # thinking, which is already how a local model behaves -- accept it as a
-    # no-op. Only an actual request to turn extended thinking on (enabled /
-    # adaptive, or a budget) is refused, since MLXBar cannot emit signed
-    # thinking blocks in v1.
+    # no-op.
     if isinstance(thinking, dict) and thinking.get("type") == "disabled" \
             and thinking.get("budget_tokens") is None:
         thinking = None
     if thinking is not None:
-        raise _bad_request(
-            "extended thinking（thinking パラメータ）には現時点で対応していません")
+        # `_normalize_thinking` already speaks this exact shape (`type` /
+        # `budget_tokens` / `effort`) -- it was written generically enough to
+        # serve both OpenAI's `thinking` extension and Anthropic's real one.
+        chat_template_kwargs = _normalize_thinking(thinking)
+        thinking_enabled = chat_template_kwargs.get("enable_thinking", True) is not False
+        if thinking_enabled and isinstance(chat_template_kwargs.get("thinking_budget"), int) \
+                and chat_template_kwargs["thinking_budget"] >= max_tokens:
+            raise _bad_request("thinking.budget_tokens は max_tokens 未満で指定してください")
     raw_choice = body.get("tool_choice")
     disable_parallel = bool(raw_choice.get("disable_parallel_tool_use", False)
                             if isinstance(raw_choice, dict) else False)
@@ -249,6 +264,8 @@ def _generation_options(body: dict, tools: list, tool_choice) -> dict:
                      "tools": [] if tool_choice == "none" else tools,
                      "tool_choice": tool_choice,
                      "parallel_tool_calls": not disable_parallel}
+    if chat_template_kwargs:
+        options["chat_template_kwargs"] = chat_template_kwargs
     if isinstance(tool_choice, dict):
         selected = tool_choice["function"]["name"]
         options["tools"] = [t for t in tools if t["function"]["name"] == selected] or tools
@@ -260,7 +277,7 @@ def _generation_options(body: dict, tools: list, tool_choice) -> dict:
         if not isinstance(stops, list) or not all(isinstance(s, str) for s in stops):
             raise _bad_request("stop_sequences は文字列の配列で指定してください")
         options["stop"] = stops
-    return options
+    return options, thinking_enabled
 
 
 # --------------------------------------------------------------------------
@@ -280,7 +297,7 @@ async def _messages(request: Request):
     tools = _normalize_tools(body.get("tools"))
     tool_choice = _normalize_tool_choice(body.get("tool_choice"), tools)
     messages, image_refs = _translate_messages(body)
-    options = _generation_options(body, tools, tool_choice)
+    options, thinking_enabled = _generation_options(body, tools, tool_choice)
 
     request.state.api_log = {
         "model": requested_model, "stream": stream,
@@ -320,7 +337,8 @@ async def _messages(request: Request):
     if compression:
         request.state.api_log["context_compressed"] = True
         state.last_context_compression = {**compression, "at": time.time()}
-    builder = AnthropicMessageBuilder(response_model, _estimate_prompt_tokens(messages))
+    builder = AnthropicMessageBuilder(response_model, _estimate_prompt_tokens(messages),
+                                      emit_thinking=thinking_enabled)
     generate_for_model = getattr(state.workers, "generate_for_model", None)
 
     def _generation():
