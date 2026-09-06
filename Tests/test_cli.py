@@ -178,6 +178,39 @@ class CLIParityTests(unittest.TestCase):
             execute(argparse.Namespace(**base), client)
         client.request.assert_not_called()
 
+    def test_set_context_compression_only_sends_provided_options(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="config", action="set-context-compression",
+                                  enabled="true", trigger_percent=80, keep_tail=None,
+                                  summary_max_tokens=None)
+        execute(args, client)
+        _, path, body = client.request.call_args[0]
+        self.assertEqual(path, "/api/v1/settings")
+        self.assertEqual(body, {"contextCompression": {"enabled": True, "triggerRatio": 0.8}})
+
+    def test_set_context_compression_converts_percent_to_ratio(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="config", action="set-context-compression",
+                                  enabled=None, trigger_percent=None, keep_tail=12,
+                                  summary_max_tokens=1500)
+        execute(args, client)
+        _, _, body = client.request.call_args[0]
+        self.assertEqual(body, {"contextCompression": {
+            "keepTailMessages": 12, "summaryMaxTokens": 1500}})
+
+    def test_set_context_compression_rejects_out_of_range_and_empty(self):
+        client = Mock()
+        base = dict(command="config", action="set-context-compression", enabled=None,
+                    trigger_percent=None, keep_tail=None, summary_max_tokens=None)
+        for bad in ({"trigger_percent": 40}, {"keep_tail": 1}, {"summary_max_tokens": 9000}):
+            with self.assertRaises(ValueError):
+                execute(argparse.Namespace(**{**base, **bad}), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**base), client)
+        client.request.assert_not_called()
+
     def test_set_flag_maps_names_to_dotted_keys(self):
         cases = {
             "auto-load-on-api": {"models": {"autoLoadOnAPIRequest": True}},

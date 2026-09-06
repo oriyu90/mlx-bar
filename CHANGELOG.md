@@ -2,11 +2,34 @@
 
 このプロジェクトの主な変更を記録します。
 
-## [2.0.0rc1] - 2026-09-05
+## [2.0.0] - 2026-09-06
 
-プレリリース（下書き）。OpenAI/Anthropic互換APIの拡充。
+OpenAI/Anthropic互換APIの拡充（プレリリース`2.0.0rc1`の内容を正式版として公開）。あわせて
+外部クライアント互換性の静的デバッグと、GUI操作のCLI完全対応の欠落1件を修正。
 
 ### 追加
+
+- **`mlxbarctl config set-context-compression`** を追加（`--enabled` / `--trigger-percent` /
+  `--keep-tail` / `--summary-max-tokens`）。v1.9.2で追加したコンテキスト自動圧縮の設定は、
+  GUIパネルはあるのにCLIからは汎用`config set`でしか到達できませんでした。`cli.py`への追加
+  のみで、管理API・設定スキーマ・GUIには触れていません。
+
+### ドキュメント
+
+- **Codexの接続手順をREADMEに追記。** OpenAI Codex CLIは既定でResponses API
+  （`wire_api = "responses"`）を使うため、`~/.codex/config.toml`の`[model_providers.<id>]`で
+  `wire_api = "chat"`を指定する必要があります。MLXBarはResponses APIに明示的な
+  `404 UNSUPPORTED_ENDPOINT`を返し（フリーズしない）、Chat Completions経路は問題なく動作します。
+- リリース前に OpenAI・Anthropic 互換層を Claude Code / Codex / ZCode / OpenClaw の実挙動を
+  基準に読み直し、**正確性・クラッシュ安全性・メモリ安全性のバグが無いこと**を確認
+  （`DESIGN_v2.0.0.md §6`）。
+
+### `2.0.0rc1`（プレリリース）から継続する変更
+
+（`2.0.0rc1` は GitHub 上は draft + prerelease で一般公開せず、`2.0.0` で正式公開。
+`v2.0.0rc1` のタグと draft リリースは削除。）
+
+#### API拡充
 
 - **`/v1/completions`（レガシー補完）を実装。** `prompt`文字列をchat templateを通さず
   そのままモデルへ渡す、Coordinator/Worker間に元々あった生プロンプト経路を初めて公開APIから
@@ -22,7 +45,7 @@
   `thinking` content blockとして返します。`signature`はMLXBarが計算するローカルな印であり、
   Anthropic本家が発行・検証する暗号署名ではありません（本家APIへの再送では拒否されます）。
 
-### 見送り（理由を明示）
+#### 見送り（理由を明示）
 
 - OpenAI Responses API（`/v1/responses`）: ステートフルな会話管理・組み込みサーバーサイド
   ツールなど、単一ローカルモデルプロセスに合わない仕様が多く、部分実装による静かな仕様乖離を
@@ -32,7 +55,7 @@
 - Chat Completionsのテキスト以外の出力: 既存の`modalities`チェックが元々正しく拒否しており、
   追加の実装は不要と確認しました。
 
-詳細は`DESIGN_v2.0.0rc1.md`を参照してください。
+詳細は`DESIGN_v2.0.0.md`を参照してください。
 
 ## [1.9.2] - 2026-09-05
 

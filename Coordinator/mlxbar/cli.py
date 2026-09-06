@@ -100,6 +100,16 @@ def parser() -> argparse.ArgumentParser:
     set_pool.add_argument("--system-reserve-gb", type=int, default=None)
     set_pool.add_argument("--generation-concurrency", type=int, default=None)
     set_pool.add_argument("--max-replicas-per-model", type=int, default=None)
+    set_compression = config.add_parser(
+        "set-context-compression",
+        help="長い会話の古い部分を要約して短縮する設定（指定したオプションだけ変更）")
+    set_compression.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_compression.add_argument("--trigger-percent", type=int, default=None,
+                                 help="発火の目安（有効プロンプト上限に対する割合、50〜95）")
+    set_compression.add_argument("--keep-tail", type=int, default=None,
+                                 help="要約後も逐語で残す直近ターン数（2〜50）")
+    set_compression.add_argument("--summary-max-tokens", type=int, default=None,
+                                 help="要約生成の最大トークン数（100〜4000）")
     set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
     set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
                                            "require-token", "continue-after-gui-exit"])
@@ -328,6 +338,27 @@ def execute(args, client: Client):
             if not pool:
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings", {"models": {"pool": pool}}).json()
+        if args.action == "set-context-compression":
+            # Mirror the GUI's Settings > Models panel (setContextCompressionSettings):
+            # the panel shows a percentage, the stored key is a 0..1 ratio.
+            patch: dict = {}
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if args.trigger_percent is not None:
+                if not 50 <= args.trigger_percent <= 95:
+                    raise ValueError("発火の目安は50〜95%で指定してください")
+                patch["triggerRatio"] = args.trigger_percent / 100
+            if args.keep_tail is not None:
+                if not 2 <= args.keep_tail <= 50:
+                    raise ValueError("要約後も残す直近ターン数は2〜50で指定してください")
+                patch["keepTailMessages"] = args.keep_tail
+            if args.summary_max_tokens is not None:
+                if not 100 <= args.summary_max_tokens <= 4000:
+                    raise ValueError("要約の最大トークン数は100〜4,000で指定してください")
+                patch["summaryMaxTokens"] = args.summary_max_tokens
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"contextCompression": patch}).json()
         if args.action == "set-flag":
             keys = {"auto-load-on-api": "models.autoLoadOnAPIRequest",
                     "anthropic-api": "api.anthropic.enabled",

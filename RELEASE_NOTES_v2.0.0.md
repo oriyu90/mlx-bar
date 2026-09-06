@@ -1,13 +1,19 @@
-# MLXBar v2.0.0rc1 (pre-release / draft)
+# MLXBar v2.0.0
 
-A pre-release draft: OpenAI/Anthropic-compatible API expansion. `/v1/completions`,
-`response_format` (`json_object` / `json_schema`), `n > 1`, and Anthropic Extended
-Thinking. No breaking changes to any existing endpoint's default behaviour, no
-settings-schema changes.
+OpenAI/Anthropic-compatible API expansion: `/v1/completions`, `response_format`
+(`json_object` / `json_schema`), `n > 1`, and Anthropic Extended Thinking. Plus a
+pre-release static-debug pass over external-client compatibility (Claude Code /
+Codex / ZCode / OpenClaw) and a GUI-to-CLI parity fix. No breaking changes to any
+existing endpoint's default behaviour, no settings-schema changes, no GUI changes.
 
-プレリリース（下書き）: OpenAI/Anthropic互換APIの拡充です。`/v1/completions`、
-`response_format`（`json_object` / `json_schema`）、`n > 1`、Anthropic Extended Thinkingに
-対応しました。既存エンドポイントの既定挙動に破壊的変更はなく、設定スキーマの変更もありません。
+OpenAI/Anthropic互換APIの拡充です。`/v1/completions`、`response_format`
+（`json_object` / `json_schema`）、`n > 1`、Anthropic Extended Thinkingに対応しました。
+あわせて外部クライアント（Claude Code / Codex / ZCode / OpenClaw）互換性の静的デバッグと、
+GUI操作のCLI完全対応の欠落1件の修正を行いました。既存エンドポイントの既定挙動に破壊的変更は
+なく、設定スキーマの変更もGUIの変更もありません。
+
+> このリリースはプレリリース `v2.0.0rc1`（GitHub上はdraft、一般公開せず）の内容を引き継ぎ、
+> 正式版として公開するものです。`v2.0.0rc1` のタグとdraftリリースは削除しました。
 
 ## `/v1/completions` (legacy text completion)
 
@@ -110,6 +116,41 @@ extended thinking outside Anthropic's own infrastructure, not a bug.
 - **Chat Completionsのテキスト以外の出力**: 既存の`modalities`チェックが元々正しく拒否して
   おり、追加実装は不要と確認しました。
 
+## External-client static debug & GUI-to-CLI parity / 外部クライアント静的デバッグとCLI完全対応
+
+Before this release the OpenAI and Anthropic compat layers were re-read against how
+Claude Code, Codex, ZCode and OpenClaw actually talk to them. **No correctness,
+crash-safety or memory-safety bugs were found.** One documentation gap surfaced:
+
+- **Codex CLI** defaults to the OpenAI Responses API (`wire_api = "responses"`),
+  which MLXBar does not implement -- it returns an explicit `404 UNSUPPORTED_ENDPOINT`
+  (it fails safely, no hang). To use Codex, set `wire_api = "chat"` in
+  `~/.codex/config.toml` under `[model_providers.<id>]`. The README now documents this.
+
+One GUI-to-CLI parity gap was fixed:
+
+- **`mlxbarctl config set-context-compression`** (`--enabled`, `--trigger-percent`,
+  `--keep-tail`, `--summary-max-tokens`). The context-compression settings added in
+  v1.9.2 had a GUI panel but only the generic `config set` escape hatch on the CLI.
+  This is an additive change to `cli.py` alone -- no management-API, settings-schema
+  or GUI changes.
+
+リリース前に、Claude Code / Codex / ZCode / OpenClaw が実際にどう叩くかを基準に OpenAI・
+Anthropic 互換層を読み直しました。**正確性・クラッシュ安全性・メモリ安全性のバグは
+ありませんでした。** ドキュメントの欠落が1件:
+
+- **Codex CLI** は既定で OpenAI Responses API（`wire_api = "responses"`）を使いますが、
+  MLXBar はこれを実装しておらず、明示的な `404 UNSUPPORTED_ENDPOINT` を返します
+  （フリーズせず安全側に倒れます）。Codex から使うには `~/.codex/config.toml` の
+  `[model_providers.<id>]` で `wire_api = "chat"` を指定してください。README に追記しました。
+
+GUI操作のCLI完全対応の欠落を1件修正:
+
+- **`mlxbarctl config set-context-compression`**（`--enabled` / `--trigger-percent` /
+  `--keep-tail` / `--summary-max-tokens`）。v1.9.2 で追加したコンテキスト自動圧縮の設定は
+  GUIパネルはあるのにCLIからは汎用 `config set` でしか到達できませんでした。`cli.py` への
+  追加のみで、管理API・設定スキーマ・GUIには触れていません。
+
 ## Compatibility / 互換性
 
 - No settings-schema changes; every new feature is request-scoped and opt-in. An
@@ -123,11 +164,12 @@ extended thinking outside Anthropic's own infrastructure, not a bug.
 
 ## Verification / 検証
 
-- Python regression suite: **403 passed** (388 from v1.9.2 + 15 new; 3 pre-existing tests
-  updated to match the intentional behaviour changes -- see `TEST_PLAN_v2.0.0rc1.md`).
+- Python regression suite: **406 passed** (403 from `v2.0.0rc1` + 3 new CLI tests).
   Run 3× consecutively, stable.
-- Design and invariants: `DESIGN_v2.0.0rc1.md`.
+- Static debug of external-client compatibility and on-hardware smoke: see
+  `TEST_PLAN_v2.0.0.md`.
+- Design and invariants: `DESIGN_v2.0.0.md`.
 
 ## Checksum
 
-`4ac1329b11eaf9a68a118998e9064f69e115f2c9ec7479170fbb095d21ed08e9`  `MLXBar-2.0.0rc1.dmg`
+`92e8a46c265932db062a551aeae4205ae047a73880ae9d976e9694d01adeca86`  `MLXBar-2.0.0.dmg`

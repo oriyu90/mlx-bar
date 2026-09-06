@@ -1,4 +1,4 @@
-# MLXBar v2.0.0rc1 設計
+# MLXBar v2.0.0 設計
 
 対象: OpenAI/Anthropic互換APIの拡充。ユーザーから提示された検討項目は次の8点。
 
@@ -10,6 +10,10 @@
 6. `n > 1`（複数候補生成）
 7. Chat Completionsでのテキスト以外の出力
 8. Anthropic Extended Thinking
+
+v2.0.0では上記に加え、リリース前の静的デバッグ（外部クライアント互換性）とGUI操作の
+CLI完全対応の精査を行い、見つかった1件のパリティ欠落を修正した（§6・§7）。
+本設計書はプレリリース `v2.0.0rc1`（GitHub上はdraft、一般公開せず）の設計を引き継ぐ。
 
 ## 1. 設計方針
 
@@ -104,7 +108,7 @@ Responses APIはChat Completionsと別の契約：サーバー側に会話状態
 一部（テキスト入出力・関数呼び出しのみ）を実装する案も検討したが、「仕様の一部だけを実装した
 Responses API」は、クライアントが最も検証しなさそうな角（`previous_response_id`によるstateful
 chainingなど）で静かに本家と乖離する。これは「対応していないと明言する」よりも有害と判断し、
-**v2.0.0rc1では実装を見送る**。ただし`404`への素通しに任せず、`/v1/completions`が過去そうで
+**v2.0.0でも実装を見送る**。ただし`404`への素通しに任せず、`/v1/completions`が過去そうで
 あったように、明示的な`UNSUPPORTED_ENDPOINT`メッセージを返すスタブを追加した
 （`openai_compat.py: responses_api`）。将来実装する場合は別途設計・別バージョンとする。
 
@@ -114,7 +118,7 @@ chainingなど）で静かに本家と乖離する。これは「対応してい
 に対するlogprobsが含まれ得るが、これをCoordinator↔Worker間のUnix domain socket JSON-linesの
 IPCへ毎トークン載せることは、既存のホットパス（プロンプトキャッシュ、ハートビート、
 キャンセル処理）に新たな大きなメモリ・帯域コストを持ち込む。安全性（crash safety / memory
-safety）を優先する既存方針に照らし、**v2.0.0rc1では実装を見送る**。挙動は変更なし
+safety）を優先する既存方針に照らし、**v2.0.0でも実装を見送る**。挙動は変更なし
 （`logprobs`は引き続きHTTP 400 `UNSUPPORTED_PARAMETER`）。トップkのみに絞る、専用の低頻度
 イベントにする等の設計は将来の検討課題として`common-rules-document`に記録する。
 
@@ -133,9 +137,12 @@ MLXBarはテキスト（＋画像入力）のローカルLLMサーバーであ�
 | `Coordinator/mlxbar/api/openai_compat.py` | `/v1/completions`実装、`/v1/responses`スタブ、`response_format`受理、`n>1`ループ |
 | `Coordinator/mlxbar/api/anthropic_compat.py` | `thinking`パラメータ受理、budget検証 |
 | `Coordinator/mlxbar/api/anthropic_stream.py` | `thinking` content block（stream/非stream） |
+| `Coordinator/mlxbar/cli.py`（v2.0.0） | `config set-context-compression` サブコマンド追加（§7） |
+| `README.md`（v2.0.0） | Codex接続手順の追記（§6）、新CLIコマンドの記載 |
 
-設定スキーマ（`SettingsStore.DEFAULTS`）への変更は**なし**。全項目がリクエスト単位のオプトインで、
-永続設定を必要としないため、マイグレーションやGUI変更が一切不要だった。
+設定スキーマ（`SettingsStore.DEFAULTS`）への変更は**なし**。API拡充の全項目がリクエスト単位の
+オプトインで、永続設定を必要としないため、マイグレーションやGUI変更が一切不要だった。§7のCLI追加も
+`cli.py`のみの変更で、管理API・設定スキーマ・GUIには触れていない。
 
 ## 4. 互換性
 
@@ -149,4 +156,56 @@ MLXBarはテキスト（＋画像入力）のローカルLLMサーバーであ�
 
 ## 5. 検証
 
-`TEST_PLAN_v2.0.0rc1.md`を参照。
+`TEST_PLAN_v2.0.0.md`を参照。
+
+## 6. リリース前の静的デバッグ（外部クライアント互換性）
+
+Claude Code / Codex / ZCode / OpenClaw など、Anthropic互換・OpenAI互換の各CLIクライアントで
+MLXBarが正常動作するかを、コードを読んで静的に検証した（`openai_compat.py` /
+`anthropic_compat.py` / `anthropic_stream.py` / `main.py`）。
+
+**結論: 正確性・クラッシュ安全性・メモリ安全性のバグは無し。** 確認した不変条件:
+
+- 認証とリクエストサイズ上限は本文パース前のASGI層（`PublicRequestGuard`）で強制される。
+  未認証リクエストはソケットがバッファした分しかメモリを使わない。
+- Anthropic Extended ThinkingのSSE列順は正しい:
+  `message_start` → `content_block_start{thinking}` → `thinking_delta*` → `signature_delta`
+  → `content_block_stop` → text block → `message_delta` → `message_stop`。
+  thinkingブロックは常にindex 0（Workerは`reasoning_delta`を`delta`より先に出す）。
+  非streamでも`content`の先頭に`thinking`が来る。
+- `n>1` + `stream` は400で拒否。`n`ループのトークン集計は正しい。
+- `response_format`はベストエフォートで、検証失敗時は無効なJSONを黙って返さず
+  HTTP 502 `RESPONSE_FORMAT_INVALID`。
+- コンテキスト自動圧縮と`response_format`指示注入はどちらも先頭systemメッセージを対象にし、
+  安全に共存する。
+- `null` tool-call index耐性、`role`は先頭1回のみ、推論内容と本文の分離 — すべて維持。
+
+**Codex向けの注意（バグではなくドキュメントの欠落）:** OpenAI Codex CLIは既定で
+Responses API（`wire_api = "responses"`）を使う。MLXBarにResponses APIは無く、
+明示的な `404 UNSUPPORTED_ENDPOINT` を返す（フリーズしない＝安全側に倒れる）。Codexから
+使うには `~/.codex/config.toml` の `[model_providers.<id>]` で `wire_api = "chat"` を
+指定する必要がある。READMEはClaude Code / ZCode / Zed・Cline・OpenCode / OpenClawを
+説明していたがCodexに触れていなかったため、v2.0.0でCodexの接続手順を追記した。
+
+## 7. GUI操作のCLI完全対応（v1.8.1契約の精査と1件の修正）
+
+v1.8.1で「GUIの全ミューテーションに*名前付き*CLIコマンドを用意する（汎用 `config set` は
+エスケープハッチ）」という契約を定めた。`MenuBarViewModel` と `MLXBarSettingsView` の全
+ミューテーションを `mlxbarctl`（`cli.py`）と突き合わせた結果、**1件だけ欠落**していた:
+
+- **`contextCompression`（v1.9.2追加）に名前付きCLIコマンドが無かった。**
+  GUIの「設定 > モデル」に4つのコントロール（有効化トグル・発火の目安%・要約後も残す
+  直近ターン数・要約の最大トークン数、`setContextCompressionSettings`）があるのに、
+  CLIからは汎用 `config set contextCompression.enabled true` でしか到達できなかった。
+
+**修正:** `mlxbarctl config set-context-compression`（`--enabled` / `--trigger-percent 50-95` /
+`--keep-tail 2-50` / `--summary-max-tokens 100-4000`）を追加。`set-model-pool` と同じ
+「指定したオプションだけ変更」方式で、`--trigger-percent` は GUI と同じく `triggerRatio`
+（0〜1）へ変換する。既存の `PUT /api/v1/settings` を1回呼ぶだけで、管理API・設定スキーマ・
+GUI・ローカライズ文字列には一切触れない（`cli.py` への追加のみ）。汎用 `config set` は
+引き続きエスケープハッチとして残す。
+
+名前付きコマンドが不要と確認した項目（既存の記録どおり、Swift専用のOS API）:
+`SMAppService` のログイン項目登録（CLIは設定値のみ、GUIが次回起動時にreconcile）、
+`SMAppService.unregister()`（remove-all-data時）、クリップボードの「コピー」ボタン
+（クライアント側処理。`secrets get-api-token` / `logs show` で同じ値は取得できる）。
