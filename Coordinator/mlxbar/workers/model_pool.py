@@ -76,6 +76,12 @@ class ModelPoolSupervisor:
         self._gen_slots = asyncio.Semaphore(self._gen_concurrency)
         self._gen_active_lanes = 0
         self._request_workers: dict[str, SingleWorkerSupervisor] = {}
+        # Per-model record of the last best-effort replica that could not be
+        # admitted: {modelId: {desired, ready, code, message, at}}. Surfaced in
+        # status() so a "desired 2 / ready 1" shortfall is visible instead of
+        # only living in a log line. Cleared once the model reaches full width
+        # or leaves the pool.
+        self._replica_admission_failures: dict[str, dict] = {}
         self._reaper_task: asyncio.Task | None = None
         self.maintenance_engines: set[str] = set()
         # Process topology is latched for this coordinator lifetime. Applying
@@ -325,12 +331,26 @@ class ModelPoolSupervisor:
         evict: list[PoolSlot] = []
         resident = self._resident_charge()
         maximum = int(self._pool_settings().get("maxResidentModels", 2))
+        incoming_id = str(model.get("id", ""))
+
+        def _distinct_models(pending_evict: list[PoolSlot]) -> int:
+            # `maxResidentModels` caps distinct model ids, not worker slots:
+            # the setting UI, `residentModelCount` status and the replicas
+            # feature all treat an extra replica of a resident model as the
+            # *same* model. Counting `len(self._slots)` here rejected a second
+            # replica whenever `maxResidentModels == 1`, defeating `replicas`.
+            dropped = {id(slot) for slot in pending_evict}
+            ids = {str(slot.model.get("id", "")) for slot in self._slots.values()
+                   if id(slot) not in dropped}
+            ids.add(incoming_id)
+            return len(ids)
+
         while candidates and (resident + estimate > budget
-                              or len(self._slots) - len(evict) >= maximum):
+                              or _distinct_models(evict) > maximum):
             victim = candidates.pop(0)
             evict.append(victim)
             resident -= victim.reservation_bytes
-        if resident + estimate > budget or len(self._slots) - len(evict) >= maximum:
+        if resident + estimate > budget or _distinct_models(evict) > maximum:
             raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
                               "使用中または固定中のモデルを残したまま安全にロードできません", 503, True)
         return min(per_model, max(estimate, 1 << 30)), evict
@@ -367,15 +387,25 @@ class ModelPoolSupervisor:
         for replica_index in range(desired):
             try:
                 result = await self._load_replica(model, engine, model_id, replica_index, pin=pin)
-            except MLXBarError:
+            except MLXBarError as exc:
                 if replica_index == 0 or result is None:
                     raise
                 # A replica beyond the first failing (memory budget, pressure)
                 # is not fatal: the model is already usable on the replicas that
                 # did load. The reaper will retry the shortfall when room frees.
-                LOGGER.warning("Could not load replica %d of %s; keeping %d replica(s)",
-                               replica_index, model_id, replica_index)
+                # Keep the stable code and a safe summary so status/diagnostics
+                # can tell an implementation gap from a healthy memory backoff
+                # (no token, path or request body is ever recorded here).
+                self._replica_admission_failures[model_id] = {
+                    "desired": desired, "ready": replica_index,
+                    "code": exc.code, "message": str(exc), "at": time.time(),
+                }
+                LOGGER.warning(
+                    "Could not load replica %d/%d of %s (%s: %s); keeping %d replica(s)",
+                    replica_index + 1, desired, model_id, exc.code, exc, replica_index)
                 break
+        else:
+            self._replica_admission_failures.pop(model_id, None)
         self._primary_model_id = model_id
         return result
 
@@ -534,8 +564,10 @@ class ModelPoolSupervisor:
             if self._slots.get(slot_key) is slot:
                 self._slots.pop(slot_key, None)
             # Only drop the primary pointer when no replica of it survives.
-            if self._primary_model_id == model_id and not self._replica_slots(model_id):
-                self._primary_model_id = None
+            if not self._replica_slots(model_id):
+                self._replica_admission_failures.pop(model_id, None)
+                if self._primary_model_id == model_id:
+                    self._primary_model_id = None
 
     async def unload(self) -> dict:
         if not self.enabled:
@@ -996,6 +1028,9 @@ class ModelPoolSupervisor:
                 "restartRequired": configured != self.enabled,
                 "residentCount": int(bool(status.get("loadedModel"))),
                 "generationConcurrency": 1,
+                "effectiveGenerationConcurrency": 1,
+                "configuredGenerationConcurrency": 1,
+                "replicaShortfalls": [],
                 "activeGenerations": min(1, len(self._legacy.active_requests)),
             }
             status["loadedModels"] = [status["loadedModel"]] if status.get("loadedModel") else []
@@ -1017,6 +1052,11 @@ class ModelPoolSupervisor:
                          "replicaIndex": slot.replica_index,
                          "replicaCount": len([s for s in self._slots.values()
                                               if str(s.model.get("id", "")) == model_id]),
+                         "readyReplicaCount": len([
+                             s for s in self._slots.values()
+                             if str(s.model.get("id", "")) == model_id and s.state == "ready"]),
+                         "desiredReplicaCount": self._desired_replicas(model_id),
+                         "replicaShortfall": self._replica_admission_failures.get(model_id),
                          "laneQueueDepth": len(slot.gen_queued),
                          "laneRecoveries": slot.gen_recoveries,
                          "keepLoaded": slot.keep_loaded or slot.session_pinned,
@@ -1082,17 +1122,37 @@ class ModelPoolSupervisor:
             "generationConcurrency": self._gen_concurrency,
             "activeGenerations": active_generations,
             "maintenanceEngines": sorted(self.maintenance_engines),
-            "modelPool": {"enabled": True,
-                          "configuredEnabled": bool(self._pool_settings().get("enabled", True)),
-                          "restartRequired": not bool(self._pool_settings().get("enabled", True)),
-                          "residentCount": len(loaded_models),
-                          "residentModelCount": len({item.get("id") for item in loaded_models}),
-                          "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
-                          "maxReplicasPerModel": self._pool_settings().get("maxReplicasPerModel", 2),
-                          "generationConcurrency": self._gen_concurrency,
-                          "activeGenerations": active_generations,
-                          "reservedBytes": self._resident_charge(),
-                          "budgetBytes": self._global_budget()},
+            "modelPool": self._model_pool_status(loaded_models, active_generations),
+        }
+
+    def _model_pool_status(self, loaded_models: list[dict], active_generations: int) -> dict:
+        configured_enabled = bool(self._pool_settings().get("enabled", True))
+        # `generationConcurrency` is latched at coordinator start like `enabled`.
+        # Report the saved value next to the running one so an API/diagnostics
+        # consumer can see a saved change that only a restart will apply.
+        configured_concurrency = max(1, min(8, int(
+            self._pool_settings().get("generationConcurrency", 2))))
+        shortfalls = [
+            {"modelId": model_id, **info}
+            for model_id, info in self._replica_admission_failures.items()
+            if model_id in {str(s.model.get("id", "")) for s in self._slots.values()}
+        ]
+        return {
+            "enabled": True,
+            "configuredEnabled": configured_enabled,
+            "restartRequired": (not configured_enabled
+                                or configured_concurrency != self._gen_concurrency),
+            "residentCount": len(loaded_models),
+            "residentModelCount": len({item.get("id") for item in loaded_models}),
+            "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
+            "maxReplicasPerModel": self._pool_settings().get("maxReplicasPerModel", 2),
+            "generationConcurrency": self._gen_concurrency,
+            "effectiveGenerationConcurrency": self._gen_concurrency,
+            "configuredGenerationConcurrency": configured_concurrency,
+            "activeGenerations": active_generations,
+            "replicaShortfalls": shortfalls,
+            "reservedBytes": self._resident_charge(),
+            "budgetBytes": self._global_budget(),
         }
 
     def _ensure_reaper(self) -> None:
@@ -1172,14 +1232,19 @@ class ModelPoolSupervisor:
                  and slot not in victims),
                 key=lambda item: item.last_released_at,
             )
-            remaining_count = len(self._slots) - len(victims)
+            # Count distinct model ids, not worker slots: extra replicas of one
+            # model are trimmed by the replica-scaledown block above, never by
+            # the `maxResidentModels` cap (which is a distinct-model setting).
+            def _distinct_after(pending: list[PoolSlot]) -> int:
+                dropped = {id(s) for s in pending}
+                return len({str(s.model.get("id", "")) for s in self._slots.values()
+                            if id(s) not in dropped})
             for slot in candidates:
-                if resident <= self._global_budget() and remaining_count <= maximum:
+                if resident <= self._global_budget() and _distinct_after(victims) <= maximum:
                     break
                 slot.state = "evicting"
                 victims.append(slot)
                 resident -= slot.reservation_bytes
-                remaining_count -= 1
         for slot in victims:
             await self._evict_slot(slot)
         await self._scale_up_pinned_replicas()
@@ -1210,8 +1275,16 @@ class ModelPoolSupervisor:
                 try:
                     await self._load_replica(model, model.get("engine"), model_id, index,
                                              pin=base.session_pinned)
-                except MLXBarError:
+                except MLXBarError as exc:
+                    self._replica_admission_failures[model_id] = {
+                        "desired": desired,
+                        "ready": len([s for s in self._replica_slots(model_id)
+                                      if s.state == "ready"]),
+                        "code": exc.code, "message": str(exc), "at": time.time(),
+                    }
                     break
+            else:
+                self._replica_admission_failures.pop(model_id, None)
 
     def _reap_pool_orphans(self) -> None:
         control = self.root / "control"

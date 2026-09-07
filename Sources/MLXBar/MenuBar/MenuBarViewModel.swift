@@ -204,6 +204,13 @@ final class MenuBarViewModel: ObservableObject {
     @Published var modelPoolBudgetBytes: Int64 = 0
     @Published var generationConcurrency = 1
     @Published var activeGenerations = 0
+    /// A saved `generationConcurrency` / pool-enabled change that only takes
+    /// effect after the next service restart. `nil`-safe: defaults to false on
+    /// coordinators that don't report it.
+    @Published var modelPoolRestartRequired = false
+    /// Human-readable "replica N/M could not load (reason)" when a pinned model
+    /// is running below its configured replica count; `nil` when at full width.
+    @Published var replicaShortfallSummary: String?
     @Published var loadingModelName: String?
     @Published var loadingEngine: String?
     @Published var loadingPhase: String?
@@ -363,6 +370,22 @@ final class MenuBarViewModel: ObservableObject {
                              (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 1)
                 setIfChanged(\.activeGenerations,
                              (pool["activeGenerations"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.modelPoolRestartRequired,
+                             (pool["restartRequired"] as? NSNumber)?.boolValue ?? false)
+                let shortfalls = (pool["replicaShortfalls"] as? [[String: Any]]) ?? []
+                if let first = shortfalls.first,
+                   let modelId = first["modelId"] as? String {
+                    let ready = (first["ready"] as? NSNumber)?.intValue ?? 0
+                    let desired = (first["desired"] as? NSNumber)?.intValue ?? 0
+                    // The stable code, not the localized message: language-neutral
+                    // and enough to tell a memory backoff from an implementation gap.
+                    let reason = (first["code"] as? String) ?? ""
+                    setIfChanged(\.replicaShortfallSummary, guiLanguage == "ja"
+                        ? "\(modelId): レプリカ \(ready)/\(desired)（\(reason)）"
+                        : "\(modelId): \(ready)/\(desired) replicas (\(reason))")
+                } else {
+                    setIfChanged(\.replicaShortfallSummary, nil)
+                }
             }
             setIfChanged(\.liveGenerationTPS, (json["generationTokensPerSecond"] as? NSNumber)?.doubleValue)
             // Every resident model, not just the primary. Older coordinators

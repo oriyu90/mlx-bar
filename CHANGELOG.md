@@ -2,6 +2,38 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.0.1] - 2026-09-08
+
+複数モデル常駐プールのバグ修正1件と、関連する診断表示の追加。API・設定スキーマ・
+互換性に影響はありません。
+
+### 修正
+
+- **`maxResidentModels` が同一モデルの追加レプリカも「常駐モデル」として数えていた。**
+  入場制御（`ModelPoolSupervisor._admit`）が `len(self._slots)`（＝レプリカ込みのWorker
+  スロット数）を上限と比較していたため、`maxResidentModels = 1` のときに `replicas = 2` の
+  プロファイルを固定しても2体目が必ず `MEMORY_BUDGET_EXCEEDED` で拒否され、同一モデルの
+  並列生成能力が失われていました。設定UI（「最大常駐モデル数」）・`residentModelCount`
+  ステータス・レプリカ機能の設計はいずれも「異なるモデルの数」を意図しているため、
+  入場制御と縮退処理（`_reap_once` の live-reduction ブロック）を**ユニークなモデルID数**で
+  数えるよう修正。メモリ予算・OSメモリ圧・モデルごとの上限・`maxReplicasPerModel` の
+  検査は各レプリカに対して従来どおり適用し、メモリ安全性は弱めていません。
+
+### 追加
+
+- **レプリカ不足・再起動待ちの診断をステータスへ追加。** `/api/v1/status` の `modelPool` に
+  `configuredGenerationConcurrency` / `effectiveGenerationConcurrency` を併記し、保存済みの
+  `generationConcurrency` がまだ反映されていない場合は `restartRequired` を true にします。
+  ベストエフォートで見送ったレプリカの内訳（`desired` / `ready` / 安定コード）を
+  `modelPool.replicaShortfalls` と各 `loadedModels[]` 行の `desiredReplicaCount` /
+  `readyReplicaCount` / `replicaShortfall` で返します。トークン・パス・リクエスト本文は
+  記録しません。
+- **`mlxbarctl models resident`** が上記の新フィールドをそのまま表示します。
+- GUIの「設定 > モデル」に、再起動待ちの注意書きと「レプリカ不足」行を、該当時のみ
+  日本語／英語で表示します（新規ミューテーションではなく読み取り専用の表示追加）。
+
+詳細は`DESIGN_v2.0.1.md`を参照してください。
+
 ## [2.0.0] - 2026-09-06
 
 OpenAI/Anthropic互換APIの拡充（プレリリース`2.0.0rc1`の内容を正式版として公開）。あわせて

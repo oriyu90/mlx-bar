@@ -285,6 +285,14 @@ struct ModelSourceSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 LabeledContent(LS("現在の常駐数"), value: "\(model.residentModelCount)")
                 LabeledContent(LS("同時生成"), value: "\(model.activeGenerations) / \(model.generationConcurrency)")
+                if model.modelPoolRestartRequired {
+                    Text(LS("保存した設定のうち、次回サービス起動時に反映される項目があります。"))
+                        .font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let shortfall = model.replicaShortfallSummary {
+                    LabeledContent(LS("レプリカ不足"), value: shortfall)
+                }
                 LabeledContent(LS("予約済みメモリ"), value: ByteCountFormatter.string(
                     fromByteCount: model.modelPoolReservedBytes, countStyle: .memory))
                 LabeledContent(LS("常駐メモリ予算"), value: ByteCountFormatter.string(

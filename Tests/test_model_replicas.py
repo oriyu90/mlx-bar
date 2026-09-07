@@ -169,6 +169,51 @@ class ReplicaTests(unittest.IsolatedAsyncioTestCase):
         # First replica admitted, second rejected -> the model is still usable.
         self.assertEqual(len(self.pool._replica_slots("model-1")), 1)
 
+    async def test_replicas_load_even_when_max_resident_models_is_one(self):
+        # Regression: `maxResidentModels` caps DISTINCT models, not worker
+        # slots. A second replica of the one resident model must still load
+        # when memory allows, otherwise `replicas` is dead on a 1-model pool.
+        self.settings.data["models"]["pool"]["maxResidentModels"] = 1
+        self._pin("model-1", 2)
+        await self.pool.load(self.model(1), pin=True)
+        self.assertEqual(len(self.pool._replica_slots("model-1")), 2)
+
+    async def test_max_resident_models_one_still_rejects_a_second_distinct_model(self):
+        self.settings.data["models"]["pool"]["maxResidentModels"] = 1
+        await self.pool.load(self.model(1), pin=True)
+        with self.assertRaises(MLXBarError) as raised:
+            await self.pool.load_for_api(self.model(2))
+        self.assertEqual(raised.exception.code, "MEMORY_BUDGET_EXCEEDED")
+        self.assertEqual(set(self.pool._slots), {"model-1"})
+
+    async def test_second_replica_still_gated_by_memory_budget_when_models_cap_is_one(self):
+        self.settings.data["models"]["pool"]["maxResidentModels"] = 1
+        self.settings.data["models"]["pool"]["defaultPerModelMaxGB"] = 10
+        self.pool._global_budget = lambda: 15 * GIB
+        self._pin("model-1", 2)
+        await self.pool.load(self.model(1, size_gb=6), pin=True)
+        self.assertEqual(len(self.pool._replica_slots("model-1")), 1)
+        shortfall = self.pool.status()["modelPool"]["replicaShortfalls"]
+        self.assertEqual(len(shortfall), 1)
+        self.assertEqual(shortfall[0]["modelId"], "model-1")
+        self.assertEqual(shortfall[0]["desired"], 2)
+        self.assertEqual(shortfall[0]["ready"], 1)
+        row = next(m for m in self.pool.status()["loadedModels"] if m["id"] == "model-1")
+        self.assertEqual(row["desiredReplicaCount"], 2)
+        self.assertEqual(row["readyReplicaCount"], 1)
+
+    async def test_status_reports_configured_vs_effective_generation_concurrency(self):
+        pool_status = self.pool.status()["modelPool"]
+        self.assertEqual(pool_status["effectiveGenerationConcurrency"], 2)
+        self.assertEqual(pool_status["configuredGenerationConcurrency"], 2)
+        self.assertFalse(pool_status["restartRequired"])
+        # A saved change that only a restart applies must show up here.
+        self.settings.data["models"]["pool"]["generationConcurrency"] = 4
+        pool_status = self.pool.status()["modelPool"]
+        self.assertEqual(pool_status["effectiveGenerationConcurrency"], 2)
+        self.assertEqual(pool_status["configuredGenerationConcurrency"], 4)
+        self.assertTrue(pool_status["restartRequired"])
+
     async def test_concurrent_same_model_requests_use_distinct_replicas(self):
         self._pin("model-1", 2)
         await self.pool.load(self.model(1), pin=True)
