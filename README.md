@@ -49,7 +49,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
 5. 「Choose Model…」（日本語UIでは「モデルを選択…」）からモデルをロードします。
 
-Developer ID署名・公証済みの正式配布版では、手順3は通常不要です。ローカルビルドは利用可能な署名証明書がない場合にad-hoc署名されます。
+配布しているビルド（GitHub Releasesのものを含む）はすべてad-hoc署名で、Apple Developer ID署名・公証（Notarization）は行っていません。そのため初回起動時は手順3の許可がほぼ必ず必要です。ローカルで自分でビルドした場合も、`DEVELOPER_ID_APPLICATION`を設定していなければ同様にad-hoc署名になります。
 
 ## 初期設定と保存先
 
