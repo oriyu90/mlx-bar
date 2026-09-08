@@ -47,7 +47,25 @@ async def status(request: Request):
                     "error": app.public_listener_error},
             "promptCacheHealth": _prompt_cache_health(app, worker_status),
             "contextCompression": getattr(app, "last_context_compression", None),
+            "rag": _rag_summary(app),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
+
+
+def _rag_summary(app) -> dict:
+    """Cheap, no-network snapshot of the knowledge base for the status view."""
+    rag = getattr(app, "rag", None)
+    if rag is None:
+        return {"enabled": False, "collectionCount": 0, "chunkCount": 0, "lastRetrieval": None}
+    try:
+        collections = rag.store.list_collections()
+    except Exception:
+        collections = []
+    return {
+        "enabled": bool(getattr(rag, "enabled", False)),
+        "collectionCount": len(collections),
+        "chunkCount": sum(int(item.get("chunk_count", 0)) for item in collections),
+        "lastRetrieval": getattr(app, "last_rag_retrieval", None),
+    }
 
 
 def _prompt_cache_health(app, worker_status: dict) -> dict:
@@ -466,6 +484,93 @@ async def recent_logs(request: Request, limit: int = 500):
 @router.delete("/logs")
 async def clear_logs(request: Request):
     return {"deleted": state(request).database.clear_api_logs()}
+
+
+@router.get("/settings/rag-embedding-token")
+async def get_rag_embedding_token(request: Request):
+    token = state(request).settings.rag_embedding_token
+    return {"token": token or "", "configured": bool(token)}
+
+
+@router.put("/settings/rag-embedding-token")
+async def put_rag_embedding_token(request: Request, body: dict):
+    try:
+        token = state(request).settings.set_rag_embedding_token(body.get("token"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, detail={"code": "INVALID_API_TOKEN", "message": str(exc)})
+    return {"token": token or "", "configured": bool(token)}
+
+
+def _rag_error(exc: MLXBarError) -> HTTPException:
+    return HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+
+@router.get("/rag/status")
+async def rag_status(request: Request, probe: bool = True):
+    try:
+        return await state(request).rag.status(probe=probe)
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.get("/rag/collections")
+async def rag_list_collections(request: Request):
+    return state(request).rag.list_collections()
+
+
+@router.post("/rag/collections", status_code=201)
+async def rag_create_collection(request: Request, body: dict):
+    try:
+        return state(request).rag.create_collection(body.get("name", ""))
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.delete("/rag/collections/{name}")
+async def rag_delete_collection(name: str, request: Request):
+    try:
+        return state(request).rag.delete_collection(name)
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.get("/rag/collections/{name}/documents")
+async def rag_list_documents(name: str, request: Request):
+    try:
+        return state(request).rag.list_documents(name)
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.post("/rag/collections/{name}/documents", status_code=202)
+async def rag_add_document(name: str, request: Request, body: dict):
+    app = state(request)
+    try:
+        app.rag.require_enabled()
+        app.rag.store.require_collection(name)
+        text = body.get("text")
+        path = body.get("path")
+        if not text and not path:
+            raise MLXBarError("RAG_EMPTY_DOCUMENT", "text または path を指定してください", 400, False)
+        return app.rag.ingest_job(app.jobs, name, text=text, path=path, title=body.get("title"))
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.delete("/rag/collections/{name}/documents/{document_id}")
+async def rag_delete_document(name: str, document_id: str, request: Request):
+    try:
+        return state(request).rag.delete_document(name, document_id)
+    except MLXBarError as exc:
+        raise _rag_error(exc)
+
+
+@router.post("/rag/collections/{name}/query")
+async def rag_query(name: str, request: Request, body: dict):
+    try:
+        return await state(request).rag.query(name, body.get("query", ""), body.get("topK"))
+    except MLXBarError as exc:
+        raise _rag_error(exc)
 
 
 @router.post("/system/reset")

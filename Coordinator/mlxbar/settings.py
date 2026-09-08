@@ -121,6 +121,27 @@ DEFAULTS: dict[str, Any] = {
         "keepTailMessages": 8,
         "summaryMaxTokens": 800,
     },
+    "rag": {
+        # Off by default: the knowledge-base feature is entirely dormant until
+        # this is set. An ordinary API request never reaches the rag package
+        # and rag.sqlite3 is not created. See DESIGN_v2.1.0.md.
+        "enabled": False,
+        # MLXBar does not embed text itself; it calls an external
+        # OpenAI-compatible /v1/embeddings endpoint (LM Studio, Ollama, ...).
+        "embedding": {
+            "baseUrl": "http://127.0.0.1:1234/v1",
+            "model": "text-embedding-nomic-embed-text-v1.5",
+            "timeoutSeconds": 30,
+            "batchSize": 32,
+        },
+        "chunkSize": 1000,
+        "chunkOverlap": 200,
+        "defaultTopK": 4,
+        "maxContextChars": 6000,
+        # Hard per-collection ceiling. Retrieval loads one collection's vectors
+        # into memory, so this is also the memory bound (n * dim * 8 bytes).
+        "maxChunksPerCollection": 5000,
+    },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info",
@@ -151,6 +172,7 @@ class SettingsStore:
         self.path = self.root / "config.json"
         self.token_path = self.root / "control" / "api-token"
         self.lm_studio_token_path = self.root / "control" / "lmstudio-token"
+        self.rag_embedding_token_path = self.root / "control" / "rag-embedding-token"
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "control").mkdir(mode=0o700, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
@@ -301,6 +323,38 @@ class SettingsStore:
         if (isinstance(summary_max_tokens, bool) or not isinstance(summary_max_tokens, int)
                 or not 100 <= summary_max_tokens <= 4000):
             raise ValueError("contextCompression.summaryMaxTokens must be between 100 and 4000")
+        rag = data.get("rag", {})
+        if not isinstance(rag.get("enabled", False), bool):
+            raise ValueError("rag.enabled must be boolean")
+        rag_embedding = rag.get("embedding", {})
+        base_url = rag_embedding.get("baseUrl", "")
+        if (not isinstance(base_url, str) or len(base_url) > 2048
+                or (base_url and not base_url.startswith(("http://", "https://")))):
+            raise ValueError("rag.embedding.baseUrl must be an http(s) URL")
+        model_name = rag_embedding.get("model", "")
+        if not isinstance(model_name, str) or len(model_name) > 512:
+            raise ValueError("rag.embedding.model must be a string")
+        rag_int_ranges = {
+            "timeoutSeconds": (5, 300),
+            "batchSize": (1, 256),
+        }
+        for key, (minimum, maximum) in rag_int_ranges.items():
+            value = rag_embedding.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(f"rag.embedding.{key} must be between {minimum} and {maximum}")
+        chunk_size = rag.get("chunkSize", 1000)
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or not 100 <= chunk_size <= 8000:
+            raise ValueError("rag.chunkSize must be between 100 and 8000")
+        chunk_overlap = rag.get("chunkOverlap", 200)
+        if (isinstance(chunk_overlap, bool) or not isinstance(chunk_overlap, int)
+                or not 0 <= chunk_overlap <= chunk_size // 2):
+            raise ValueError("rag.chunkOverlap must be between 0 and half of rag.chunkSize")
+        for key, minimum, maximum in (("defaultTopK", 1, 20),
+                                      ("maxContextChars", 500, 32000),
+                                      ("maxChunksPerCollection", 100, 50000)):
+            value = rag.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(f"rag.{key} must be between {minimum} and {maximum}")
         if data.get("general", {}).get("language") not in {"en", "ja"}:
             raise ValueError("general.language must be en or ja")
         if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):
@@ -417,4 +471,23 @@ class SettingsStore:
         if len(token) > 2048 or any(character in "\r\n" for character in token):
             raise ValueError("LM Studio APIキーが不正です")
         self._write_secret(self.lm_studio_token_path, token)
+        return token
+
+    @property
+    def rag_embedding_token(self) -> str | None:
+        if not self.rag_embedding_token_path.exists():
+            return None
+        token = self.rag_embedding_token_path.read_text(encoding="utf-8").strip()
+        return token or None
+
+    def set_rag_embedding_token(self, token: str | None) -> str | None:
+        if token is not None and not isinstance(token, str):
+            raise ValueError("埋め込みAPIキーは文字列で指定してください")
+        token = (token or "").strip()
+        if not token:
+            self.rag_embedding_token_path.unlink(missing_ok=True)
+            return None
+        if len(token) > 2048 or any(character in "\r\n" for character in token):
+            raise ValueError("埋め込みAPIキーが不正です")
+        self._write_secret(self.rag_embedding_token_path, token)
         return token

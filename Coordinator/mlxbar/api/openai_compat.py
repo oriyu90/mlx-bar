@@ -10,11 +10,52 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..errors import MLXBarError
+from ..rag.retrieval import inject_context_block
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from . import response_format as response_format_lib
 
 MAX_N = 8
+
+
+def _last_user_text(messages: list[dict]) -> str:
+    """The text of the most recent user message, for use as a retrieval query."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(part.get("text", "") for part in content
+                            if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+async def _apply_rag(request: Request, body: dict, messages: list[dict]) -> list[dict]:
+    """Optionally prepend a retrieved-context system message.
+
+    No-op unless the request carries a ``rag`` object. Mirrors the placement of
+    ``response_format``'s injection (index 0) so the two compose, and runs
+    after ``maybe_compress_messages`` so the context is never summarized away.
+    """
+    spec = body.get("rag")
+    if spec is None:
+        return messages
+    if not isinstance(spec, dict) or not isinstance(spec.get("collection"), str):
+        raise HTTPException(422, detail={"code": "INVALID_REQUEST",
+            "message": "ragはcollectionを含むオブジェクトで指定してください", "param": "rag"})
+    state = app_state(request)
+    language = state.settings.data.get("general", {}).get("language", "en")
+    try:
+        block, summary = await state.rag.retrieve_context_block(
+            spec, _last_user_text(messages), language=language)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    if summary:
+        state.last_rag_retrieval = {**summary, "at": time.time()}
+        request.state.api_log["rag_passages"] = summary.get("passages", 0)
+    return inject_context_block(messages, block) if block else messages
 
 
 router = APIRouter()
@@ -476,6 +517,7 @@ async def chat(request: Request, body: dict):
     if compression:
         request.state.api_log["context_compressed"] = True
         app_state(request).last_context_compression = {**compression, "at": time.time()}
+    normalized_messages = await _apply_rag(request, body, normalized_messages)
     if body.get("stream", False):
         async def stream():
             estimated_prompt_tokens = _estimated_prompt_tokens(normalized_messages)

@@ -175,6 +175,54 @@ struct RuntimeJobInfo {
     var operationName: String { kind.hasPrefix("runtime_stage:") ? "ランタイムをダウンロード・検証" : "ランタイムを更新" }
 }
 
+struct RagCollectionInfo: Identifiable, Hashable {
+    let name: String
+    let documentCount: Int
+    let chunkCount: Int
+    let dimension: Int?
+    let embeddingModel: String?
+    var id: String { name }
+
+    init?(_ value: [String: Any]) {
+        guard let name = value["name"] as? String else { return nil }
+        self.name = name
+        documentCount = (value["document_count"] as? NSNumber)?.intValue ?? 0
+        chunkCount = (value["chunk_count"] as? NSNumber)?.intValue ?? 0
+        dimension = (value["dim"] as? NSNumber)?.intValue
+        embeddingModel = value["embedding_model"] as? String
+    }
+}
+
+struct RagDocumentInfo: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let source: String
+    let charCount: Int
+    let chunkCount: Int
+
+    init?(_ value: [String: Any]) {
+        guard let id = value["id"] as? String else { return nil }
+        self.id = id
+        title = value["title"] as? String ?? ""
+        source = value["source"] as? String ?? ""
+        charCount = (value["char_count"] as? NSNumber)?.intValue ?? 0
+        chunkCount = (value["chunk_count"] as? NSNumber)?.intValue ?? 0
+    }
+}
+
+struct RagQueryHit: Identifiable, Hashable {
+    let id = UUID()
+    let text: String
+    let score: Double
+    let documentTitle: String
+
+    init(_ value: [String: Any]) {
+        text = value["text"] as? String ?? ""
+        score = (value["score"] as? NSNumber)?.doubleValue ?? 0
+        documentTitle = value["documentTitle"] as? String ?? ""
+    }
+}
+
 @MainActor
 final class MenuBarViewModel: ObservableObject {
     @Published var serviceRunning = false
@@ -211,6 +259,19 @@ final class MenuBarViewModel: ObservableObject {
     /// Human-readable "replica N/M could not load (reason)" when a pinned model
     /// is running below its configured replica count; `nil` when at full width.
     @Published var replicaShortfallSummary: String?
+    // Knowledge base (RAG). All read defensively; an older coordinator that
+    // omits the `rag` status/settings keys simply leaves these at their
+    // defaults and the tab shows the feature as off.
+    @Published var ragEnabled = false
+    @Published var ragCollections: [RagCollectionInfo] = []
+    @Published var ragDocuments: [RagDocumentInfo] = []
+    @Published var ragQueryResults: [RagQueryHit] = []
+    @Published var ragBackendReachable: Bool?
+    @Published var ragBackendMessage: String?
+    @Published var ragEmbeddingDim: Int?
+    @Published var ragEmbeddingToken = ""
+    @Published var ragStatusMessage: String?
+    @Published var ragLastRetrievalText: String?
     @Published var loadingModelName: String?
     @Published var loadingEngine: String?
     @Published var loadingPhase: String?
@@ -442,6 +503,18 @@ final class MenuBarViewModel: ObservableObject {
             } else {
                 setIfChanged(\.lastContextCompressionOriginalChars, nil)
                 setIfChanged(\.lastContextCompressionCompressedChars, nil)
+            }
+            if let rag = json["rag"] as? [String: Any] {
+                setIfChanged(\.ragEnabled, rag["enabled"] as? Bool ?? false)
+                if let last = rag["lastRetrieval"] as? [String: Any],
+                   let collection = last["collection"] as? String {
+                    let passages = (last["passages"] as? NSNumber)?.intValue ?? 0
+                    setIfChanged(\.ragLastRetrievalText, guiLanguage == "ja"
+                        ? "「\(collection)」から\(passages)件の文脈を取得しました"
+                        : "Retrieved \(passages) passage(s) from “\(collection)”")
+                } else {
+                    setIfChanged(\.ragLastRetrievalText, nil)
+                }
             }
             if let api = json["api"] as? [String: Any] {
                 setIfChanged(\.apiURL, api["url"] as? String ?? apiURL)
@@ -941,6 +1014,154 @@ final class MenuBarViewModel: ObservableObject {
                 "summaryMaxTokens": summaryMaxTokens,
             ]])
             await self.refreshSettings()
+        }
+    }
+
+    // MARK: - Knowledge base (RAG)
+
+    /// Config + collection list, no network probe of the embedding backend.
+    func refreshRag() async {
+        do {
+            if let status = try await json("GET", "/api/v1/rag/status?probe=false") as? [String: Any] {
+                applyRagStatus(status)
+            }
+            if let token = try await json("GET", "/api/v1/settings/rag-embedding-token") as? [String: Any] {
+                ragEmbeddingToken = token["token"] as? String ?? ""
+            }
+        } catch { errorMessage = presentError(error) }
+    }
+
+    /// Contacts the embedding endpoint and reports reachability + dimension.
+    func testRagBackend() async {
+        ragStatusMessage = ui("Contacting the embedding endpoint…", "埋め込みエンドポイントに接続中…")
+        do {
+            guard let status = try await json("GET", "/api/v1/rag/status?probe=true",
+                                              timeoutSeconds: 60) as? [String: Any] else { return }
+            applyRagStatus(status)
+            if ragBackendReachable == true {
+                ragStatusMessage = ui("Connected. Embedding dimension: \(ragEmbeddingDim ?? 0)",
+                                      "接続成功。埋め込み次元: \(ragEmbeddingDim ?? 0)")
+            } else {
+                ragStatusMessage = ragBackendMessage ?? ui("Could not reach the embedding endpoint.",
+                                                           "埋め込みエンドポイントに接続できませんでした。")
+            }
+        } catch { ragStatusMessage = presentError(error) }
+    }
+
+    private func applyRagStatus(_ json: [String: Any]) {
+        ragEnabled = json["enabled"] as? Bool ?? false
+        ragCollections = (json["collections"] as? [[String: Any]] ?? []).compactMap(RagCollectionInfo.init)
+        if let backend = json["backend"] as? [String: Any] {
+            ragBackendReachable = backend["reachable"] as? Bool
+            ragEmbeddingDim = (backend["dim"] as? NSNumber)?.intValue
+            ragBackendMessage = backend["message"] as? String
+        }
+    }
+
+    func setRagSettings(enabled: Bool, baseURL: String, model: String,
+                        chunkSize: Int, chunkOverlap: Int, defaultTopK: Int,
+                        maxContextChars: Int) async {
+        guard 100...8000 ~= chunkSize, 0...(chunkSize / 2) ~= chunkOverlap,
+              1...20 ~= defaultTopK, 500...32000 ~= maxContextChars,
+              baseURL.hasPrefix("http://") || baseURL.hasPrefix("https://") else {
+            errorMessage = ui("One or more knowledge-base settings are outside the supported range",
+                              "知識ベースの設定に範囲外の値があります")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["rag": [
+                "enabled": enabled,
+                "embedding": ["baseUrl": baseURL, "model": model],
+                "chunkSize": chunkSize,
+                "chunkOverlap": chunkOverlap,
+                "defaultTopK": defaultTopK,
+                "maxContextChars": maxContextChars,
+            ]])
+            await self.refreshSettings()
+            await self.refreshRag()
+        }
+    }
+
+    func saveRagEmbeddingToken(_ token: String) async {
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings/rag-embedding-token", ["token": token])
+            self.ragStatusMessage = self.ui("Embedding API key saved", "埋め込みAPIキーを保存しました")
+        }
+    }
+
+    func createRagCollection(_ name: String) async {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        await perform {
+            _ = try await self.json("POST", "/api/v1/rag/collections", ["name": trimmed])
+            await self.refreshRag()
+        }
+    }
+
+    func deleteRagCollection(_ name: String) async {
+        await perform {
+            _ = try await self.json("DELETE", "/api/v1/rag/collections/\(self.pathComponent(name))")
+            self.ragDocuments = []
+            await self.refreshRag()
+        }
+    }
+
+    func refreshRagDocuments(collection: String) async {
+        do {
+            guard let json = try await json("GET",
+                "/api/v1/rag/collections/\(pathComponent(collection))/documents") as? [String: Any],
+                  let data = json["data"] as? [[String: Any]] else { return }
+            ragDocuments = data.compactMap(RagDocumentInfo.init)
+        } catch { errorMessage = presentError(error) }
+    }
+
+    func addRagDocument(collection: String, title: String, text: String) async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        await ingestRagDocument(collection: collection,
+                                payload: ["title": title, "text": body])
+    }
+
+    func addRagDocumentFile(collection: String, path: String) async {
+        await ingestRagDocument(collection: collection, payload: ["path": path])
+    }
+
+    private func ingestRagDocument(collection: String, payload: [String: Any]) async {
+        await perform {
+            self.ragStatusMessage = self.ui("Embedding the document…", "ドキュメントを埋め込み中…")
+            let job = try await self.json("POST",
+                "/api/v1/rag/collections/\(self.pathComponent(collection))/documents",
+                payload, timeoutSeconds: CoordinatorClient.Timeout.modelLoad) as? [String: Any] ?? [:]
+            let finished = try await self.waitForJob(job)
+            let result = finished["result"] as? [String: Any]
+            let chunks = (result?["chunkCount"] as? NSNumber)?.intValue ?? 0
+            self.ragStatusMessage = self.ui("Added \(chunks) chunk(s)", "\(chunks)個のチャンクを追加しました")
+            await self.refreshRagDocuments(collection: collection)
+            await self.refreshRag()
+        }
+    }
+
+    func deleteRagDocument(collection: String, documentId: String) async {
+        await perform {
+            _ = try await self.json("DELETE",
+                "/api/v1/rag/collections/\(self.pathComponent(collection))/documents/\(self.pathComponent(documentId))")
+            await self.refreshRagDocuments(collection: collection)
+            await self.refreshRag()
+        }
+    }
+
+    func runRagQuery(collection: String, query: String) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        await perform {
+            let json = try await self.json("POST",
+                "/api/v1/rag/collections/\(self.pathComponent(collection))/query",
+                ["query": trimmed], timeoutSeconds: 60) as? [String: Any] ?? [:]
+            let results = json["results"] as? [[String: Any]] ?? []
+            self.ragQueryResults = results.map(RagQueryHit.init)
+            if results.isEmpty {
+                self.ragStatusMessage = self.ui("No matching passages", "一致する文章はありませんでした")
+            }
         }
     }
 

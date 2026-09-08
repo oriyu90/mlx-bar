@@ -269,5 +269,54 @@ class RemoveAllDataTests(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
 
 
+class RagCliTests(unittest.TestCase):
+    _SET_RAG_BASE = dict(
+        command="config", action="set-rag", enabled=None, embedding_base_url=None,
+        embedding_model=None, embedding_timeout_seconds=None, embedding_batch_size=None,
+        chunk_size=None, chunk_overlap=None, default_top_k=None, max_context_chars=None,
+        max_chunks_per_collection=None,
+    )
+
+    def test_set_rag_only_sends_provided_options(self):
+        client = Mock()
+        client.request.return_value = response({"rag": {"enabled": True}})
+        args = argparse.Namespace(**{**self._SET_RAG_BASE, "enabled": "true",
+                                     "embedding_model": "nomic", "chunk_size": 800})
+        execute(args, client)
+        _, path, body = client.request.call_args[0]
+        self.assertEqual(path, "/api/v1/settings")
+        self.assertEqual(body, {"rag": {"enabled": True, "chunkSize": 800,
+                                        "embedding": {"model": "nomic"}}})
+
+    def test_set_rag_rejects_out_of_range_and_empty(self):
+        client = Mock()
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**{**self._SET_RAG_BASE, "default_top_k": 99}), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**{**self._SET_RAG_BASE, "embedding_base_url": "ftp://x"}), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**self._SET_RAG_BASE), client)
+
+    def test_rag_collection_and_query_hit_expected_endpoints(self):
+        client = Mock()
+        client.request.return_value = response({"data": []})
+        execute(argparse.Namespace(command="rag", action="collection", sub="create", name="kb"), client)
+        client.request.assert_called_with("POST", "/api/v1/rag/collections", {"name": "kb"})
+
+        execute(argparse.Namespace(command="rag", action="query", collection="kb",
+                                   query="hello", top_k=3), client)
+        client.request.assert_called_with("POST", "/api/v1/rag/collections/kb/query",
+                                          {"query": "hello", "topK": 3})
+
+    def test_rag_doc_add_requires_exactly_one_source(self):
+        client = Mock()
+        base = dict(command="rag", action="doc", sub="add", collection="kb", title=None,
+                    wait=False, global_json=False)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**base, file=None, text=None), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**base, file="/x", text="y"), client)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,59 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.1.0] - 2026-09-08
+
+ローカル知識ベース（RAG）を追加。文書分割 → 埋め込み生成 → ベクトル検索 →
+コンテキスト生成のパイプラインを、コーディネータ内に依存追加なしで実装しました。
+**既定で無効**（`rag.enabled = false`）で、リクエストに `rag` フィールドを付けない限り
+新しいコードパスには一切到達しません。設定スキーマは追加のみ、`schemaVersion` は 1 の
+ままで、既存の `config.json` はそのまま読めます。
+
+### 追加
+
+- **ローカル知識ベース（`Coordinator/mlxbar/rag/`、新規）。** 再帰的文字分割
+  （`chunking`）、別ファイル SQLite のベクトルストア（`store` → `rag.sqlite3`、最初の
+  コレクション作成まで生成されません）、外部 OpenAI 互換 `/v1/embeddings` クライアント
+  （`embeddings`）、純 Python のコサイン類似度 top-k と取得文の整形（`retrieval`）、
+  これらをまとめる `RagService`（`service`）。埋め込みは MLXBar では計算せず、
+  `rag.embedding.baseUrl` で指定した LM Studio / Ollama などへ委譲します（新規の重い依存も
+  新 Worker 種別も追加していません）。
+- **`/v1/chat/completions` と `/anthropic/v1/messages` の任意 `rag` フィールド。**
+  `{"collection": "...", "topK": 4, "maxChars": 6000, "optional": false}`。直近の user
+  メッセージをクエリに検索し、取得文を1個の合成 `system` メッセージとしてプロンプト先頭へ
+  注入します。`response_format` 注入・`contextCompression` と両立（retrieval は圧縮の後）。
+  コレクション不明は HTTP 404 `RAG_COLLECTION_NOT_FOUND`、`rag.enabled` 無効時に `rag` を
+  付けると 400 `RAG_DISABLED`、埋め込みエンドポイント到達不可は 503
+  `RAG_EMBEDDING_UNAVAILABLE`（`retryable: true`。`optional: true` を付けた場合のみ
+  文脈なしで通常生成にフォールバック）。
+- **管理 API。** `GET /api/v1/rag/status`、`GET|POST /api/v1/rag/collections`、
+  `DELETE /api/v1/rag/collections/{name}`、`GET|POST /api/v1/rag/collections/{name}/documents`
+  （ドキュメント取り込みはジョブ）、`DELETE .../documents/{id}`、
+  `POST /api/v1/rag/collections/{name}/query`（生成なしの取得プレビュー）、
+  `GET|PUT /api/v1/settings/rag-embedding-token`。`/api/v1/status` に `rag` サマリ、
+  `reset_all()` に `rag.sqlite3` の後始末を追加。
+- **`mlxbarctl rag …` と `config set-rag`。** `rag status` / `rag collection list|create|delete` /
+  `rag doc add|list|remove` / `rag query` と、GUI と等価な `config set-rag --…`（指定した
+  項目だけ変更）、`secrets get-rag-embedding-token` / `set-rag-embedding-token`。v1.8.1 の
+  GUI↔CLI パリティ契約に沿った名前付きコマンドです。
+- **GUI「設定 > 知識ベース」タブ（日英完全対応）。** マスタートグル、埋め込みバックエンド
+  設定と接続テスト、チャンク設定、コレクション CRUD、ドキュメントの追加（ファイル／
+  テキスト）・一覧・削除、検索テスト。メニューバーに直近の取得を1行表示。
+- 設定 `rag`（`enabled` / `embedding.{baseUrl,model,timeoutSeconds,batchSize}` /
+  `chunkSize` / `chunkOverlap` / `defaultTopK` / `maxContextChars` /
+  `maxChunksPerCollection`）を `DEFAULTS` と `_validate` に追加。
+
+### 互換性
+
+- `rag.enabled = false`（既定）のとき機能は完全に休眠。`rag` フィールド未指定の
+  リクエストは v2.0.1 とバイト等価。
+- 別 SQLite ファイル（`rag.sqlite3`）のため既存 `state.sqlite3` は無変更・マイグレーション
+  なし。追加した `/api/v1/status` の `rag` キーは増分で、旧 GUI は無視して素通りします。
+- Worker / Coordinator↔Worker RPC / プロンプトキャッシュ / モデルプール / OpenAI・
+  Anthropic の wire format（`rag` 未指定時）は無変更。
+
+詳細は`DESIGN_v2.1.0.md`を参照してください。
+
 ## [2.0.1] - 2026-09-08
 
 複数モデル常駐プールのバグ修正1件と、関連する診断表示の追加。API・設定スキーマ・

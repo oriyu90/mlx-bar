@@ -18,6 +18,7 @@ from .jobs import JobManager
 from .runtimes.slots import SlotStore
 from .runtimes.updater import RuntimeUpdater
 from .runtimes.service import RuntimeUpdateService
+from .rag import RagService
 from .settings import SettingsStore
 from .workers.model_pool import ModelPoolSupervisor
 
@@ -30,6 +31,9 @@ class AppState:
         self.root = self.settings.root
         self.database = Database(self.root / "state.sqlite3")
         self.jobs = JobManager(self.database)
+        # Knowledge base (RAG). Dormant unless `rag.enabled`; opens its own
+        # SQLite file lazily on the first collection.
+        self.rag = RagService(self.root, self.settings)
         self.workers = ModelPoolSupervisor(self.root, self.settings)
         self.slots = SlotStore(self.root)
         self.updater = RuntimeUpdater(self.slots)
@@ -44,6 +48,10 @@ class AppState:
         # None. In-memory only -- purely informational, not persisted, so a
         # restart simply forgets it rather than needing a DB migration.
         self.last_context_compression: dict | None = None
+        # Last request-time RAG retrieval (see api/openai_compat.py), or None.
+        # In-memory only, purely informational -- same treatment as
+        # last_context_compression.
+        self.last_rag_retrieval: dict | None = None
 
     def scan_job(self) -> dict:
         async def work(update):
@@ -104,6 +112,8 @@ class AppState:
         shutil.rmtree(self.workers.socket_dir, ignore_errors=True)
         with contextlib.suppress(Exception):
             self.database.close()
+        with contextlib.suppress(Exception):
+            self.rag.close()
         for handler in list(logging.getLogger().handlers):
             with contextlib.suppress(Exception):
                 handler.close()

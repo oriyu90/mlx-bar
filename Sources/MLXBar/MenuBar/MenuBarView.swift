@@ -87,6 +87,12 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let retrieval = model.ragLastRetrievalText {
+                Label(retrieval, systemImage: "text.magnifyingglass")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             if let error = model.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")

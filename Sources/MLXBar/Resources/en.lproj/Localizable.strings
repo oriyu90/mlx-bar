@@ -318,3 +318,9 @@
 "コンテキスト圧縮設定を適用" = "Apply Context Compression Settings";
 "コンテキスト圧縮の設定値が範囲外です" = "Context compression settings are outside the supported range";
 "要約は元の発言そのものではありません。応答が過去の発言の要約に基づくことがあります。既定では無効です。トリガー閾値はモデルのプロンプト上限に対する割合、直近ターン数は要約されずそのまま送られる末尾のメッセージ数です。" = "The summary is not the original wording. Replies may be based on a summary of earlier turns instead of the verbatim conversation. Off by default. The trigger threshold is a fraction of the model's prompt limit; recent turns are always sent verbatim.";
+
+/* v2.1.0 -- knowledge base (RAG). The Knowledge base settings view resolves
+   its own strings via a bilingual helper, so only the tab title and the file
+   picker (shared FileSelectionService) need a table entry here. */
+"知識ベース" = "Knowledge Base";
+"ファイルを選択" = "Choose a File";

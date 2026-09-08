@@ -35,11 +35,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import MLXBarError
+from ..rag.retrieval import inject_context_block
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from .anthropic_stream import AnthropicMessageBuilder, sse, _anthropic_error_type
 from .openai_compat import (
-    _ensure_requested_model, _find_model, _is_generatable, _normalize_thinking, app_state,
+    _ensure_requested_model, _find_model, _is_generatable, _last_user_text,
+    _normalize_thinking, app_state,
 )
 
 
@@ -337,6 +339,21 @@ async def _messages(request: Request):
     if compression:
         request.state.api_log["context_compressed"] = True
         state.last_context_compression = {**compression, "at": time.time()}
+    rag_spec = body.get("rag")
+    if rag_spec is not None:
+        if not isinstance(rag_spec, dict) or not isinstance(rag_spec.get("collection"), str):
+            raise _bad_request("rag は collection を含むオブジェクトで指定してください")
+        language = state.settings.data.get("general", {}).get("language", "en")
+        try:
+            block, summary = await state.rag.retrieve_context_block(
+                rag_spec, _last_user_text(messages), language=language)
+        except MLXBarError as exc:
+            raise HTTPException(exc.status, detail={
+                "type": _anthropic_error_type(exc.code), "message": exc.message})
+        if summary:
+            state.last_rag_retrieval = {**summary, "at": time.time()}
+        if block:
+            messages = inject_context_block(messages, block)
     builder = AnthropicMessageBuilder(response_model, _estimate_prompt_tokens(messages),
                                       emit_thinking=thinking_enabled)
     generate_for_model = getattr(state.workers, "generate_for_model", None)

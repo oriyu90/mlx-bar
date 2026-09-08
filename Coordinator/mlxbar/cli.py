@@ -126,12 +126,46 @@ def parser() -> argparse.ArgumentParser:
     set_sampling.add_argument("--repetition-context-size", type=int, required=True)
     set_login = config.add_parser("set-launch-at-login")
     set_login.add_argument("value", choices=["true", "false"])
+    set_rag = config.add_parser(
+        "set-rag", help="ナレッジベース（RAG）の設定（指定したオプションだけ変更）")
+    set_rag.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_rag.add_argument("--embedding-base-url", default=None)
+    set_rag.add_argument("--embedding-model", default=None)
+    set_rag.add_argument("--embedding-timeout-seconds", type=int, default=None)
+    set_rag.add_argument("--embedding-batch-size", type=int, default=None)
+    set_rag.add_argument("--chunk-size", type=int, default=None)
+    set_rag.add_argument("--chunk-overlap", type=int, default=None)
+    set_rag.add_argument("--default-top-k", type=int, default=None)
+    set_rag.add_argument("--max-context-chars", type=int, default=None)
+    set_rag.add_argument("--max-chunks-per-collection", type=int, default=None)
     secrets_group = sub.add_parser("secrets").add_subparsers(dest="action", required=True)
     secrets_group.add_parser("get-api-token")
     set_api_token = secrets_group.add_parser("set-api-token"); set_api_token.add_argument("token")
     secrets_group.add_parser("regenerate-api-token")
     secrets_group.add_parser("get-lmstudio-token")
     set_lm_token = secrets_group.add_parser("set-lmstudio-token"); set_lm_token.add_argument("token", nargs="?", default="")
+    secrets_group.add_parser("get-rag-embedding-token")
+    set_rag_token = secrets_group.add_parser("set-rag-embedding-token")
+    set_rag_token.add_argument("token", nargs="?", default="")
+    rag = sub.add_parser("rag").add_subparsers(dest="action", required=True)
+    rag.add_parser("status")
+    rag_collection = rag.add_parser("collection").add_subparsers(dest="sub", required=True)
+    rag_collection.add_parser("list")
+    rc_create = rag_collection.add_parser("create"); rc_create.add_argument("name")
+    rc_delete = rag_collection.add_parser("delete"); rc_delete.add_argument("name")
+    rag_doc = rag.add_parser("doc").add_subparsers(dest="sub", required=True)
+    rd_add = rag_doc.add_parser("add")
+    rd_add.add_argument("collection")
+    rd_add.add_argument("--file", default=None)
+    rd_add.add_argument("--text", default=None)
+    rd_add.add_argument("--title", default=None)
+    rd_add.add_argument("--wait", action="store_true")
+    rd_list = rag_doc.add_parser("list"); rd_list.add_argument("collection")
+    rd_remove = rag_doc.add_parser("remove")
+    rd_remove.add_argument("collection"); rd_remove.add_argument("document_id")
+    rag_query = rag.add_parser("query")
+    rag_query.add_argument("collection"); rag_query.add_argument("query")
+    rag_query.add_argument("--top-k", type=int, default=None)
     logs_group = sub.add_parser("logs").add_subparsers(dest="action", required=True)
     logs_show = logs_group.add_parser("show"); logs_show.add_argument("--limit", type=int, default=500)
     logs_group.add_parser("clear")
@@ -403,6 +437,52 @@ def execute(args, client: Client):
             # against the real registration on its next launch/refresh.
             return client.request("PUT", "/api/v1/settings",
                                   {"general": {"launchAtLogin": args.value == "true"}}).json()
+        if args.action == "set-rag":
+            # Mirror the GUI's Settings > Knowledge base panel: only the given
+            # options change; ranges match settings.py's _validate.
+            patch: dict = {}
+            embedding: dict = {}
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if args.embedding_base_url is not None:
+                if not args.embedding_base_url.startswith(("http://", "https://")):
+                    raise ValueError("埋め込みエンドポイントのURLは http:// または https:// で指定してください")
+                embedding["baseUrl"] = args.embedding_base_url
+            if args.embedding_model is not None:
+                embedding["model"] = args.embedding_model
+            if args.embedding_timeout_seconds is not None:
+                if not 5 <= args.embedding_timeout_seconds <= 300:
+                    raise ValueError("埋め込みのタイムアウトは5〜300秒で指定してください")
+                embedding["timeoutSeconds"] = args.embedding_timeout_seconds
+            if args.embedding_batch_size is not None:
+                if not 1 <= args.embedding_batch_size <= 256:
+                    raise ValueError("埋め込みのバッチサイズは1〜256で指定してください")
+                embedding["batchSize"] = args.embedding_batch_size
+            if args.chunk_size is not None:
+                if not 100 <= args.chunk_size <= 8000:
+                    raise ValueError("チャンクサイズは100〜8,000文字で指定してください")
+                patch["chunkSize"] = args.chunk_size
+            if args.chunk_overlap is not None:
+                if args.chunk_overlap < 0:
+                    raise ValueError("チャンクの重なりは0以上で指定してください")
+                patch["chunkOverlap"] = args.chunk_overlap
+            if args.default_top_k is not None:
+                if not 1 <= args.default_top_k <= 20:
+                    raise ValueError("既定の取得件数は1〜20で指定してください")
+                patch["defaultTopK"] = args.default_top_k
+            if args.max_context_chars is not None:
+                if not 500 <= args.max_context_chars <= 32000:
+                    raise ValueError("注入する文脈の最大文字数は500〜32,000で指定してください")
+                patch["maxContextChars"] = args.max_context_chars
+            if args.max_chunks_per_collection is not None:
+                if not 100 <= args.max_chunks_per_collection <= 50000:
+                    raise ValueError("コレクションあたりのチャンク上限は100〜50,000で指定してください")
+                patch["maxChunksPerCollection"] = args.max_chunks_per_collection
+            if embedding:
+                patch["embedding"] = embedding
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"rag": patch}).json()
         return client.request("PUT", "/api/v1/settings", nested_patch(args.key, args.value)).json()
     if args.command == "secrets":
         if args.action == "get-api-token": return client.request("GET", "/api/v1/settings/api-token").json()
@@ -410,6 +490,8 @@ def execute(args, client: Client):
         if args.action == "regenerate-api-token": return client.request("POST", "/api/v1/settings/api-token/regenerate").json()
         if args.action == "get-lmstudio-token": return client.request("GET", "/api/v1/settings/lm-studio-token").json()
         if args.action == "set-lmstudio-token": return client.request("PUT", "/api/v1/settings/lm-studio-token", {"token": args.token}).json()
+        if args.action == "get-rag-embedding-token": return client.request("GET", "/api/v1/settings/rag-embedding-token").json()
+        if args.action == "set-rag-embedding-token": return client.request("PUT", "/api/v1/settings/rag-embedding-token", {"token": args.token}).json()
     if args.command == "logs":
         if args.action == "show": return client.request("GET", f"/api/v1/logs?limit={args.limit}").json()
         if args.action == "clear": return client.request("DELETE", "/api/v1/logs").json()
@@ -454,6 +536,41 @@ def execute(args, client: Client):
         if args.action == "set-auto-load":
             return client.request("PUT", "/api/v1/settings",
                                   {"models": {"lmStudio": {"autoLoad": args.value == "true"}}}).json()
+    if args.command == "rag":
+        if args.action == "status":
+            return client.request("GET", "/api/v1/rag/status").json()
+        if args.action == "collection":
+            if args.sub == "list":
+                return client.request("GET", "/api/v1/rag/collections").json()
+            if args.sub == "create":
+                return client.request("POST", "/api/v1/rag/collections", {"name": args.name}).json()
+            if args.sub == "delete":
+                return client.request("DELETE", f"/api/v1/rag/collections/{args.name}").json()
+        if args.action == "doc":
+            if args.sub == "add":
+                if bool(args.file) == bool(args.text):
+                    raise ValueError("--file または --text のどちらか一方を指定してください")
+                body: dict = {"title": args.title}
+                if args.file:
+                    body["path"] = str(Path(args.file).expanduser())
+                else:
+                    body["text"] = args.text
+                job = client.request(
+                    "POST", f"/api/v1/rag/collections/{args.collection}/documents", body).json()
+                return wait_job(client, job, args.global_json) if args.wait else job
+            if args.sub == "list":
+                return client.request(
+                    "GET", f"/api/v1/rag/collections/{args.collection}/documents").json()
+            if args.sub == "remove":
+                return client.request(
+                    "DELETE",
+                    f"/api/v1/rag/collections/{args.collection}/documents/{args.document_id}").json()
+        if args.action == "query":
+            payload: dict = {"query": args.query}
+            if args.top_k is not None:
+                payload["topK"] = args.top_k
+            return client.request(
+                "POST", f"/api/v1/rag/collections/{args.collection}/query", payload).json()
     if args.command == "diagnostics": return client.request("GET", "/api/v1/diagnostics").json()
     if args.command == "remove-all-data": return remove_all_data(args, client)
 

@@ -56,6 +56,19 @@ final class FileSelectionService {
         return await present(panel)
     }
 
+    func chooseTextFile(startingAt directory: URL? = nil) async -> Selection {
+        let panel = NSOpenPanel()
+        panel.title = LS("ファイルを選択")
+        panel.prompt = LS("追加")
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.plainText, .text, .utf8PlainText, .data]
+        panel.showsHiddenFiles = true
+        panel.directoryURL = validDirectory(directory)
+        return await present(panel)
+    }
+
     private func validDirectory(_ url: URL?) -> URL? {
         guard let url else { return nil }
         var isDirectory: ObjCBool = false
