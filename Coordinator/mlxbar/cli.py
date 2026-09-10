@@ -110,6 +110,23 @@ def parser() -> argparse.ArgumentParser:
                                  help="要約後も逐語で残す直近ターン数（2〜50）")
     set_compression.add_argument("--summary-max-tokens", type=int, default=None,
                                  help="要約生成の最大トークン数（100〜4000）")
+    set_adaptive = config.add_parser(
+        "set-adaptive-memory",
+        help="実験的機能 アダプティブ・ハイブリッド・コンテキストメモリの設定（指定したオプションだけ変更、既定で無効）")
+    set_adaptive.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_adaptive.add_argument("--policy", choices=["fidelity", "balanced", "memorySaver"], default=None)
+    set_adaptive.add_argument("--trigger-percent", type=int, default=None, help="発火の目安（50〜95）")
+    set_adaptive.add_argument("--memory-pressure-percent", type=int, default=None,
+                              help="メモリ逼迫の目安（50〜95）")
+    set_adaptive.add_argument("--keep-tail", type=int, default=None,
+                              help="EXACTのまま残す直近ターン数（2〜50）")
+    set_adaptive.add_argument("--max-latent-tokens", type=int, default=None,
+                              help="LATENTブロックの最大ソフトトークン数（16〜2048）")
+    set_adaptive.add_argument("--max-retrieved-segments", type=int, default=None,
+                              help="取得するLATENTセグメントの上限（1〜64）")
+    set_adaptive.add_argument("--verbatim-protection", choices=["true", "false"], default=None)
+    set_adaptive.add_argument("--soft-token", choices=["true", "false"], default=None,
+                              help="ソフトトークンのHybrid Prefill（実験、既定で無効）")
     set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
     set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
                                            "require-token", "continue-after-gui-exit"])
@@ -400,6 +417,43 @@ def execute(args, client: Client):
             if not patch:
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings", {"contextCompression": patch}).json()
+        if args.action == "set-adaptive-memory":
+            # Mirror the GUI's Settings > Experimental panel
+            # (setAdaptiveMemorySettings). Ranges match settings.py's _validate;
+            # the server also rejects enabling this while contextCompression is on.
+            patch: dict = {}
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if args.policy is not None:
+                patch["policy"] = args.policy
+            if args.trigger_percent is not None:
+                if not 50 <= args.trigger_percent <= 95:
+                    raise ValueError("発火の目安は50〜95%で指定してください")
+                patch["triggerRatio"] = args.trigger_percent / 100
+            if args.memory_pressure_percent is not None:
+                if not 50 <= args.memory_pressure_percent <= 95:
+                    raise ValueError("メモリ逼迫の目安は50〜95%で指定してください")
+                patch["memoryPressureRatio"] = args.memory_pressure_percent / 100
+            if args.keep_tail is not None:
+                if not 2 <= args.keep_tail <= 50:
+                    raise ValueError("EXACTのまま残す直近ターン数は2〜50で指定してください")
+                patch["keepTailMessages"] = args.keep_tail
+            if args.max_latent_tokens is not None:
+                if not 16 <= args.max_latent_tokens <= 2048:
+                    raise ValueError("LATENTブロックの最大ソフトトークン数は16〜2048で指定してください")
+                patch["maxLatentTokens"] = args.max_latent_tokens
+            if args.max_retrieved_segments is not None:
+                if not 1 <= args.max_retrieved_segments <= 64:
+                    raise ValueError("取得するLATENTセグメントの上限は1〜64で指定してください")
+                patch["maxRetrievedSegments"] = args.max_retrieved_segments
+            if args.verbatim_protection is not None:
+                patch["verbatimProtection"] = args.verbatim_protection == "true"
+            if args.soft_token is not None:
+                patch["softToken"] = args.soft_token == "true"
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings",
+                                  {"experimental": {"adaptiveMemory": patch}}).json()
         if args.action == "set-flag":
             keys = {"auto-load-on-api": "models.autoLoadOnAPIRequest",
                     "anthropic-api": "api.anthropic.enabled",

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import os
 import time
+
+LOGGER = logging.getLogger(__name__)
 
 from common import cache_state
 from common.server import BaseAdapter, run
@@ -179,12 +182,44 @@ class MLXLMAdapter(BaseAdapter):
         prompt_tokens: list[int] = []
         cache = None
         cache_tier = "cold"
-        if isinstance(prompt, str) and self.prompt_cache is not None:
+        adaptive_active = False
+        adaptive_cfg = params.get("adaptiveMemory") or {}
+        if isinstance(prompt, str) and adaptive_cfg.get("enabled") and adaptive_cfg.get("softToken"):
+            # Experimental soft-token Hybrid Prefiller. Everything here happens
+            # before a single token is yielded, so any failure falls straight
+            # through to the ordinary EXACT path below with nothing emitted.
+            try:
+                from .adaptive_memory import AdaptiveRuntime, FallbackToExact
+                adaptive_tokens = self._encode(prompt)
+                runtime = AdaptiveRuntime(
+                    self.model, self.processor, adaptive_cfg,
+                    cache_root=os.environ.get("MLXBAR_PROMPT_CACHE_ROOT"))
+                plan = runtime.prepare(adaptive_tokens)
+                cache = plan["cache"]
+                kwargs["prompt"] = plan["remaining"]
+                kwargs["prompt_cache"] = cache
+                prompt_tokens = plan["all_tokens"]
+                cache_tier = "adaptive"
+                adaptive_active = True
+                yield {"type": "metrics", "adaptive_memory": plan["metrics"]}
+            except FallbackToExact as exc:
+                LOGGER.info("adaptive memory fell back to EXACT: %s", exc)
+                cache = None
+                cache_tier = "cold"
+                kwargs.pop("prompt_cache", None)
+            except Exception as exc:  # noqa: BLE001 - never break a request
+                LOGGER.warning("adaptive memory disabled for this request: %s", exc)
+                cache = None
+                cache_tier = "cold"
+                kwargs.pop("prompt_cache", None)
+        if not adaptive_active and isinstance(prompt, str) and self.prompt_cache is not None:
             try:
                 prompt_tokens = self._encode(prompt)
             except Exception:
                 prompt_tokens = []
-        if prompt_tokens:
+        if adaptive_active:
+            pass
+        elif prompt_tokens:
             cache, remaining, cache_tier = self.prompt_cache.fetch(self.model, prompt_tokens)
             if cache is None:
                 try:
@@ -238,7 +273,10 @@ class MLXLMAdapter(BaseAdapter):
             # too: its cache holds a real prefix of the conversation, and
             # throwing it away is what used to make the next request pay for the
             # whole prompt again. Only the pairing has to be proven first.
-            if cache is not None and prompt_tokens and self.prompt_cache is not None:
+            if (cache is not None and prompt_tokens and self.prompt_cache is not None
+                    and not adaptive_active):
+                # A hybrid (soft-token) cache is not a plain prefix of the raw
+                # prompt, so it must never be stored in the EXACT prompt cache.
                 self._remember(cache, prompt_tokens, generated, completed, request_id)
 
         if len(generated) >= max_tokens:

@@ -243,6 +243,8 @@ final class MenuBarViewModel: ObservableObject {
     /// request either didn't need compression or the feature is off.
     @Published var lastContextCompressionOriginalChars: Int?
     @Published var lastContextCompressionCompressedChars: Int?
+    @Published var lastAdaptiveMemoryRatio: Double?
+    @Published var lastAdaptiveMemoryFallbackReason: String?
     @Published var activeRequestCount = 0
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
@@ -503,6 +505,14 @@ final class MenuBarViewModel: ObservableObject {
             } else {
                 setIfChanged(\.lastContextCompressionOriginalChars, nil)
                 setIfChanged(\.lastContextCompressionCompressedChars, nil)
+            }
+            if let adaptive = json["adaptiveMemory"] as? [String: Any] {
+                setIfChanged(\.lastAdaptiveMemoryRatio,
+                             (adaptive["compression_ratio"] as? NSNumber)?.doubleValue)
+                setIfChanged(\.lastAdaptiveMemoryFallbackReason, adaptive["fallback_reason"] as? String)
+            } else {
+                setIfChanged(\.lastAdaptiveMemoryRatio, nil)
+                setIfChanged(\.lastAdaptiveMemoryFallbackReason, nil)
             }
             if let rag = json["rag"] as? [String: Any] {
                 setIfChanged(\.ragEnabled, rag["enabled"] as? Bool ?? false)
@@ -926,6 +936,21 @@ final class MenuBarViewModel: ObservableObject {
             : "Compacted the conversation (\(MenuBarViewModel.tokenCount(original))→\(MenuBarViewModel.tokenCount(compressed)) chars)"
     }
 
+    /// Set after a request that went through Adaptive Hybrid Context Memory
+    /// (v2.2.0), so the model list can say the reply used a condensed context.
+    var adaptiveMemorySummaryText: String? {
+        if let reason = lastAdaptiveMemoryFallbackReason, !reason.isEmpty {
+            return guiLanguage == "ja"
+                ? "アダプティブメモリはEXACTにフォールバックしました（\(reason)）"
+                : "Adaptive memory fell back to EXACT (\(reason))"
+        }
+        guard let ratio = lastAdaptiveMemoryRatio, ratio > 0, ratio < 1 else { return nil }
+        let percent = Int(((1 - ratio) * 100).rounded())
+        return guiLanguage == "ja"
+            ? "アダプティブメモリで文脈を約\(percent)%削減しました"
+            : "Adaptive memory trimmed the context by ~\(percent)%"
+    }
+
     static func cacheReasonText(_ reason: String?, japanese: Bool) -> String {
         switch reason {
         case "reuse_unsupported":
@@ -1013,6 +1038,37 @@ final class MenuBarViewModel: ObservableObject {
                 "keepTailMessages": keepTailMessages,
                 "summaryMaxTokens": summaryMaxTokens,
             ]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// Adaptive Hybrid Context Memory (experimental, v2.2.0). The server
+    /// rejects enabling this while Context Compression is on (422); `perform`
+    /// surfaces that message.
+    func setAdaptiveMemorySettings(enabled: Bool, policy: String, triggerPercent: Int,
+                                   memoryPressurePercent: Int, keepTailMessages: Int,
+                                   maxLatentTokens: Int, maxRetrievedSegments: Int,
+                                   verbatimProtection: Bool, softToken: Bool) async {
+        guard ["fidelity", "balanced", "memorySaver"].contains(policy),
+              50...95 ~= triggerPercent, 50...95 ~= memoryPressurePercent,
+              2...50 ~= keepTailMessages, 16...2048 ~= maxLatentTokens,
+              1...64 ~= maxRetrievedSegments else {
+            errorMessage = ui("Adaptive memory settings are outside the supported range",
+                              "アダプティブメモリの設定値が範囲外です")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["experimental": ["adaptiveMemory": [
+                "enabled": enabled,
+                "policy": policy,
+                "triggerRatio": Double(triggerPercent) / 100,
+                "memoryPressureRatio": Double(memoryPressurePercent) / 100,
+                "keepTailMessages": keepTailMessages,
+                "maxLatentTokens": maxLatentTokens,
+                "maxRetrievedSegments": maxRetrievedSegments,
+                "verbatimProtection": verbatimProtection,
+                "softToken": softToken,
+            ]]])
             await self.refreshSettings()
         }
     }

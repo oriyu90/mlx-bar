@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.1.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.2.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -33,6 +33,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 公開APIポートの検査と、旧接続をdrainするデュアルリスナー切替
 - MLX LM / MLX VLMを分離したランタイムの初回自動インストール、更新、検証、復元、旧版削除
 - 既定で無効なローカル知識ベース（RAG）：文書分割・外部OpenAI互換`/v1/embeddings`での埋め込み生成・純Pythonのベクトル検索・取得文のプロンプト注入。リクエストに`rag`フィールドを付けたときだけ動作
+- 既定で無効な実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」（v2.2.0）：古い会話ターンをEXACT（逐語）／LATENT（短い要約、任意でソフトトークンのHybrid Prefill）／COLD（推論から除外、元メッセージから復元）へ動的に振り分けてTTFTとKVメモリを削減。コンテキスト自動圧縮とは排他。あらゆる失敗は通常のEXACT推論へ自動フォールバック
 - GUIと同じ管理APIを利用する`mlxbarctl`
 
 ## 動作要件
@@ -44,7 +45,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.1.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.2.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -136,7 +137,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)、v2.2.0の変更点（実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」。古い会話をEXACT／LATENT／COLDへ動的振り分け。既定で無効、`experimental.adaptiveMemory.enabled`未設定なら新コードパスに到達せず、あらゆる失敗は通常EXACT推論へフォールバック）は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -279,6 +280,7 @@ GUIで操作できることは**すべて**`mlxbarctl`から操作できます�
 | 設定 > モデル > 複数モデル常駐 | `config set-model-pool --…` |
 | 設定 > モデル > コンテキスト自動圧縮（v1.9.2〜） | `config set-context-compression --…`（v2.0.0〜） |
 | 設定 > 知識ベース（v2.1.0〜） | `config set-rag --…` / `rag status` / `rag collection …` / `rag doc …` / `rag query` / `secrets set-rag-embedding-token` |
+| 設定 > 実験的機能 > アダプティブ・ハイブリッド・コンテキストメモリ（v2.2.0〜） | `config set-adaptive-memory --…` |
 | 設定 > モデル > Max token上限 / 既定の生成パラメータ / 並列リクエスト | `config set-max-tokens` / `config set-sampling-defaults` / `config set-queue-limits` |
 | 設定 > モデル > 追加フォルダ | `model add-folder` / `model remove-folder` |
 | 設定 > モデル / API > 各種トグル | `config set-flag <name> true|false`（`auto-load-on-api` / `anthropic-api` / `remote-image-urls` / `require-token` / `continue-after-gui-exit`） |
@@ -319,6 +321,8 @@ OpenAI互換エラーはトップレベルの`error`オブジェクトで返し�
 v2.0.0から`response_format`の`json_object`・`json_schema`、`n`（複数候補生成、非stream時のみ、最大8）、レガシーの`/v1/completions`（生プロンプト、chat templateなし）に対応しました。`response_format`はMLXBarに文法制約デコーダがないため、プロンプト指示＋生成後バリデーションのベストエフォート実装です（`json_schema`は`oneOf`/`$ref`など一部キーワード未対応、事前にHTTP 400で拒否）。検証に失敗した場合は無効なJSONを黙って返さず、HTTP 502 `RESPONSE_FORMAT_INVALID`（`retryable: true`）で拒否します。`logprobs`とOpenAI Responses API（`/v1/responses`）、Chat Completionsのテキスト以外の出力は引き続き未対応で、フリーズせず入力エラー/HTTP 404として終了します（scope外とした理由は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)を参照）。
 
 v2.1.0から、リクエストに任意の`rag`フィールドを付けると、ローカル知識ベースから関連文を検索してプロンプト先頭に合成`system`メッセージとして注入します（例: `"rag": {"collection": "my-notes", "topK": 4, "maxChars": 6000}`）。`rag`を付けないリクエストの挙動はv2.0.1と完全に同一です。直近のuserメッセージ本文をクエリにします。指定コレクションが無ければHTTP 404 `RAG_COLLECTION_NOT_FOUND`、`rag.enabled`（設定）が無効のときは400 `RAG_DISABLED`、外部の埋め込みエンドポイントに接続できないときは503 `RAG_EMBEDDING_UNAVAILABLE`（`retryable: true`）を返します。`"rag": {"optional": true}`を付けると、埋め込み取得に失敗しても文脈なしで通常生成にフォールバックします。埋め込み自体はMLXBarでは計算せず、`rag.embedding.baseUrl`で指定したOpenAI互換`/v1/embeddings`（LM Studio、Ollama など）へ委譲します。`/anthropic`側も同じ`rag`フィールドに対応します。設計は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)を参照してください。
+
+v2.2.0で実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」を追加しました（設定`experimental.adaptiveMemory`、**既定で無効**）。有効化すると、長い会話の古いターンを、コード・数値・ツール出力・ファイルパス・ハッシュなどの逐語情報はEXACT（そのまま）、自然言語の議論はLATENT（短い要約ノート。ノートは内容アドレスでキャッシュし、同じ履歴を再送するクライアントでは再要約を省略）、関連性の低いターンはCOLD（推論から除外。元メッセージはクライアントが再送するため復元可能）へ振り分け、TTFTとKVキャッシュ使用量を削減します。`experimental.adaptiveMemory.softToken`を有効にすると、mlx-lm Workerがさらに古い帯のトークンをモデル自身の埋め込み層でソフトトークンへ平均プールし、`input_embeddings`でKVキャッシュへHybrid Prefillします（Apple Siliconでの実測用の試験実装。対応しないモデルでは自動でEXACTへフォールバック）。`contextCompression`とは排他で、両方を有効化しようとするとHTTP 422で拒否します。Writer失敗・Reader非対応・埋め込み次元不一致・キャッシュ破損・Policy例外など**あらゆる失敗は通常のEXACT推論へ自動フォールバックし、APIエラーにはしません**。`GET /api/v1/status`の`adaptiveMemory`に直近の`compression_ratio`と`fallback_reason`が入ります。設計は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)を参照してください。
 
 ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルまたは`extra_body`内の`thinking`と`reasoning_effort`も受理し、mlx-lm・mlx-vlmのチャットテンプレートへ渡します。`thinking.type`の`enabled` / `disabled`は`enable_thinking`へ、`budget_tokens`は`thinking_budget`へ、`clear_thinking`は逆値の`preserve_thinking`へ、`thinking.effort`は`reasoning_effort`へ変換します。将来のZCodeやOpenAI互換クライアントが追加する未知の拡張項目は生成へ渡さず安全に無視するため、項目追加だけでHTTP 400になりません。同じ値が`extra_body.chat_template_kwargs`に明示された場合はそちらを優先します。`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`はMLXBarが管理するため、`chat_template_kwargs`内での上書きは受け付けません。
 
@@ -562,7 +566,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.1.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.2.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

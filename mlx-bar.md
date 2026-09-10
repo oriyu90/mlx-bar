@@ -156,6 +156,47 @@
   はすでに`model_pool.py`にあった値をSwiftの`ResidentModel`へ1フィールド追加しただけ。
   詳細は`DESIGN_v1.9.2.md` / `TEST_PLAN_v1.9.2.md`。
 
+## v2.2.0で守ること（実験的機能: アダプティブ・ハイブリッド・コンテキストメモリ）
+
+- **既定OFFが不変条件。** `experimental.adaptiveMemory.enabled: false`。適用しただけでは
+  挙動は一切変わらない（`config.json`にキーが無ければ無効相当にマージ）。`schemaVersion`は
+  1のまま。新設定は`experimental`という新トップレベルキー配下に**追加のみ**。
+- **`contextCompression`とは排他。** `_validate`が両方`enabled`で`ValueError`（HTTP 422）。
+  片方を有効化するもう一方は自動で無効化しない——ユーザーに明示させる。
+- **2層構造。両方ともOFF既定。**
+  - 層1（コーディネータ、`Coordinator/mlxbar/api/adaptive_memory/`）は`messages`リストの
+    書き換えだけ。`context_compression.py`の`_split_point` / `_chars` / `_summarize` /
+    `_effective_max_prompt_characters`を**再利用**（re-exportしただけで本体は無改変）。
+    `maybe_plan_adaptive_memory`は`_plan`全体を`except Exception -> (messages, None)`で包み、
+    絶対に投げない。
+  - 層2（mlx-lm Worker、`Workers/mlx_lm_worker/adaptive_memory/`）は`softToken`がONかつ
+    Readerが`input_embeddings`対応のときのみ。`AdaptiveRuntime.prepare()`は
+    `FallbackToExact`**以外を投げない**。`adapter.stream()`の分岐はトークンを1つもyieldする
+    前に完結するので、失敗しても下の通常EXACT経路へそのまま落ちる。
+- **adapter.pyのOFF経路はバイト等価。** 分岐ゲートは`adaptive_cfg.get("enabled") and
+  adaptive_cfg.get("softToken")`の二重。`adaptive_active`がFalseのとき`PromptCacheStore.fetch`
+  も`_remember`（`store`）も従来どおり。ハイブリッドキャッシュはRawプロンプトのprefixでは
+  ないのでEXACTプロンプトキャッシュへ**絶対に混ぜない**（`_remember`ガードに`and not
+  adaptive_active`）。
+- **Writer `meanpool-v1`は無学習・決定論的。** モデル自身の入力埋め込み層で平均プールする
+  だけ。品質は主張しない——Apple Siliconでの機構の実測用。だから`softToken`は既定OFF
+  （「実測がないなら既定値を動かさない」）。学習型Writerを足すときは`writer_registry`へ
+  追加し、fingerprintがcache keyに入るので古いソフトトークンは自動で無効化される。
+- **Hybrid KVキャッシュはv1では再利用しない。** `hybrid_cache.HybridKVCache.get`は常にmiss、
+  `put`はno-op。27B級ハイブリッドでの部分ソフトトークンprefill済みキャッシュの往復が未実測の
+  ため。key構成（reader/writer/template/policy/mlx-lm version + block hash）だけ確定させて
+  ある。実測してから埋めること。
+- **フォールバック理由を潰さない。** Writer非対応 / Reader非対応 / 埋め込み次元不一致 /
+  Writer失敗 / Latent Cache破損 / chat template解析失敗 / Policy例外 / プロンプトが短くバンド
+  分割不可 — すべて通常EXACT推論へ自動復帰。`/api/v1/status`の`adaptiveMemory`に
+  `compression_ratio`と`fallback_reason`。実験機能の失敗をAPIエラーへ波及させない。
+- **`/api/v1/status`の`adaptiveMemory`キーは増分。** 旧GUIは無視。`AppState.last_adaptive_memory`は
+  `last_context_compression`と同じインメモリ・非永続の扱い。
+- **mlx-vlm Workerは無変更**（画像ターンは常にEXACT）。CLIは`config set-adaptive-memory`
+  （GUI等価、指定した項目だけ変更）。汎用`config set experimental.adaptiveMemory.<key>`も可。
+- 詳細は`DESIGN_v2.2.0.md` / `TEST_PLAN_v2.2.0.md`。Python回帰466件
+  （v2.1.0の430 + `test_adaptive_memory.py` 34 + `test_cli.py` 2）。
+
 ## 未解決の課題
 
 ### Anthropic / OpenAI の `top_k` を黙って無視している（v1.9.0時点・未対応）

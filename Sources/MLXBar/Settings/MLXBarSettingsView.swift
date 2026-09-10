@@ -236,6 +236,15 @@ struct ModelSourceSettingsView: View {
     @State private var contextCompressionTriggerPercent = 70
     @State private var contextCompressionKeepTail = 8
     @State private var contextCompressionSummaryMaxTokens = 800
+    @State private var adaptiveMemoryEnabled = false
+    @State private var adaptiveMemorySoftToken = false
+    @State private var adaptiveMemoryPolicy = "balanced"
+    @State private var adaptiveMemoryTriggerPercent = 60
+    @State private var adaptiveMemoryMemoryPressurePercent = 75
+    @State private var adaptiveMemoryKeepTail = 8
+    @State private var adaptiveMemoryMaxLatentTokens = 256
+    @State private var adaptiveMemoryMaxRetrievedSegments = 8
+    @State private var adaptiveMemoryVerbatimProtection = true
     @State private var pinnedModelIds: Set<String> = []
     @State private var pinnedModelReplicas: [String: Int] = [:]
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
@@ -320,6 +329,43 @@ struct ModelSourceSettingsView: View {
                     }
                 }.buttonStyle(.borderedProminent)
                 Text(LS("要約は元の発言そのものではありません。応答が過去の発言の要約に基づくことがあります。既定では無効です。トリガー閾値はモデルのプロンプト上限に対する割合、直近ターン数は要約されずそのまま送られる末尾のメッセージ数です。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("実験的機能")) {
+                Toggle(LS("アダプティブ・ハイブリッド・コンテキストメモリ"), isOn: $adaptiveMemoryEnabled)
+                Picker(LS("方針"), selection: $adaptiveMemoryPolicy) {
+                    Text(LS("忠実度優先")).tag("fidelity")
+                    Text(LS("バランス")).tag("balanced")
+                    Text(LS("メモリ節約")).tag("memorySaver")
+                }
+                Stepper("\(LS("発火の目安")): \(adaptiveMemoryTriggerPercent)%",
+                        value: $adaptiveMemoryTriggerPercent, in: 50...95, step: 5)
+                Stepper("\(LS("メモリ逼迫の目安")): \(adaptiveMemoryMemoryPressurePercent)%",
+                        value: $adaptiveMemoryMemoryPressurePercent, in: 50...95, step: 5)
+                Stepper("\(LS("EXACTのまま残す直近ターン数")): \(adaptiveMemoryKeepTail)",
+                        value: $adaptiveMemoryKeepTail, in: 2...50)
+                Stepper("\(LS("LATENTブロックの最大ソフトトークン数")): \(adaptiveMemoryMaxLatentTokens)",
+                        value: $adaptiveMemoryMaxLatentTokens, in: 16...2048, step: 16)
+                Stepper("\(LS("取得するLATENTセグメントの上限")): \(adaptiveMemoryMaxRetrievedSegments)",
+                        value: $adaptiveMemoryMaxRetrievedSegments, in: 1...64)
+                Toggle(LS("コード・数値・ツール出力をEXACTで保護"), isOn: $adaptiveMemoryVerbatimProtection)
+                Toggle(LS("ソフトトークンのHybrid Prefill（実験）"), isOn: $adaptiveMemorySoftToken)
+                Button(LS("アダプティブメモリ設定を適用")) {
+                    Task {
+                        await model.setAdaptiveMemorySettings(
+                            enabled: adaptiveMemoryEnabled,
+                            policy: adaptiveMemoryPolicy,
+                            triggerPercent: adaptiveMemoryTriggerPercent,
+                            memoryPressurePercent: adaptiveMemoryMemoryPressurePercent,
+                            keepTailMessages: adaptiveMemoryKeepTail,
+                            maxLatentTokens: adaptiveMemoryMaxLatentTokens,
+                            maxRetrievedSegments: adaptiveMemoryMaxRetrievedSegments,
+                            verbatimProtection: adaptiveMemoryVerbatimProtection,
+                            softToken: adaptiveMemorySoftToken)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("実験的機能です。既定では無効です。古い会話を「EXACT／LATENT（短い要約）／COLD（推論から除外）」へ振り分けてTTFTとKVメモリを削減します。要約は元の発言そのものではありません。コンテキスト自動圧縮とは同時に使用できません。ソフトトークンのHybrid PrefillはApple Siliconでの実測用の試験実装で、対応していないモデルでは自動的にEXACTへフォールバックします。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -461,6 +507,16 @@ struct ModelSourceSettingsView: View {
             contextCompressionTriggerPercent = Int((((compression["triggerRatio"] as? NSNumber)?.doubleValue ?? 0.7) * 100).rounded())
             contextCompressionKeepTail = (compression["keepTailMessages"] as? NSNumber)?.intValue ?? 8
             contextCompressionSummaryMaxTokens = (compression["summaryMaxTokens"] as? NSNumber)?.intValue ?? 800
+            let adaptive = ((model.settings["experimental"] as? [String: Any])?["adaptiveMemory"] as? [String: Any]) ?? [:]
+            adaptiveMemoryEnabled = adaptive["enabled"] as? Bool ?? false
+            adaptiveMemorySoftToken = adaptive["softToken"] as? Bool ?? false
+            adaptiveMemoryPolicy = adaptive["policy"] as? String ?? "balanced"
+            adaptiveMemoryTriggerPercent = Int((((adaptive["triggerRatio"] as? NSNumber)?.doubleValue ?? 0.6) * 100).rounded())
+            adaptiveMemoryMemoryPressurePercent = Int((((adaptive["memoryPressureRatio"] as? NSNumber)?.doubleValue ?? 0.75) * 100).rounded())
+            adaptiveMemoryKeepTail = (adaptive["keepTailMessages"] as? NSNumber)?.intValue ?? 8
+            adaptiveMemoryMaxLatentTokens = (adaptive["maxLatentTokens"] as? NSNumber)?.intValue ?? 256
+            adaptiveMemoryMaxRetrievedSegments = (adaptive["maxRetrievedSegments"] as? NSNumber)?.intValue ?? 8
+            adaptiveMemoryVerbatimProtection = adaptive["verbatimProtection"] as? Bool ?? true
             let profiles = pool["profiles"] as? [[String: Any]] ?? []
             pinnedModelIds = Set(profiles
                 .filter { ($0["keepLoaded"] as? Bool) ?? false }

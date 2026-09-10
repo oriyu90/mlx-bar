@@ -36,6 +36,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import MLXBarError
 from ..rag.retrieval import inject_context_block
+from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from .anthropic_stream import AnthropicMessageBuilder, sse, _anthropic_error_type
@@ -339,6 +340,14 @@ async def _messages(request: Request):
     if compression:
         request.state.api_log["context_compressed"] = True
         state.last_context_compression = {**compression, "at": time.time()}
+    messages, adaptive = await maybe_plan_adaptive_memory(
+        state.workers, loaded, messages, tools, state.settings, request_id)
+    adaptive_options = adaptive_memory_worker_options(state.settings)
+    if adaptive_options:
+        options["adaptiveMemory"] = adaptive_options
+    if adaptive:
+        request.state.api_log["adaptive_memory"] = True
+        state.last_adaptive_memory = {**adaptive, "at": time.time()}
     rag_spec = body.get("rag")
     if rag_spec is not None:
         if not isinstance(rag_spec, dict) or not isinstance(rag_spec.get("collection"), str):

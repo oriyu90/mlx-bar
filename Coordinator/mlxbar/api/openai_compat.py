@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from ..errors import MLXBarError
 from ..rag.retrieval import inject_context_block
+from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from . import response_format as response_format_lib
@@ -517,6 +518,15 @@ async def chat(request: Request, body: dict):
     if compression:
         request.state.api_log["context_compressed"] = True
         app_state(request).last_context_compression = {**compression, "at": time.time()}
+    normalized_messages, adaptive = await maybe_plan_adaptive_memory(
+        app_state(request).workers, loaded, normalized_messages,
+        effective_tools, app_state(request).settings, request_id)
+    adaptive_options = adaptive_memory_worker_options(app_state(request).settings)
+    if adaptive_options:
+        options["adaptiveMemory"] = adaptive_options
+    if adaptive:
+        request.state.api_log["adaptive_memory"] = True
+        app_state(request).last_adaptive_memory = {**adaptive, "at": time.time()}
     normalized_messages = await _apply_rag(request, body, normalized_messages)
     if body.get("stream", False):
         async def stream():
@@ -618,6 +628,10 @@ async def chat(request: Request, body: dict):
                                     "shared_prefix_tokens", "held_prefix_tokens"):
                             if event.get(key) is not None:
                                 request.state.api_log[key] = event[key]
+                        if event.get("adaptive_memory") is not None:
+                            request.state.api_log["adaptive_memory"] = True
+                            app_state(request).last_adaptive_memory = {
+                                **event["adaptive_memory"], "at": time.time()}
                     elif event.get("type") == "tool_support":
                         request.state.api_log["tool_support"] = event.get("state")
                     elif event.get("type") in {"phase", "heartbeat", "queue", "progress"}:
@@ -766,6 +780,10 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
                             "shared_prefix_tokens", "held_prefix_tokens"):
                     if event.get(key) is not None:
                         request.state.api_log[key] = event[key]
+                if event.get("adaptive_memory") is not None:
+                    request.state.api_log["adaptive_memory"] = True
+                    app_state(request).last_adaptive_memory = {
+                        **event["adaptive_memory"], "at": time.time()}
             elif event.get("type") == "tool_support":
                 request.state.api_log["tool_support"] = event.get("state")
             elif event.get("type") == "error":

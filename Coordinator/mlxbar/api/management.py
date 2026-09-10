@@ -47,6 +47,7 @@ async def status(request: Request):
                     "error": app.public_listener_error},
             "promptCacheHealth": _prompt_cache_health(app, worker_status),
             "contextCompression": getattr(app, "last_context_compression", None),
+            "adaptiveMemory": getattr(app, "last_adaptive_memory", None),
             "rag": _rag_summary(app),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
 

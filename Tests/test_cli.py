@@ -211,6 +211,34 @@ class CLIParityTests(unittest.TestCase):
             execute(argparse.Namespace(**base), client)
         client.request.assert_not_called()
 
+    def test_set_adaptive_memory_only_sends_provided_options(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="config", action="set-adaptive-memory",
+                                  enabled="true", policy="memorySaver", trigger_percent=70,
+                                  memory_pressure_percent=None, keep_tail=None,
+                                  max_latent_tokens=None, max_retrieved_segments=None,
+                                  verbatim_protection=None, soft_token="false")
+        execute(args, client)
+        _, path, body = client.request.call_args[0]
+        self.assertEqual(path, "/api/v1/settings")
+        self.assertEqual(body, {"experimental": {"adaptiveMemory": {
+            "enabled": True, "policy": "memorySaver", "triggerRatio": 0.7, "softToken": False}}})
+
+    def test_set_adaptive_memory_rejects_out_of_range_and_empty(self):
+        client = Mock()
+        base = dict(command="config", action="set-adaptive-memory", enabled=None, policy=None,
+                    trigger_percent=None, memory_pressure_percent=None, keep_tail=None,
+                    max_latent_tokens=None, max_retrieved_segments=None,
+                    verbatim_protection=None, soft_token=None)
+        for bad in ({"trigger_percent": 40}, {"keep_tail": 1}, {"max_latent_tokens": 8},
+                    {"max_retrieved_segments": 0}, {"memory_pressure_percent": 99}):
+            with self.assertRaises(ValueError):
+                execute(argparse.Namespace(**{**base, **bad}), client)
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(**base), client)
+        client.request.assert_not_called()
+
     def test_set_flag_maps_names_to_dotted_keys(self):
         cases = {
             "auto-load-on-api": {"models": {"autoLoadOnAPIRequest": True}},

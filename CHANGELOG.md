@@ -2,6 +2,41 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.2.0] - 2026-09-11
+
+実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」を追加。長い会話の古いターンを、
+逐語情報（コード・数値・tool 結果・パス・ハッシュ）は **EXACT**（そのまま）、自然言語の議論は
+**LATENT**（短い要約ノート。内容アドレスでキャッシュし同一履歴の再送時は再要約を省略。任意で
+mlx-lm Worker がモデル自身の埋め込み層でソフトトークンへ平均プールし `input_embeddings` で
+KV キャッシュへ Hybrid Prefill）、関連性の低いターンは **COLD**（推論から除外。元メッセージを
+クライアントが再送するため復元可能）へ振り分けます。**既定で無効**
+（`experimental.adaptiveMemory.enabled = false`）で、有効化しない限り新コードパスへは一切
+到達しません。設定スキーマは追加のみ、`schemaVersion` は 1 のまま、既存の `config.json` は
+そのまま読めます。`contextCompression` とは排他（両方を有効化しようとすると HTTP 422）。
+Writer 非対応・Reader 非対応・埋め込み次元不一致・キャッシュ破損・Policy 例外など**あらゆる
+失敗は通常の EXACT 推論へ自動フォールバックし、API エラーにはしません**。
+
+### 追加
+
+- **コーディネータ層（`Coordinator/mlxbar/api/adaptive_memory/`、新規）。** Context Structure
+  Analyzer（`segment`）、決定論的 Adaptive Policy v1（`policy`、プリセット fidelity /
+  balanced / memorySaver）、Planner（`planner`、`context_compression` の tail 分割・サイズ
+  計算・サマライザ・発火閾値を再利用。COLD ドロップ＋LATENT ノート＋EXACT/tail 逐語）、
+  内容アドレスのノートキャッシュ（`latent_store`）、メトリクス（`metrics`）。`messages`
+  リストを書き換えるだけで生成経路には触れず、`context_compression` と同じ「例外を投げない・
+  疑わしければ入力をそのまま返す」契約。
+- **mlx-lm Worker のソフトトークン層（`Workers/mlx_lm_worker/adaptive_memory/`、新規）。**
+  Writer `meanpool-v1`（無学習・決定論的。モデル自身の入力埋め込み層で平均プール）、
+  Hybrid Prefiller（`hybrid_prefill`、exact/latent ブロックを1個の KV キャッシュへ順に
+  prefill）、内容アドレスのソフトトークンキャッシュ（`latent_store`）、Hybrid KV の key
+  構成（`hybrid_cache`、再利用は将来版）。`softToken` が ON かつ Reader が対応する場合のみ
+  作動し、`prepare()` は `FallbackToExact` 以外を投げない。
+- **`config set-adaptive-memory`（`cli.py`）** — GUI と等価に指定した項目だけ変更。
+- **「設定 > 詳細 > 実験的機能」セクション（日英）。** マスタートグル・方針 Picker・
+  各 Stepper・逐語保護／ソフトトークンのトグル・適用ボタン。メニューバーに直近の圧縮率／
+  フォールバック理由を1行表示。
+- **`/api/v1/status` の `adaptiveMemory` サマリ**（増分フィールド）。
+
 ## [2.1.0] - 2026-09-08
 
 ローカル知識ベース（RAG）を追加。文書分割 → 埋め込み生成 → ベクトル検索 →

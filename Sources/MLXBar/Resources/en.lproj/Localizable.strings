@@ -324,3 +324,20 @@
    picker (shared FileSelectionService) need a table entry here. */
 "知識ベース" = "Knowledge Base";
 "ファイルを選択" = "Choose a File";
+
+/* v2.2.0 -- Adaptive Hybrid Context Memory (experimental) */
+"実験的機能" = "Experimental";
+"アダプティブ・ハイブリッド・コンテキストメモリ" = "Adaptive Hybrid Context Memory";
+"方針" = "Policy";
+"忠実度優先" = "Fidelity";
+"バランス" = "Balanced";
+"メモリ節約" = "Memory Saver";
+"メモリ逼迫の目安" = "Memory-pressure threshold";
+"EXACTのまま残す直近ターン数" = "Recent turns kept EXACT";
+"LATENTブロックの最大ソフトトークン数" = "Max soft tokens per LATENT block";
+"取得するLATENTセグメントの上限" = "Max retrieved LATENT segments";
+"コード・数値・ツール出力をEXACTで保護" = "Protect code, numbers and tool output as EXACT";
+"ソフトトークンのHybrid Prefill（実験）" = "Soft-token Hybrid Prefill (experimental)";
+"アダプティブメモリ設定を適用" = "Apply Adaptive Memory Settings";
+"アダプティブメモリの設定値が範囲外です" = "Adaptive memory settings are outside the supported range";
+"実験的機能です。既定では無効です。古い会話を「EXACT／LATENT（短い要約）／COLD（推論から除外）」へ振り分けてTTFTとKVメモリを削減します。要約は元の発言そのものではありません。コンテキスト自動圧縮とは同時に使用できません。ソフトトークンのHybrid PrefillはApple Siliconでの実測用の試験実装で、対応していないモデルでは自動的にEXACTへフォールバックします。" = "Experimental. Off by default. Routes older turns to EXACT / LATENT (a short summary) / COLD (dropped from inference) to cut TTFT and KV memory. A summary is not the original wording. Cannot be used together with Automatic Context Compression. Soft-token Hybrid Prefill is a trial implementation for on-device measurement on Apple Silicon and falls back to EXACT automatically on models that do not support it.";

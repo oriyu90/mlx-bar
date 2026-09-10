@@ -87,6 +87,12 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            if let adaptive = model.adaptiveMemorySummaryText {
+                Label(adaptive, systemImage: "sparkles")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if let retrieval = model.ragLastRetrievalText {
                 Label(retrieval, systemImage: "text.magnifyingglass")
                     .font(.caption2)

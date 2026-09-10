@@ -142,6 +142,47 @@ DEFAULTS: dict[str, Any] = {
         # into memory, so this is also the memory bound (n * dim * 8 bytes).
         "maxChunksPerCollection": 5000,
     },
+    "experimental": {
+        # Adaptive Hybrid Context Memory (DESIGN_v2.2.0.md). Entirely dormant
+        # until `enabled` -- an ordinary API request never reaches the
+        # adaptive_memory package and no cache directory is created. It is an
+        # explicit opt-in rather than a default behaviour change: like
+        # `contextCompression`, what the model "sees" of earlier turns is no
+        # longer a byte-for-byte copy of what the client sent. Cannot be used
+        # together with `contextCompression` (the validator rejects both on).
+        "adaptiveMemory": {
+            "enabled": False,
+            # "fidelity" keeps more turns EXACT; "memorySaver" drops/compresses
+            # more aggressively; "balanced" is the middle.
+            "policy": "balanced",
+            # Fraction of effectiveMaxPromptCharacters at which planning fires.
+            "triggerRatio": 0.60,
+            # Fraction of the per-model KV budget projected in use at which
+            # planning fires even below triggerRatio.
+            "memoryPressureRatio": 0.75,
+            # Tail messages always kept EXACT (tool_calls/tool pairs and image
+            # turns extend this automatically, as in context_compression.py).
+            "keepTailMessages": 8,
+            # Ceiling on soft tokens the Writer may emit per LATENT block.
+            "maxLatentTokens": 256,
+            # Ceiling on LATENT segments the Retriever includes; the rest stay
+            # COLD (excluded from inference, recoverable from the raw message).
+            "maxRetrievedSegments": 8,
+            # Force EXACT for code / diffs / shell / structured data / tool
+            # output / paths / hashes / numeric-dense text.
+            "verbatimProtection": True,
+            # OFF: coordinator tier only (COLD drop + LATENT-as-note). ON: the
+            # mlx-lm worker additionally attempts the soft-token Hybrid
+            # Prefiller. Default OFF -- no on-device measurement yet
+            # (mlx-bar.md: "実測がないなら既定値を動かさない").
+            "softToken": False,
+            "persistentLatentCache": True,
+            "persistentHybridKV": True,
+            # On any Writer/Reader/cache/policy failure, fall back to normal
+            # EXACT inference instead of surfacing an error.
+            "fallbackToExact": True,
+        },
+    },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info",
@@ -323,6 +364,34 @@ class SettingsStore:
         if (isinstance(summary_max_tokens, bool) or not isinstance(summary_max_tokens, int)
                 or not 100 <= summary_max_tokens <= 4000):
             raise ValueError("contextCompression.summaryMaxTokens must be between 100 and 4000")
+        adaptive = data.get("experimental", {}).get("adaptiveMemory", {})
+        for key in ("enabled", "verbatimProtection", "softToken", "persistentLatentCache",
+                    "persistentHybridKV", "fallbackToExact"):
+            if not isinstance(adaptive.get(key, False), bool):
+                raise ValueError(f"experimental.adaptiveMemory.{key} must be boolean")
+        if adaptive.get("policy", "balanced") not in {"fidelity", "balanced", "memorySaver"}:
+            raise ValueError("experimental.adaptiveMemory.policy must be fidelity, balanced or memorySaver")
+        for key in ("triggerRatio", "memoryPressureRatio"):
+            value = adaptive.get(key, 0.6)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not 0.5 <= float(value) <= 0.95):
+                raise ValueError(f"experimental.adaptiveMemory.{key} must be between 0.5 and 0.95")
+        adaptive_keep_tail = adaptive.get("keepTailMessages", 8)
+        if (isinstance(adaptive_keep_tail, bool) or not isinstance(adaptive_keep_tail, int)
+                or not 2 <= adaptive_keep_tail <= 50):
+            raise ValueError("experimental.adaptiveMemory.keepTailMessages must be between 2 and 50")
+        max_latent_tokens = adaptive.get("maxLatentTokens", 256)
+        if (isinstance(max_latent_tokens, bool) or not isinstance(max_latent_tokens, int)
+                or not 16 <= max_latent_tokens <= 2048):
+            raise ValueError("experimental.adaptiveMemory.maxLatentTokens must be between 16 and 2048")
+        max_retrieved = adaptive.get("maxRetrievedSegments", 8)
+        if (isinstance(max_retrieved, bool) or not isinstance(max_retrieved, int)
+                or not 1 <= max_retrieved <= 64):
+            raise ValueError("experimental.adaptiveMemory.maxRetrievedSegments must be between 1 and 64")
+        if adaptive.get("enabled", False) and compression.get("enabled", False):
+            raise ValueError("Adaptive Hybrid Memory and Text Context Compression cannot both be "
+                             "enabled / アダプティブ・ハイブリッド・メモリとテキストコンテキスト圧縮は"
+                             "同時に有効化できません")
         rag = data.get("rag", {})
         if not isinstance(rag.get("enabled", False), bool):
             raise ValueError("rag.enabled must be boolean")

@@ -48,6 +48,9 @@ class AppState:
         # None. In-memory only -- purely informational, not persisted, so a
         # restart simply forgets it rather than needing a DB migration.
         self.last_context_compression: dict | None = None
+        # Last adaptive-memory planning event (see api/adaptive_memory/), or
+        # None. Same in-memory, informational-only treatment.
+        self.last_adaptive_memory: dict | None = None
         # Last request-time RAG retrieval (see api/openai_compat.py), or None.
         # In-memory only, purely informational -- same treatment as
         # last_context_compression.
