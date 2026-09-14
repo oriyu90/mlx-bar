@@ -39,5 +39,9 @@ SHA-256は `3fdca5270d6bce9029a89e21bf392456ddb3d75395471a16e10c77e9affc10d7`。
 
 ## 5. リリース後smoke
 
-- [ ] GitHub Releaseがdraft/prereleaseではなくLatest、DMGとSHA-256 sidecarを配布。
-- [ ] `studio-rizi.pages.dev/projects/mlx-bar/` の4言語、ダウンロードURL、構造化データ、トップNEWSを確認。
+- [x] GitHub Releaseがdraft/prereleaseではなくLatest、DMGとSHA-256 sidecarを配布。
+- [x] `studio-rizi.pages.dev/projects/mlx-bar/` の4言語、ダウンロードURL、構造化データ、トップNEWSを確認。
+
+結果: GitHub Release `v2.3.0` はLatest（draft=false / prerelease=false）。studio-rizi
+`ff7b4e3`のCloudflare Pages反映後、公開HTMLの `softwareVersion: 2.3.0`、4言語DMG名、
+2026.09.15の4言語UPDATEを確認した。
