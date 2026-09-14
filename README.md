@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.2.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.3.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -23,6 +23,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
 - mlx-lm・mlx-vlm両方で長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
+- 既定で無効な実験的Paged KVキャッシュ（v2.3.0）：plain mlx-lm `KVCache`だけを256-tokenブロックへ分け、会話分岐とWorker再起動後に最長の連続prefixをSSDから再利用。非対応layout・メモリ不足・破損は既存snapshotまたは通常EXACT生成へ自動退避
 - 生成を中断しても、そこまでに計算した分を保持して次のターンから再開
 - ZCode等のOpenAI Chat Completionsクライアント向けtool calling（履歴、`tools`、`tool_choice`、ストリーミング差分）
 - 本文とAPIキーを含めない、最大2,000件の最近のAPIログ
@@ -45,7 +46,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.2.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.3.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -64,6 +65,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 ├── control/coordinator.sock
 ├── control/api-token
 ├── prompt-cache/
+├── paged-kv-cache/       # 実験機能を明示的に有効化した場合だけ作成
 ├── runtimes/
 └── logs/
 ```
@@ -81,7 +83,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 「APIサーバー」: URL確認、コピー、ポート変更
 - 「詳細」: 最近のAPIアクセスを最大500件表示、コピー、消去
 - 「ランタイム」設定: 自動インストール状況の確認、最新版または指定版への更新、検証後の切替・復元・旧版削除
-- 「キャッシュ」設定: 永続プロンプトキャッシュの有効化、容量上限、使用量確認、RAM／ディスクキャッシュの個別消去、古いキャッシュ世代の自動回収
+- 「キャッシュ」設定: 永続プロンプトキャッシュと実験的Paged KVの個別有効化、容量上限、対応状況・使用量確認、RAM／snapshot／Paged SSDの個別消去、古いキャッシュ世代の自動回収
 
 モデルのロード中は、対象モデル名、エンジン、現在段階、経過秒数をモデル画面とメニューバーに表示します。完了後は「モデル名をコピー」またはメニューバーのコピーボタンから、読み込み済みモデル名をクリップボードへコピーできます。
 
@@ -251,6 +253,8 @@ mlxbarctl prompt-cache status
 mlxbarctl prompt-cache set --disk-enabled true --max-gb 10
 mlxbarctl prompt-cache clear-memory
 mlxbarctl prompt-cache clear-disk
+mlxbarctl prompt-cache clear-paged
+mlxbarctl config set-paged-kv-cache --enabled true --disk-enabled true --disk-max-gb 10 --branch-reuse true
 mlxbarctl lmstudio set-base-url http://127.0.0.1:1234
 mlxbarctl lmstudio set-auto-load true
 mlxbarctl secrets get-api-token
@@ -286,7 +290,8 @@ GUIで操作できることは**すべて**`mlxbarctl`から操作できます�
 | 設定 > モデル / API > 各種トグル | `config set-flag <name> true|false`（`auto-load-on-api` / `anthropic-api` / `remote-image-urls` / `require-token` / `continue-after-gui-exit`） |
 | 設定 > APIサーバー（ポート / LAN公開 / APIキー） | `network set-port` / `network set-lan` / `secrets set-api-token` / `secrets regenerate-api-token` |
 | 設定 > LM Studio | `lmstudio set-base-url` / `lmstudio set-auto-load` / `secrets set-lmstudio-token` |
-| 設定 > キャッシュ（設定 / 消去 / 状態） | `prompt-cache set` / `prompt-cache clear-memory` / `prompt-cache clear-disk` / `prompt-cache status` |
+| 設定 > キャッシュ（設定 / 消去 / 状態） | `prompt-cache set` / `prompt-cache clear-memory` / `prompt-cache clear-disk` / `prompt-cache clear-paged` / `prompt-cache status` |
+| 設定 > キャッシュ > Paged KVキャッシュ（実験） | `config set-paged-kv-cache --…` |
 | 設定 > 詳細（APIログ） | `logs show` / `logs clear` |
 | 設定 > 一般 > 言語 | `config set-language` |
 | 設定 > 削除（全データ削除） | `remove-all-data --yes` |
@@ -323,6 +328,8 @@ v2.0.0から`response_format`の`json_object`・`json_schema`、`n`（複数候�
 v2.1.0から、リクエストに任意の`rag`フィールドを付けると、ローカル知識ベースから関連文を検索してプロンプト先頭に合成`system`メッセージとして注入します（例: `"rag": {"collection": "my-notes", "topK": 4, "maxChars": 6000}`）。`rag`を付けないリクエストの挙動はv2.0.1と完全に同一です。直近のuserメッセージ本文をクエリにします。指定コレクションが無ければHTTP 404 `RAG_COLLECTION_NOT_FOUND`、`rag.enabled`（設定）が無効のときは400 `RAG_DISABLED`、外部の埋め込みエンドポイントに接続できないときは503 `RAG_EMBEDDING_UNAVAILABLE`（`retryable: true`）を返します。`"rag": {"optional": true}`を付けると、埋め込み取得に失敗しても文脈なしで通常生成にフォールバックします。埋め込み自体はMLXBarでは計算せず、`rag.embedding.baseUrl`で指定したOpenAI互換`/v1/embeddings`（LM Studio、Ollama など）へ委譲します。`/anthropic`側も同じ`rag`フィールドに対応します。設計は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)を参照してください。
 
 v2.2.0で実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」を追加しました（設定`experimental.adaptiveMemory`、**既定で無効**）。有効化すると、長い会話の古いターンを、コード・数値・ツール出力・ファイルパス・ハッシュなどの逐語情報はEXACT（そのまま）、自然言語の議論はLATENT（短い要約ノート。ノートは内容アドレスでキャッシュし、同じ履歴を再送するクライアントでは再要約を省略）、関連性の低いターンはCOLD（推論から除外。元メッセージはクライアントが再送するため復元可能）へ振り分け、TTFTとKVキャッシュ使用量を削減します。`experimental.adaptiveMemory.softToken`を有効にすると、mlx-lm Workerがさらに古い帯のトークンをモデル自身の埋め込み層でソフトトークンへ平均プールし、`input_embeddings`でKVキャッシュへHybrid Prefillします（Apple Siliconでの実測用の試験実装。対応しないモデルでは自動でEXACTへフォールバック）。`contextCompression`とは排他で、両方を有効化しようとするとHTTP 422で拒否します。Writer失敗・Reader非対応・埋め込み次元不一致・キャッシュ破損・Policy例外など**あらゆる失敗は通常のEXACT推論へ自動フォールバックし、APIエラーにはしません**。`GET /api/v1/status`の`adaptiveMemory`に直近の`compression_ratio`と`fallback_reason`が入ります。設計は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)を参照してください。
+
+実験的Paged KVキャッシュはv2.3.0で追加しました（設定`experimental.pagedKVCache`、**既定で無効**）。対象は全layerが上流のplain mlx-lm `KVCache`であるモデルだけです。raw token列を256-tokenの固定ブロックへ分け、親block hash・token digest・モデル/重み/tokenizer/chat template・Python/MLX/mlx-lm版・state arityを含むnamespaceで分離します。復元は常に新しいruntime cacheへ行い、shape/dtype/layer/offset、モデルから算出したbytes/token、safetensors全体のSHA-256を検証します。1つでも不明なら既存snapshot/cold EXACTへ退避します。復元前にはlive cache・連結scratch・読込blockを含む最悪時メモリを審査し、最初のmodel event前に復元cacheが失敗した場合だけEXACTを一度再試行します。1 event後は二重応答を避けるため再試行しません。量子化・rotating・composite/recurrent・VLM・Adaptive Memory soft-token KV・RAM hot tierは対象外です。不変条件は[`DESIGN_v2.3.0.md`](DESIGN_v2.3.0.md)、設計と実装分析は[`DESIGN_OMLX_STYLE_PAGED_KV_CACHE_PROPOSAL.md`](DESIGN_OMLX_STYLE_PAGED_KV_CACHE_PROPOSAL.md)を参照してください。
 
 ZCodeが送る`extra_body.chat_template_kwargs`に加え、トップレベルまたは`extra_body`内の`thinking`と`reasoning_effort`も受理し、mlx-lm・mlx-vlmのチャットテンプレートへ渡します。`thinking.type`の`enabled` / `disabled`は`enable_thinking`へ、`budget_tokens`は`thinking_budget`へ、`clear_thinking`は逆値の`preserve_thinking`へ、`thinking.effort`は`reasoning_effort`へ変換します。将来のZCodeやOpenAI互換クライアントが追加する未知の拡張項目は生成へ渡さず安全に無視するため、項目追加だけでHTTP 400になりません。同じ値が`extra_body.chat_template_kwargs`に明示された場合はそちらを優先します。`tools`、`tool_choice`、`tokenize`、`add_generation_prompt`、`num_images`はMLXBarが管理するため、`chat_template_kwargs`内での上書きは受け付けません。
 
@@ -566,7 +573,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.2.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.3.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

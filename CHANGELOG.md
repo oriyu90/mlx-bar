@@ -2,6 +2,35 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.3.0] - 2026-09-15
+
+oMLXの実装思想を参考に、mlx-lmのplain `KVCache`を固定長ブロックで永続化する
+実験的Paged KVキャッシュを追加しました。**既定で無効**
+（`experimental.pagedKVCache.enabled = false`）で、OFFのときはWorker環境変数、専用
+パッケージのimport、保存ディレクトリ作成のいずれも発生しません。
+
+### 追加
+
+- 256 tokenのimmutable safetensors block、parent-chain SHA-256、モデル・ランタイム・
+  cache layoutを含むnamespaceにより、会話分岐やWorker再起動後でも連続prefixをSSDから再利用。
+- exact classが `mlx_lm.models.cache.KVCache` の全層だけを許可。量子化・回転・複合・カスタムcacheは
+  fail-closedとし、従来のsnapshotまたはEXACT生成へ戻します。
+- GUIと `mlxbarctl config set-paged-kv-cache`でmaster、SSD、容量、branch reuseを設定。対応状態、hit、
+  復元token数、memory safety skipを表示し、専用削除は確認ダイアログ経由で実行します。
+
+### 安全性と互換性
+
+- cache stateのarity 2 / 3は実MLX tensorのsetterでself-probeし、不明なlayoutは利用しません。
+- 復元と保存の前に必要メモリを見積もり、active memoryまたはheadroomを信頼できなければskipします。
+- checksum、shape、dtype、offset、metadata、file size、tensor keyを検査。不完全なatomic rename、
+  孤立sidecar、破損、symlinkは自己修復または隔離します。
+- 復元cacheでの最初の評価失敗は、model eventを1度も出していない場合に限りEXACTを1回だけ
+  再試行。連続失敗とlayout mismatchはcircuit breakerで停止します。
+- ディスク上限は旧namespace、quarantine、sidecar、exact markerを含むWorker専用root全体へ適用。
+
+設計と分析は `DESIGN_OMLX_STYLE_PAGED_KV_CACHE_PROPOSAL.md`、不変条件は `DESIGN_v2.3.0.md`、
+検証は `TEST_PLAN_v2.3.0.md` を参照してください。
+
 ## [2.2.0] - 2026-09-11
 
 実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」を追加。長い会話の古いターンを、

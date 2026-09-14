@@ -98,6 +98,26 @@ class WorkerSupervisor:
         suffix = "" if self.instance_key == "legacy" else f"-{self.instance_key}"
         return self.root / "logs" / f"worker-{engine}{suffix}.log"
 
+    def _configure_paged_cache_environment(self, env: dict[str, str], engine: str) -> None:
+        paged = ((self.settings.data.get("experimental", {}) or {})
+                 .get("pagedKVCache", {}) or {})
+        if not paged.get("enabled", False):
+            return
+        # Separate roots make ownership and deletion unambiguous even when
+        # replicas write concurrently. Divide the global quota by the latched
+        # maximum resident process count so replicas cannot multiply it.
+        pool = self.settings.data.get("models", {}).get("pool", {}) or {}
+        max_workers = max(1, int(pool.get("maxResidentModels", 1)))
+        global_bytes = int(float(paged.get("diskMaxGB", 10)) * (1 << 30))
+        env["MLXBAR_PAGED_KV_ENABLED"] = "1"
+        env["MLXBAR_PAGED_KV_DISK_ENABLED"] = (
+            "1" if paged.get("diskEnabled", True) else "0")
+        env["MLXBAR_PAGED_KV_MAX_BYTES"] = str(global_bytes // max_workers)
+        env["MLXBAR_PAGED_KV_BRANCH_REUSE"] = (
+            "1" if paged.get("branchReuse", True) else "0")
+        env["MLXBAR_PAGED_KV_ROOT"] = str(
+            self.root / "paged-kv-cache" / engine / self.instance_key)
+
     def _write_manifest(self, engine: str, pid: int) -> None:
         try:
             self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +228,7 @@ class WorkerSupervisor:
         env["MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS"] = str(
             min(10, max(1, int(cache_settings.get("keepGenerations", 2)))))
         env["MLXBAR_PROMPT_CACHE_MEMORY_RATIO"] = str(cache_settings.get("memoryRatio", 0.10))
+        self._configure_paged_cache_environment(env, engine)
         # Stable block hashes are required for reuse across Python processes.
         # PromptCacheState owns the RAM tier, so do not duplicate exact hybrid
         # snapshots inside APC's separate in-memory LRU.
@@ -470,6 +491,16 @@ class WorkerSupervisor:
             import shutil
             shutil.rmtree(root)
         return {"enabled": False, "disk_bytes": 0}
+
+    async def clear_paged_prompt_cache(self) -> dict:
+        if (self.loaded and self.loaded.get("engine") == "mlx-lm" and self.socket_path):
+            response = await self._call("clear_paged_prompt_cache", {}, timeout=30)
+            return response.get("cache", {})
+        root = self.root / "paged-kv-cache"
+        if root.exists():
+            import shutil
+            shutil.rmtree(root)
+        return {"enabled": False, "pagedKV": {"configured": False, "diskBytes": 0}}
 
     async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None,
                        image_root: Path | None = None):

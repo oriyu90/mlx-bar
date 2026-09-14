@@ -178,9 +178,23 @@ DEFAULTS: dict[str, Any] = {
             "softToken": False,
             "persistentLatentCache": True,
             "persistentHybridKV": True,
+            # A separate gate prevents an existing v2.2.0 config from silently
+            # enabling hybrid KV persistence when that later phase ships.
+            "hybridKVReuse": False,
             # On any Writer/Reader/cache/policy failure, fall back to normal
             # EXACT inference instead of surfacing an error.
             "fallbackToExact": True,
+        },
+        # OMLX-style branch-aware blocks for plain mlx-lm KVCache. The master
+        # switch is intentionally off and remains opt-in across upgrades.
+        "pagedKVCache": {
+            "enabled": False,
+            "diskEnabled": True,
+            "diskMaxGB": 10,
+            # Phase 4 is not admitted until real-device measurements exist.
+            "memoryTier": "off",
+            "memoryRatio": 0.05,
+            "branchReuse": True,
         },
     },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
@@ -366,7 +380,7 @@ class SettingsStore:
             raise ValueError("contextCompression.summaryMaxTokens must be between 100 and 4000")
         adaptive = data.get("experimental", {}).get("adaptiveMemory", {})
         for key in ("enabled", "verbatimProtection", "softToken", "persistentLatentCache",
-                    "persistentHybridKV", "fallbackToExact"):
+                    "persistentHybridKV", "hybridKVReuse", "fallbackToExact"):
             if not isinstance(adaptive.get(key, False), bool):
                 raise ValueError(f"experimental.adaptiveMemory.{key} must be boolean")
         if adaptive.get("policy", "balanced") not in {"fidelity", "balanced", "memorySaver"}:
@@ -392,6 +406,21 @@ class SettingsStore:
             raise ValueError("Adaptive Hybrid Memory and Text Context Compression cannot both be "
                              "enabled / アダプティブ・ハイブリッド・メモリとテキストコンテキスト圧縮は"
                              "同時に有効化できません")
+        paged = data.get("experimental", {}).get("pagedKVCache", {})
+        for key in ("enabled", "diskEnabled", "branchReuse"):
+            if not isinstance(paged.get(key, False), bool):
+                raise ValueError(f"experimental.pagedKVCache.{key} must be boolean")
+        paged_disk_gb = paged.get("diskMaxGB", 10)
+        if (isinstance(paged_disk_gb, bool) or not isinstance(paged_disk_gb, (int, float))
+                or not 1 <= float(paged_disk_gb) <= 100):
+            raise ValueError("experimental.pagedKVCache.diskMaxGB must be between 1 and 100")
+        if paged.get("memoryTier", "off") != "off":
+            raise ValueError("experimental.pagedKVCache.memoryTier must be off in this version")
+        paged_memory_ratio = paged.get("memoryRatio", 0.05)
+        if (isinstance(paged_memory_ratio, bool)
+                or not isinstance(paged_memory_ratio, (int, float))
+                or not 0 <= float(paged_memory_ratio) <= 0.20):
+            raise ValueError("experimental.pagedKVCache.memoryRatio must be between 0 and 0.20")
         rag = data.get("rag", {})
         if not isinstance(rag.get("enabled", False), bool):
             raise ValueError("rag.enabled must be boolean")

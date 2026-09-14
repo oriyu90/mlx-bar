@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "Workers"))
@@ -359,6 +360,89 @@ def test_mlx_lm_sampling_parameters_reach_sampler_and_logits_processors():
     assert captured["processors"]["repetition_context_size"] == 80
     assert captured["generate"]["sampler"] == "sampler"
     assert captured["generate"]["logits_processors"] == ["processor"]
+
+
+def test_mlx_lm_paged_failure_before_first_model_event_retries_exact_once():
+    mlx_lm = ModuleType("mlx_lm")
+    cache_module = ModuleType("mlx_lm.models.cache")
+    calls = []
+    fresh = SimpleNamespace(offset=0)
+
+    def stream_generate(_model, _processor, **kwargs):
+        calls.append(dict(kwargs))
+        if kwargs["prompt"] == [599]:
+            raise RuntimeError("restored cache rejected")
+        yield SimpleNamespace(text="recovered", token=7, prompt_tokens=600,
+                              generation_tokens=1, prompt_tps=10, generation_tps=5)
+
+    class Store:
+        disabled_reason = None
+
+        def __init__(self):
+            self.fallbacks = []
+            self.stored = []
+
+        def fetch(self, _model, tokens):
+            return [SimpleNamespace(offset=599)], tokens[599:], "paged_disk"
+
+        def mark_paged_fallback(self, reason):
+            self.fallbacks.append(reason)
+
+        def store(self, _model, tokens, cache, prompt_length=None):
+            self.stored.append((tokens, cache, prompt_length))
+
+    mlx_lm.stream_generate = stream_generate
+    cache_module.make_prompt_cache = lambda _model: fresh
+    adapter = MLXLMAdapter()
+    adapter.model = object()
+    adapter.processor = SimpleNamespace(encode=lambda *_args, **_kwargs: list(range(600)))
+    adapter.prompt_cache = Store()
+    with patch.dict(sys.modules, {"mlx_lm": mlx_lm, "mlx_lm.models": ModuleType("mlx_lm.models"),
+                                  "mlx_lm.models.cache": cache_module}):
+        events = list(adapter.stream("request", {"prompt": "hello", "seed": 4}))
+    assert len(calls) == 2
+    assert calls[0]["prompt"] == [599]
+    assert calls[1]["prompt"] == list(range(600))
+    assert calls[1]["prompt_cache"] is fresh
+    assert adapter.prompt_cache.fallbacks == ["first_evaluation:RuntimeError"]
+    assert [event.get("text") for event in events if event["type"] == "delta"] == ["recovered"]
+    assert events[-1]["cache_tier"] == "cold"
+
+
+def test_mlx_lm_paged_failure_after_a_model_event_is_never_replayed():
+    mlx_lm = ModuleType("mlx_lm")
+    calls = []
+
+    def stream_generate(_model, _processor, **kwargs):
+        calls.append(dict(kwargs))
+        yield SimpleNamespace(text="", token=7)
+        raise RuntimeError("decode failed after model event")
+
+    class Store:
+        disabled_reason = None
+
+        def __init__(self):
+            self.fallbacks = []
+
+        def fetch(self, _model, tokens):
+            return [SimpleNamespace(offset=599)], tokens[599:], "paged_disk"
+
+        def mark_paged_fallback(self, reason):
+            self.fallbacks.append(reason)
+
+        def store(self, *_args, **_kwargs):
+            pass
+
+    mlx_lm.stream_generate = stream_generate
+    adapter = MLXLMAdapter()
+    adapter.model = object()
+    adapter.processor = SimpleNamespace(encode=lambda *_args, **_kwargs: list(range(600)))
+    adapter.prompt_cache = Store()
+    with patch.dict(sys.modules, {"mlx_lm": mlx_lm}):
+        with pytest.raises(RuntimeError, match="decode failed"):
+            list(adapter.stream("request", {"prompt": "hello"}))
+    assert len(calls) == 1
+    assert adapter.prompt_cache.fallbacks == []
 
 
 def test_mlx_lm_chat_template_kwargs_are_preserved_with_tools():

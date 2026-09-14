@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import logging
 import os
@@ -51,12 +52,23 @@ class MLXLMAdapter(BaseAdapter):
             keep = int(os.environ.get("MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS", "2"))
         except (TypeError, ValueError):
             keep = 2
+        try:
+            paged_max_bytes = int(os.environ.get("MLXBAR_PAGED_KV_MAX_BYTES", "0"))
+        except (TypeError, ValueError):
+            paged_max_bytes = 0
         self.prompt_cache = PromptCacheStore(
             path, runtime_version,
             root=os.environ.get("MLXBAR_PROMPT_CACHE_ROOT"),
             disk_enabled=self._truthy(os.environ.get("MLXBAR_PROMPT_CACHE_DISK_ENABLED", "1")),
             max_bytes=max_bytes,
             keep_generations=min(10, max(1, keep)),
+            model=self.model,
+            cache_budget=self.cache_budget,
+            paged_enabled=self._truthy(os.environ.get("MLXBAR_PAGED_KV_ENABLED")),
+            paged_root=os.environ.get("MLXBAR_PAGED_KV_ROOT"),
+            paged_disk_enabled=self._truthy(os.environ.get("MLXBAR_PAGED_KV_DISK_ENABLED", "1")),
+            paged_max_bytes=max(0, paged_max_bytes),
+            paged_branch_reuse=self._truthy(os.environ.get("MLXBAR_PAGED_KV_BRANCH_REUSE", "1")),
         )
 
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
@@ -72,8 +84,8 @@ class MLXLMAdapter(BaseAdapter):
             self.model, self.processor = load(path)
         self.model_path = path
         self.apply_memory_limits()
-        self._init_prompt_cache(path)
         self.cache_budget = _read_cache_budget(path)
+        self._init_prompt_cache(path)
         return self.capabilities()
 
     def unload(self) -> None:
@@ -89,6 +101,10 @@ class MLXLMAdapter(BaseAdapter):
     def clear_disk_prompt_cache(self) -> None:
         if self.prompt_cache is not None:
             self.prompt_cache.clear_disk()
+
+    def clear_paged_prompt_cache(self) -> None:
+        if self.prompt_cache is not None:
+            self.prompt_cache.clear_paged()
 
     def prompt_cache_stats(self) -> dict:
         if self.prompt_cache is None:
@@ -251,22 +267,53 @@ class MLXLMAdapter(BaseAdapter):
         finish_reason = None
         ticker = _ProgressTicker(params)
         try:
-            for response in stream_generate(self.model, self.processor, **kwargs):
-                # Counted first: the cache already holds this token, so leaving it
-                # out of the list would describe a cache that does not exist.
-                token = getattr(response, "token", None)
-                if isinstance(token, int) and not isinstance(token, bool):
-                    generated.append(token)
-                if request_id in self.cancelled:
-                    return
-                last_response = response
-                finish_reason = getattr(response, "finish_reason", None) or finish_reason
-                text = getattr(response, "text", response if isinstance(response, str) else "")
-                if text:
-                    yield {"type": "delta", "text": text, **_live_progress(response)}
-                elif ticker.due():
-                    yield {"type": "token_progress", **_live_progress(response)}
-            completed = True
+            retried_exact = False
+            while True:
+                saw_model_event = False
+                try:
+                    for response in stream_generate(self.model, self.processor, **kwargs):
+                        # Once the runtime returns any model event, replay is no
+                        # longer safe even if its text is empty: sampling state
+                        # and the live cache may already have advanced.
+                        saw_model_event = True
+                        token = getattr(response, "token", None)
+                        if isinstance(token, int) and not isinstance(token, bool):
+                            generated.append(token)
+                        if request_id in self.cancelled:
+                            return
+                        last_response = response
+                        finish_reason = getattr(response, "finish_reason", None) or finish_reason
+                        text = getattr(response, "text", response if isinstance(response, str) else "")
+                        if text:
+                            yield {"type": "delta", "text": text, **_live_progress(response)}
+                        elif ticker.due():
+                            yield {"type": "token_progress", **_live_progress(response)}
+                    completed = True
+                    break
+                except Exception as exc:
+                    if (cache_tier != "paged_disk" or saw_model_event or retried_exact
+                            or request_id in self.cancelled):
+                        raise
+                    # A restored cache is an optimization only. Before the first
+                    # model event, discard it and replay exactly once from a
+                    # runtime-created empty cache. No public delta can duplicate.
+                    LOGGER.warning("Paged KV failed before first output; retrying EXACT: %s", exc)
+                    if self.prompt_cache is not None:
+                        self.prompt_cache.mark_paged_fallback(
+                            f"first_evaluation:{type(exc).__name__}")
+                    from mlx_lm.models.cache import make_prompt_cache
+                    cache = make_prompt_cache(self.model)
+                    kwargs["prompt"] = prompt_tokens
+                    kwargs["prompt_cache"] = cache
+                    cache_tier = "cold"
+                    generated.clear()
+                    last_response = None
+                    finish_reason = None
+                    retried_exact = True
+                    if isinstance(seed, int) and not isinstance(seed, bool):
+                        with contextlib.suppress(Exception):
+                            import mlx.core as mx
+                            mx.random.seed(seed)
         finally:
             # The warm tier hands out copies, so an abandoned cache can never
             # corrupt a stored one. That makes an interrupted turn worth keeping

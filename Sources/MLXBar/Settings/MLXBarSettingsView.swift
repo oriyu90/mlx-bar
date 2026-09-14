@@ -35,7 +35,12 @@ struct PromptCacheSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var diskEnabled = true
     @State private var diskMaxGB = 5
+    @State private var pagedEnabled = false
+    @State private var pagedDiskEnabled = true
+    @State private var pagedDiskMaxGB = 10
+    @State private var pagedBranchReuse = true
     @State private var confirmsDiskClear = false
+    @State private var confirmsPagedClear = false
 
     private var configured: [String: Any] {
         model.settings["promptCache"] as? [String: Any] ?? [:]
@@ -44,6 +49,25 @@ struct PromptCacheSettingsView: View {
     private func bytes(_ value: Any?) -> String {
         let number = (value as? NSNumber)?.int64Value ?? 0
         return ByteCountFormatter.string(fromByteCount: number, countStyle: .file)
+    }
+
+    private func pagedCapability(_ status: [String: Any]) -> String {
+        guard (status["configured"] as? Bool) == true else { return LS("モデル未ロード") }
+        if (status["eligible"] as? Bool) == true { return LS("対応") }
+        switch status["capability"] as? String {
+        case "checkpoint_only": return LS("非対応（従来キャッシュのみ）")
+        default: return LS("非対応")
+        }
+    }
+
+    private func pagedReason(_ reason: String) -> String {
+        switch reason {
+        case "non_plain_kv_layout": return LS("plain KVCacheではないモデルです")
+        case "budget_unknown": return LS("モデルのKVメモリ量を安全に算出できません")
+        case "disk_disabled": return LS("Paged SSD保存が無効です")
+        case "circuit_open": return LS("安全装置が作動したためWorker再起動まで無効です")
+        default: return reason
+        }
     }
 
     var body: some View {
@@ -55,6 +79,50 @@ struct PromptCacheSettingsView: View {
                     Task { await model.setPromptCacheSettings(enabled: diskEnabled, maximumGB: diskMaxGB) }
                 }.buttonStyle(.borderedProminent)
                 Text(LS("ZCodeの長いsystem promptとtools定義をローカルディスクへ保存します。設定変更は次回のモデルWorker起動時に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section(LS("Paged KVキャッシュ（実験）")) {
+                Toggle(LS("Paged KVキャッシュを有効化"), isOn: $pagedEnabled)
+                Toggle(LS("Paged SSD保存"), isOn: $pagedDiskEnabled)
+                    .disabled(!pagedEnabled)
+                Toggle(LS("会話分岐の共通prefixを再利用"), isOn: $pagedBranchReuse)
+                    .disabled(!pagedEnabled || !pagedDiskEnabled)
+                Stepper("\(LS("Paged SSD上限")): \(pagedDiskMaxGB) GB",
+                        value: $pagedDiskMaxGB, in: 1...100)
+                    .disabled(!pagedEnabled || !pagedDiskEnabled)
+                Button(LS("Paged KV設定を適用")) {
+                    Task {
+                        await model.setPagedKVCacheSettings(
+                            enabled: pagedEnabled, diskEnabled: pagedDiskEnabled,
+                            maximumGB: pagedDiskMaxGB, branchReuse: pagedBranchReuse)
+                    }
+                }.buttonStyle(.borderedProminent)
+                let paged = model.promptCacheStatus["pagedKV"] as? [String: Any] ?? [:]
+                LabeledContent(LS("モデル対応状況"),
+                               value: pagedCapability(paged))
+                LabeledContent(LS("現在の動作"),
+                               value: (paged["enabled"] as? Bool) == true ? LS("有効") : LS("無効"))
+                LabeledContent(LS("Paged SSD使用量"), value: bytes(paged["diskBytes"]))
+                LabeledContent(LS("保存ブロック"),
+                               value: "\((paged["diskBlocks"] as? NSNumber)?.intValue ?? 0)")
+                LabeledContent(LS("キャッシュヒット"),
+                               value: "\((paged["hits"] as? NSNumber)?.intValue ?? 0)")
+                LabeledContent(LS("復元トークン"),
+                               value: "\((paged["tokensRestored"] as? NSNumber)?.intValue ?? 0)")
+                if let reason = paged["disabledReason"] as? String {
+                    Text("\(LS("無効理由")): \(pagedReason(reason))")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                let rejected = ((paged["restoreBudgetRejects"] as? NSNumber)?.intValue ?? 0)
+                    + ((paged["storeBudgetRejects"] as? NSNumber)?.intValue ?? 0)
+                if rejected > 0 {
+                    LabeledContent(LS("メモリ保護によるスキップ"), value: "\(rejected)")
+                }
+                Button(LS("Pagedキャッシュを消去…"), role: .destructive) {
+                    confirmsPagedClear = true
+                }
+                .disabled(((paged["diskBytes"] as? NSNumber)?.int64Value ?? 0) == 0)
+                Text(LS("plain mlx-lm KVCacheだけが対象です。非対応モデル、量子化・回転・複合キャッシュ、メモリ不足、破損時は通常のEXACT生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section(LS("キャッシュ状態")) {
@@ -100,6 +168,11 @@ struct PromptCacheSettingsView: View {
             await model.refreshSettings()
             diskEnabled = configured["diskEnabled"] as? Bool ?? true
             diskMaxGB = (configured["diskMaxGB"] as? NSNumber)?.intValue ?? 5
+            let paged = ((model.settings["experimental"] as? [String: Any])?["pagedKVCache"] as? [String: Any]) ?? [:]
+            pagedEnabled = paged["enabled"] as? Bool ?? false
+            pagedDiskEnabled = paged["diskEnabled"] as? Bool ?? true
+            pagedDiskMaxGB = (paged["diskMaxGB"] as? NSNumber)?.intValue ?? 10
+            pagedBranchReuse = paged["branchReuse"] as? Bool ?? true
             await model.refreshPromptCache()
         }
         .confirmationDialog(LS("ディスクキャッシュを消去しますか？"), isPresented: $confirmsDiskClear) {
@@ -109,6 +182,15 @@ struct PromptCacheSettingsView: View {
             Button(LS("キャンセル"), role: .cancel) {}
         } message: {
             Text(LS("次の会話ではプロンプトを再計算します。モデルや会話履歴は削除しません。"))
+        }
+        .confirmationDialog(LS("Paged KVキャッシュを消去しますか？"),
+                            isPresented: $confirmsPagedClear) {
+            Button(LS("Paged KVキャッシュを消去"), role: .destructive) {
+                Task { await model.clearPagedPromptCache() }
+            }
+            Button(LS("キャンセル"), role: .cancel) {}
+        } message: {
+            Text(LS("次の会話ではPaged KVを再構築します。モデルや会話履歴は削除しません。"))
         }
     }
 }

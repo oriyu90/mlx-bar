@@ -181,6 +181,10 @@ class BaseAdapter:
         """Clear optional persistent cache state owned by this worker."""
         return None
 
+    def clear_paged_prompt_cache(self) -> None:
+        """Clear only the opt-in paged tier, leaving legacy snapshots intact."""
+        return None
+
     def memory_stats(self) -> dict:
         result = {"active_bytes": 0, "cache_bytes": 0, "peak_bytes": 0}
         try:
@@ -368,6 +372,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
             if method == "clear_disk_prompt_cache":
                 await on_mlx_thread(adapter.clear_disk_prompt_cache)
+                return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
+            if method == "clear_paged_prompt_cache":
+                await on_mlx_thread(adapter.clear_paged_prompt_cache)
                 return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
             if method == "cancel":
                 adapter.cancelled.add(params.get("request_id", ""))

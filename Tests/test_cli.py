@@ -239,6 +239,24 @@ class CLIParityTests(unittest.TestCase):
             execute(argparse.Namespace(**base), client)
         client.request.assert_not_called()
 
+    def test_set_paged_kv_cache_only_sends_provided_options(self):
+        client = Mock()
+        client.request.return_value = response({})
+        args = argparse.Namespace(command="config", action="set-paged-kv-cache",
+                                  enabled="true", disk_enabled=None, disk_max_gb=12,
+                                  branch_reuse="false")
+        execute(args, client)
+        _, path, body = client.request.call_args[0]
+        self.assertEqual(path, "/api/v1/settings")
+        self.assertEqual(body, {"experimental": {"pagedKVCache": {
+            "enabled": True, "diskMaxGB": 12, "branchReuse": False}}})
+
+    def test_clear_paged_cache_has_an_isolated_endpoint(self):
+        client = Mock()
+        client.request.return_value = response({})
+        execute(argparse.Namespace(command="prompt-cache", action="clear-paged"), client)
+        client.request.assert_called_once_with("POST", "/api/v1/prompt-cache/paged/clear")
+
     def test_set_flag_maps_names_to_dotted_keys(self):
         cases = {
             "auto-load-on-api": {"models": {"autoLoadOnAPIRequest": True}},

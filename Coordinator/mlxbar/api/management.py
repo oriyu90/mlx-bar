@@ -384,6 +384,14 @@ async def clear_disk_prompt_cache(request: Request):
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
 
 
+@router.post("/prompt-cache/paged/clear")
+async def clear_paged_prompt_cache(request: Request):
+    try:
+        return await state(request).workers.clear_paged_prompt_cache()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+
 @router.get("/settings/api-token")
 async def get_api_token(request: Request):
     token = state(request).settings.api_token

@@ -11,6 +11,7 @@ from mlxbar.catalog.scanner import normalized_id
 from mlxbar.cli import execute
 from mlxbar.settings import SettingsStore
 from mlxbar.state import AppState
+from mlxbar.workers.supervisor import WorkerSupervisor
 
 
 class ClassifierTests(unittest.TestCase):
@@ -101,6 +102,40 @@ class SettingsTests(unittest.TestCase):
                 store.update({"promptCache": {"memoryBlocks": "yes"}})
             with self.assertRaisesRegex(ValueError, "diskWriteBudgetGB"):
                 store.update({"promptCache": {"diskWriteBudgetGB": -1}})
+
+    def test_paged_kv_cache_is_opt_in_and_strictly_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            paged = store.data["experimental"]["pagedKVCache"]
+            self.assertFalse(paged["enabled"])
+            self.assertEqual(paged["memoryTier"], "off")
+            self.assertFalse(store.data["experimental"]["adaptiveMemory"]["hybridKVReuse"])
+            updated = store.update({"experimental": {"pagedKVCache": {
+                "enabled": True, "diskMaxGB": 20, "branchReuse": False}}})
+            self.assertTrue(updated["experimental"]["pagedKVCache"]["enabled"])
+            self.assertFalse(updated["experimental"]["pagedKVCache"]["branchReuse"])
+            with self.assertRaisesRegex(ValueError, "diskMaxGB"):
+                store.update({"experimental": {"pagedKVCache": {"diskMaxGB": 0}}})
+            with self.assertRaisesRegex(ValueError, "memoryTier"):
+                store.update({"experimental": {"pagedKVCache": {"memoryTier": "auto"}}})
+
+    def test_paged_worker_environment_is_absent_when_off_and_globally_bounded_when_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            supervisor = WorkerSupervisor(root, store, instance_key="model-1", reap_orphans=False)
+            env = {}
+            supervisor._configure_paged_cache_environment(env, "mlx-lm")
+            self.assertEqual(env, {})
+            store.update({"models": {"pool": {"maxResidentModels": 4}},
+                          "experimental": {"pagedKVCache": {
+                              "enabled": True, "diskEnabled": True,
+                              "diskMaxGB": 12, "branchReuse": False}}})
+            supervisor._configure_paged_cache_environment(env, "mlx-lm")
+            self.assertEqual(int(env["MLXBAR_PAGED_KV_MAX_BYTES"]), 3 << 30)
+            self.assertEqual(env["MLXBAR_PAGED_KV_BRANCH_REUSE"], "0")
+            self.assertEqual(Path(env["MLXBAR_PAGED_KV_ROOT"]),
+                             root / "paged-kv-cache" / "mlx-lm" / "model-1")
 
     def test_preloading_the_last_model_is_on_by_default_and_type_checked(self):
         with tempfile.TemporaryDirectory() as directory:

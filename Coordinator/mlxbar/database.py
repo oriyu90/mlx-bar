@@ -281,7 +281,7 @@ class Database:
             "prompt_tps": max(0.0, float(entry.get("prompt_tps") or 0.0)),
             "generation_tps": max(0.0, float(entry.get("generation_tps") or 0.0)),
             "cache_tier": (str(entry.get("cache_tier"))[:16]
-                           if entry.get("cache_tier") in {"cold", "memory", "disk"} else None),
+                           if entry.get("cache_tier") in {"cold", "memory", "disk", "paged_disk"} else None),
             "tool_support": (str(entry.get("tool_support"))[:16]
                              if entry.get("tool_support") in {"none", "full", "degraded"} else None),
             # A closed vocabulary, so a future worker cannot turn this column

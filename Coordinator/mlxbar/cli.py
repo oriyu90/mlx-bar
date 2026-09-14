@@ -127,6 +127,13 @@ def parser() -> argparse.ArgumentParser:
     set_adaptive.add_argument("--verbatim-protection", choices=["true", "false"], default=None)
     set_adaptive.add_argument("--soft-token", choices=["true", "false"], default=None,
                               help="ソフトトークンのHybrid Prefill（実験、既定で無効）")
+    set_paged = config.add_parser(
+        "set-paged-kv-cache",
+        help="実験的な分岐対応Paged KVキャッシュ（mlx-lm plain KVのみ、既定で無効）")
+    set_paged.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_paged.add_argument("--disk-enabled", choices=["true", "false"], default=None)
+    set_paged.add_argument("--disk-max-gb", type=int, default=None)
+    set_paged.add_argument("--branch-reuse", choices=["true", "false"], default=None)
     set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
     set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
                                            "require-token", "continue-after-gui-exit"])
@@ -198,6 +205,7 @@ def parser() -> argparse.ArgumentParser:
     pcache.add_parser("status")
     pcache.add_parser("clear-memory")
     pcache.add_parser("clear-disk")
+    pcache.add_parser("clear-paged")
     pcache_set = pcache.add_parser("set", help="永続（ディスク）プロンプトキャッシュの設定")
     pcache_set.add_argument("--disk-enabled", choices=["true", "false"], default=None)
     pcache_set.add_argument("--max-gb", type=int, default=None)
@@ -454,6 +462,22 @@ def execute(args, client: Client):
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings",
                                   {"experimental": {"adaptiveMemory": patch}}).json()
+        if args.action == "set-paged-kv-cache":
+            patch: dict = {}
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if args.disk_enabled is not None:
+                patch["diskEnabled"] = args.disk_enabled == "true"
+            if args.disk_max_gb is not None:
+                if not 1 <= args.disk_max_gb <= 100:
+                    raise ValueError("Paged KVディスク上限は1〜100 GBで指定してください")
+                patch["diskMaxGB"] = args.disk_max_gb
+            if args.branch_reuse is not None:
+                patch["branchReuse"] = args.branch_reuse == "true"
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings",
+                                  {"experimental": {"pagedKVCache": patch}}).json()
         if args.action == "set-flag":
             keys = {"auto-load-on-api": "models.autoLoadOnAPIRequest",
                     "anthropic-api": "api.anthropic.enabled",
@@ -572,6 +596,8 @@ def execute(args, client: Client):
             return client.request("POST", "/api/v1/prompt-cache/memory/clear").json()
         if args.action == "clear-disk":
             return client.request("POST", "/api/v1/prompt-cache/disk/clear").json()
+        if args.action == "clear-paged":
+            return client.request("POST", "/api/v1/prompt-cache/paged/clear").json()
         if args.action == "set":
             patch: dict = {}
             if args.disk_enabled is not None:

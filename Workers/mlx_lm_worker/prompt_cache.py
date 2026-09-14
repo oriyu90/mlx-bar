@@ -43,7 +43,10 @@ class PromptCacheStore:
     def __init__(self, model_path: str, runtime_version: str, *, root: str | None = None,
                  disk_enabled: bool = True, max_bytes: int = 10 << 30,
                  keep_generations: int = 2, guard_tokens: int = DEFAULT_GUARD_TOKENS,
-                 memory_max_bytes: int | None = None):
+                 memory_max_bytes: int | None = None, model=None,
+                 cache_budget: dict | None = None, paged_enabled: bool = False,
+                 paged_root: str | None = None, paged_disk_enabled: bool = True,
+                 paged_max_bytes: int = 0, paged_branch_reuse: bool = True):
         self.model_path = model_path
         self.guard_tokens = max(0, guard_tokens)
         self.max_bytes = max(0, max_bytes)
@@ -53,11 +56,26 @@ class PromptCacheStore:
         self.memory: object | None = None
         self.disk_hits = 0
         self.memory_hits = 0
+        self.paged = None
         # A single 8k-token snapshot of a 32B model is around a gigabyte, so an
         # unbounded warm tier would quietly undo the memory limits this release
         # adds. Cap it against physical RAM unless told otherwise.
         self.memory_max_bytes = memory_max_bytes or self._default_memory_budget()
         self._reset_memory(self.memory_max_bytes)
+        # This import is deliberately behind the master switch. With the
+        # feature absent/disabled, v2.2.0 neither imports the new package nor
+        # probes a cache class nor creates a paged directory.
+        if paged_enabled and model is not None and paged_root:
+            try:
+                from .paged_cache import PagedKVStore
+                model_fingerprint = self._fingerprint(Path(model_path), runtime_version)
+                self.paged = PagedKVStore(
+                    model=model, model_fingerprint=model_fingerprint,
+                    runtime_version=runtime_version, root=paged_root,
+                    max_bytes=paged_max_bytes, disk_enabled=paged_disk_enabled,
+                    branch_reuse=paged_branch_reuse, cache_budget=cache_budget or {})
+            except Exception as exc:
+                LOGGER.warning("Paged KV cache disabled: %s", exc)
         if not disk_enabled:
             self.disabled_reason = "disabled_by_setting"
             return
@@ -139,6 +157,14 @@ class PromptCacheStore:
         if cache is not None and len(remaining) < len(tokens):
             self.memory_hits += 1
             return cache, remaining, "memory"
+        if self.paged is not None:
+            try:
+                paged = self.paged.fetch(model, tokens)
+            except Exception as exc:
+                LOGGER.warning("Paged KV lookup failed; using snapshot/cold path: %s", exc)
+                paged = None
+            if paged is not None:
+                return paged[0], tokens[paged[1]:], "paged_disk"
         snapshot = self._fetch_disk(model, tokens)
         if snapshot is not None:
             self.disk_hits += 1
@@ -161,6 +187,8 @@ class PromptCacheStore:
             except Exception as exc:
                 LOGGER.warning("Could not retain prompt cache in memory: %s", exc)
                 self._reset_memory()
+        if self.paged is not None:
+            self.paged.store(tokens, cache, prompt_length or len(tokens))
         self._store_disk(model, tokens, cache, prompt_length or len(tokens))
 
     def stats(self) -> dict:
@@ -175,6 +203,10 @@ class PromptCacheStore:
             "diskHits": self.disk_hits,
             "generations": self._namespace_count(),
             "diskBytes": self._namespace_bytes(),
+            "pagedKV": (self.paged.stats() if self.paged is not None else {
+                "configured": False, "enabled": False, "eligible": False,
+                "capability": "disabled", "formatVersion": 1, "blockSize": 256,
+            }),
         }
         if self.memory is not None:
             with contextlib.suppress(Exception):
@@ -192,6 +224,14 @@ class PromptCacheStore:
             directory.mkdir(parents=True, exist_ok=True)
             os.chmod(directory, 0o700)
         self.disk_hits = 0
+
+    def clear_paged(self) -> None:
+        if self.paged is not None:
+            self.paged.clear()
+
+    def mark_paged_fallback(self, reason: str) -> None:
+        if self.paged is not None:
+            self.paged.mark_exact_fallback(reason)
 
     # ------------------------------------------------------------ memory tier
 

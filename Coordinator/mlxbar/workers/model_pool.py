@@ -969,6 +969,14 @@ class ModelPoolSupervisor:
             results.append(await slot.worker.clear_disk_prompt_cache())
         return results[-1] if results else await self._legacy.clear_disk_prompt_cache()
 
+    async def clear_paged_prompt_cache(self) -> dict:
+        if not self.enabled:
+            return await self._legacy.clear_paged_prompt_cache()
+        results = []
+        for slot in self._slots.values():
+            results.append(await slot.worker.clear_paged_prompt_cache())
+        return results[-1] if results else await self._legacy.clear_paged_prompt_cache()
+
     def effective_max_tokens(self) -> int:
         slot = self._primary_slot()
         return (slot.worker if slot else self._legacy).effective_max_tokens()

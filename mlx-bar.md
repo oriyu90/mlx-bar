@@ -3,6 +3,24 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.3.0のoMLX型Paged KVキャッシュで守ること（2026-09-15リリース）
+
+- `experimental.pagedKVCache.enabled`は既定false。OFFならCoordinatorは`MLXBAR_PAGED_KV_*`を渡さず、Workerは`paged_cache`をimportせず、probeもdirectory作成もしない。この休眠契約を崩さない。
+- 初期対応は全layerが上流のplain mlx-lm `KVCache`である場合だけ。`type(layer) is KVCache`、state setterの実MLX往復、arity 2/3を確認する。Quantized/Rotating/Arrays/CacheList/recurrent/custom/VLMをクラス名推測で対応扱いにしない。
+- blockは256 tokens固定、full blockだけ。`(prompt_length - 1) // 256`までに留め、最低1 raw tokenを必ずruntimeへ渡す。partial terminal blockは未実装。
+- namespaceはモデル/重み/tokenizer/template fingerprint、mlx-lm/MLX/Python版、layer数、state arity、format/block sizeを含む。hashはparent + token IDs + namespace saltの連鎖。別namespaceを読ませない。
+- state復元は必ず`make_prompt_cache(model)`で作ったfresh cacheへ行う。全layerのshape/dtype/offset/arityと、`model_cache_budget`のbytes/tokenに一致しなければ即circuit openしEXACTへ戻す。
+- safetensorsとSHA-256 sidecarは0600、root/namespace/quarantineは0700、同一directory temp + fsync + atomic rename。checksum不一致はquarantine。pickleは使用禁止。tensor/checksumのrename間で落ちたhalf-pairは起動時と次回store時の両方で除去し、同一worker内で自己修復する。孤立sidecarも起動時に除去。
+- quotaはworker private root全体（旧namespace、quarantine、checksum、exact markerを含む）で数える。1 blockごとにpruneし、複数workerではglobal `diskMaxGB / maxResidentModels`を渡す。上限をプロセス数倍してはならない。
+- restore admissionはbytes/tokenがknownで、live result + concatenate scratch + 1 blockがabsolute/ratio memory limit内に入る場合だけ。storeも1 blockのcontiguous allocationを事前計上する。`mx.get_active_memory()`自体が無い/失敗する場合を0と仮定せず両方ともskipする。数値不明を楽観許可しない。MLX array操作はworker owner threadだけ。
+- 破損ファイルは期待block bytes + 小さなheader上限を超えた時点で、`mx.load`より前にquarantineする。tensor keyの不足だけでなく余分なkeyも拒否。cache root/namespace/quarantine/exact directoryはsymlinkを許可しない。
+- paged cacheが最初のmodel event前に失敗した場合だけfresh EXACT cacheで1回再試行。空textでも1 event受け取った後は再試行禁止。二重応答を作らない。
+- 3連続restore/first-evaluation失敗、または1 layout/offset mismatchでworker生存中のcircuitを開く。生成は既存snapshot/cold EXACTへ継続する。
+- `prompt-cache clear-disk`は既存snapshotだけ、`clear-paged`はPagedだけ。rollbackデータを同時に消さない。
+- `memoryTier=auto`、quantized KV、terminal partial、background writer、VLM置換、hybrid soft-token KVは実機ゲート未達。勝手に実装/有効化しない。Adaptive側は`enabled && softToken && persistentHybridKV && hybridKVReuse`の4重gateが将来も必須。
+- 重み不要の実runtime確認は`scripts/verify-paged-cache-runtime.py`、任意の実モデルfail-closed/smokeは`scripts/verify-paged-cache-model.py`を使う。
+- 設定UIはmaster OFF時にSSD/branch/quotaを操作不可とし、内部reason codeをそのまま主表示しない。Paged専用削除は確認dialog必須。状態にblock/hit/restored token/memory guard skipを表示する。
+
 ## v1.6.2の複数モデルpoolで守ること
 
 - poolは従来の`WorkerSupervisor`を差し替えない。`ModelPoolSupervisor`がmodel単位のSupervisorを合成し、`enabled=false`ではv1.6.1のlegacy経路へ委譲する。互換性調査はまずこの無効経路と`loadedModel`応答を確認する。

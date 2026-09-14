@@ -1073,6 +1073,25 @@ final class MenuBarViewModel: ObservableObject {
         }
     }
 
+    func setPagedKVCacheSettings(enabled: Bool, diskEnabled: Bool, maximumGB: Int,
+                                 branchReuse: Bool) async {
+        guard 1...100 ~= maximumGB else {
+            errorMessage = ui("Paged KV disk cache must be between 1 and 100 GB",
+                              "Paged KVディスクキャッシュは1〜100 GBで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["experimental": ["pagedKVCache": [
+                "enabled": enabled, "diskEnabled": diskEnabled,
+                "diskMaxGB": maximumGB, "branchReuse": branchReuse,
+            ]]])
+            await self.refreshSettings()
+            self.promptCacheMessage = self.ui(
+                "The setting applies the next time the model worker starts",
+                "設定は次にモデルWorkerを起動したときに反映されます")
+        }
+    }
+
     // MARK: - Knowledge base (RAG)
 
     /// Config + collection list, no network probe of the embedding backend.
@@ -1344,6 +1363,15 @@ final class MenuBarViewModel: ObservableObject {
             self.promptCacheMessage = memory
                 ? self.ui("Memory prompt cache cleared", "メモリーキャッシュを消去しました")
                 : self.ui("Disk prompt cache cleared", "ディスクキャッシュを消去しました")
+        }
+    }
+
+    func clearPagedPromptCache() async {
+        await perform {
+            self.promptCacheStatus = try await self.json(
+                "POST", "/api/v1/prompt-cache/paged/clear") as? [String: Any] ?? [:]
+            self.promptCacheMessage = self.ui(
+                "Paged KV cache cleared", "Paged KVキャッシュを消去しました")
         }
     }
 
