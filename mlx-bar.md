@@ -3,6 +3,15 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.4.1の監査修正で守ること（2026-09-23リリース）
+
+- `general.logLevel`は当初consumerが無く、GUI/CLIだけが存在するプラセボだった。
+  `main.py:server_log_level()`でpublic/management両uvicornへ配線し（起動時latch、
+  listener切替時にも再読込）、`_validate`で4択に制限した。不正値・欠落は`warning`へ戻す。
+- メモリガード欄と要求上限欄（同時接続数）に再起動注意文を追加し、MB表示の丸めを注記した。
+  headroom Stepperの刻み外の値はSwiftガードと422の二重で弾かれるため追加対応なし。
+- 新規設定キー・既定値変更なし。`logLevel`検証は既存の正当値に影響しない。
+
 ## v2.4.0の設定GUI一元管理で守ること（2026-09-23リリース）
 
 - 新規キーは追加していない。`DEFAULTS` の変更は `hybridKVReuse: true` 拒否の検証追加のみ。
@@ -25,11 +34,6 @@
   版上げ時はpyprojectと同時に書き換える。
 - テスト実行は`Coordinator/.venv`が無い環境ではsystem python＋httpx/fastapi/packaging/pytestで
   `PYTHONPATH=Coordinator python -m pytest Tests/ -p no:cacheprovider`。`-p randomly`は未導入。
-- v2.4.0後の監査修正：`general.logLevel`は当初consumerが無く、GUI/CLIだけが存在する
-  プラセボだった。`main.py:server_log_level()`でpublic/management両uvicornへ配線し
-  （起動時latch、listener切替時にも再読込）、`_validate`で4択に制限した。
-  メモリガード欄と要求上限欄（同時接続数）に再起動注意文を追加し、MB表示の丸めを注記した。
-  headroom Stepperの刻み外の値はSwiftガードと422の二重で弾かれるため追加対応なし。
 
 ## v2.3.0のoMLX型Paged KVキャッシュで守ること（2026-09-15リリース）
 
