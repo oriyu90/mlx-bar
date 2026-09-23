@@ -3,6 +3,29 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.4.0の設定GUI一元管理で守ること（2026-09-23リリース）
+
+- 新規キーは追加していない。`DEFAULTS` の変更は `hybridKVReuse: true` 拒否の検証追加のみ。
+  既存config.jsonはdeep_mergeでそのまま動作する。この「既定値不変」を次版でも崩さない。
+- 検証範囲の唯一の正本は `Coordinator/mlxbar/settings.py:_validate`。GUI（Swift guard）と
+  CLI（argparse後のValueError）の範囲はこれのmirrorであり、勝手に広げない。
+  範囲を変える場合は3箇所＋`Tests/test_gui_settings_parity.py`を同時更新する。
+- 将来ゲートは検証で閉じている：`pagedKVCache.memoryTier != off`拒否（既存）、
+  `adaptiveMemory.hybridKVReuse == true`拒否（v2.4.0追加）。RAM hot tier・KV量子化・
+  hybrid KV再利用の実装時は、実機ゲート通過後に該当拒否を外し、GUI/CLI/TEST_PLANを同時更新する。
+- `MenuBarViewModel.setModelMemoryLimit`はprofiles配列全体を書き戻す。将来profileにfield追加時は
+  この関数が他fieldを落とさないこと（取得→1件だけ変更→PUTの順）を回帰テストで確認する。
+- `models.lmStudio.folder`のクリアはJSON nullでPUTする（SwiftはNSNull）。空文字を送ると
+  CLIはNoneへ正規化するが、GUI直送の空文字は検証がないため素通る。folderに検証追加時は注意。
+- `en.lproj/Localizable.strings`は同一キー重複禁止。新規日本語 literal 追加時は必ず英訳1行を追加し、
+  重複検査（`^"(.*)" = `の集計）を行う。既存の`モデル未ロード`重複1件は未解消。
+- CLIの新規optional引数は`getattr(args, field, None)`で読む。古いNamespaceを組み立てる既存テスト
+  （test_cli.py）が落ちないための防御であり、新規テストは全field明示が望ましい。
+- `Coordinator/uv.lock`の`mlxbar`版数は手動管理（`uv lock`再生成は別途ネットワーク要）。
+  版上げ時はpyprojectと同時に書き換える。
+- テスト実行は`Coordinator/.venv`が無い環境ではsystem python＋httpx/fastapi/packaging/pytestで
+  `PYTHONPATH=Coordinator python -m pytest Tests/ -p no:cacheprovider`。`-p randomly`は未導入。
+
 ## v2.3.0のoMLX型Paged KVキャッシュで守ること（2026-09-15リリース）
 
 - `experimental.pagedKVCache.enabled`は既定false。OFFならCoordinatorは`MLXBAR_PAGED_KV_*`を渡さず、Workerは`paged_cache`をimportせず、probeもdirectory作成もしない。この休眠契約を崩さない。

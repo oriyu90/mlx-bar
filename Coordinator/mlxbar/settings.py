@@ -383,6 +383,13 @@ class SettingsStore:
                     "persistentHybridKV", "hybridKVReuse", "fallbackToExact"):
             if not isinstance(adaptive.get(key, False), bool):
                 raise ValueError(f"experimental.adaptiveMemory.{key} must be boolean")
+        if adaptive.get("hybridKVReuse", False):
+            # Soft-token hybrid KV reuse is not implemented yet (DESIGN_v2.2.0
+            # phase plan). Refuse true now so a stored true can never silently
+            # start reusing hybrid KV when a later phase ships the reader.
+            raise ValueError("experimental.adaptiveMemory.hybridKVReuse must be false "
+                             "in this version / このバージョンでは"
+                             "experimental.adaptiveMemory.hybridKVReuseはfalse固定です")
         if adaptive.get("policy", "balanced") not in {"fidelity", "balanced", "memorySaver"}:
             raise ValueError("experimental.adaptiveMemory.policy must be fidelity, balanced or memorySaver")
         for key in ("triggerRatio", "memoryPressureRatio"):

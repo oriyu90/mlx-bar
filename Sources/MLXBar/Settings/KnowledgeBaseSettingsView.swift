@@ -16,6 +16,9 @@ struct KnowledgeBaseSettingsView: View {
     @State private var chunkOverlap = 200
     @State private var defaultTopK = 4
     @State private var maxContextChars = 6000
+    @State private var embeddingTimeoutSeconds = 30
+    @State private var embeddingBatchSize = 32
+    @State private var maxChunksPerCollection = 5000
 
     @State private var newCollectionName = ""
     @State private var selectedCollection: String?
@@ -65,6 +68,14 @@ struct KnowledgeBaseSettingsView: View {
                         Task { await model.saveRagEmbeddingToken("") }
                     }.disabled(model.ragEmbeddingToken.isEmpty)
                 }
+                Stepper(value: $embeddingTimeoutSeconds, in: 5...300, step: 5) {
+                    Text(t("タイムアウト: \(embeddingTimeoutSeconds) 秒",
+                           "Timeout: \(embeddingTimeoutSeconds) s"))
+                }
+                Stepper(value: $embeddingBatchSize, in: 1...256) {
+                    Text(t("埋め込みバッチサイズ: \(embeddingBatchSize)",
+                           "Embedding batch size: \(embeddingBatchSize)"))
+                }
                 if let reachable = model.ragBackendReachable {
                     Label(reachable
                           ? t("接続OK（埋め込み次元: \(model.ragEmbeddingDim ?? 0)）",
@@ -91,6 +102,13 @@ struct KnowledgeBaseSettingsView: View {
                     Text(t("注入する文脈の最大文字数: \(maxContextChars)",
                            "Max injected context: \(maxContextChars) chars"))
                 }
+                Stepper(value: $maxChunksPerCollection, in: 100...50000, step: 100) {
+                    Text(t("コレクション上限: \(maxChunksPerCollection) チャンク",
+                           "Collection cap: \(maxChunksPerCollection) chunks"))
+                }
+                Text(t("取得は全件読みの純Python検索のため、上限を上げる前に取得速度を確認してください。",
+                       "Retrieval scans all vectors in pure Python; check retrieval speed before raising the cap."))
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -99,7 +117,10 @@ struct KnowledgeBaseSettingsView: View {
                         await model.setRagSettings(
                             enabled: enabled, baseURL: baseURL, model: embeddingModel,
                             chunkSize: chunkSize, chunkOverlap: chunkOverlap,
-                            defaultTopK: defaultTopK, maxContextChars: maxContextChars)
+                            defaultTopK: defaultTopK, maxContextChars: maxContextChars,
+                            timeoutSeconds: embeddingTimeoutSeconds,
+                            batchSize: embeddingBatchSize,
+                            maxChunks: maxChunksPerCollection)
                     }
                 }.buttonStyle(.borderedProminent)
                 if let message = model.ragStatusMessage {
@@ -163,6 +184,9 @@ struct KnowledgeBaseSettingsView: View {
             chunkOverlap = (rag["chunkOverlap"] as? NSNumber)?.intValue ?? chunkOverlap
             defaultTopK = (rag["defaultTopK"] as? NSNumber)?.intValue ?? defaultTopK
             maxContextChars = (rag["maxContextChars"] as? NSNumber)?.intValue ?? maxContextChars
+            maxChunksPerCollection = (rag["maxChunksPerCollection"] as? NSNumber)?.intValue ?? maxChunksPerCollection
+            embeddingTimeoutSeconds = (embedding["timeoutSeconds"] as? NSNumber)?.intValue ?? embeddingTimeoutSeconds
+            embeddingBatchSize = (embedding["batchSize"] as? NSNumber)?.intValue ?? embeddingBatchSize
             await model.refreshRag()
         }
         .confirmationDialog(t("このコレクションを削除しますか？", "Delete this collection?"),

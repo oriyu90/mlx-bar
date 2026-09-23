@@ -974,6 +974,107 @@ final class MenuBarViewModel: ObservableObject {
         }
     }
 
+    /// Prompt input ceilings (v2.4.0). Ranges mirror SettingsStore._validate.
+    func setPromptInputLimits(maxPromptChars: Int, maxImages: Int, maxImageBytes: Int) async {
+        guard 1...10_000_000 ~= maxPromptChars else {
+            errorMessage = ui("Maximum prompt characters must be between 1 and 10,000,000",
+                              "プロンプト最大文字数は1〜10,000,000で指定してください")
+            return
+        }
+        guard 0...128 ~= maxImages else {
+            errorMessage = ui("Maximum images must be between 0 and 128",
+                              "画像最大枚数は0〜128で指定してください")
+            return
+        }
+        guard 1...2_147_483_648 ~= maxImageBytes else {
+            errorMessage = ui("Maximum image size must be between 1 and 2,147,483,648 bytes",
+                              "画像最大バイト数は1〜2,147,483,648で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
+                "maxPromptCharacters": maxPromptChars, "maxImages": maxImages,
+                "maxImageBytes": maxImageBytes,
+            ]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// Generation timeouts in seconds (v2.4.0). Ranges mirror SettingsStore._validate.
+    func setGenerationTimeouts(load: Int, tokenIdle: Int, heartbeat: Int,
+                               total: Int, cancelGrace: Int) async {
+        guard 10...3600 ~= load, 5...600 ~= tokenIdle, 1...30 ~= heartbeat,
+              10...7200 ~= total, 1...30 ~= cancelGrace else {
+            errorMessage = ui("One or more timeouts are outside the supported range",
+                              "タイムアウトに範囲外の値があります")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
+                "loadTimeoutSeconds": load, "tokenIdleTimeoutSeconds": tokenIdle,
+                "streamHeartbeatSeconds": heartbeat, "totalTimeoutSeconds": total,
+                "cancelGraceSeconds": cancelGrace,
+            ]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// OMLX-style memory guard ratios (v2.4.0). 0 disables the MLX-side wired
+    /// or cache limit and keeps the runtime default. wired must not exceed
+    /// memory — checked here as well as on the server.
+    func setMemoryGuardRatios(memory: Double, wired: Double, cache: Double) async {
+        guard (0.5...0.99).contains(memory) else {
+            errorMessage = ui("Memory limit ratio must be between 0.5 and 0.99",
+                              "メモリ上限比率は0.5〜0.99で指定してください")
+            return
+        }
+        guard (0...0.95).contains(wired) else {
+            errorMessage = ui("Wired limit ratio must be between 0 and 0.95",
+                              "wired上限比率は0〜0.95で指定してください")
+            return
+        }
+        guard (0...0.5).contains(cache) else {
+            errorMessage = ui("Cache limit ratio must be between 0 and 0.5",
+                              "キャッシュ上限比率は0〜0.5で指定してください")
+            return
+        }
+        guard wired <= memory else {
+            errorMessage = ui("Wired limit ratio must not exceed the memory limit ratio",
+                              "wired上限比率はメモリ上限比率を超えられません")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
+                "memoryLimitRatio": memory, "wiredLimitRatio": wired,
+                "cacheLimitRatio": cache,
+            ]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// API listener limits (v2.4.0). 0 bytes derives the ceiling from the
+    /// generation limits above. Changing the port/host still goes through the
+    /// dedicated setPort/setLANAccess paths with their listener checks.
+    func setApiLimits(maxRequestBytes: Int, maxConnections: Int) async {
+        guard 0...4_294_967_296 ~= maxRequestBytes else {
+            errorMessage = ui("Maximum request size must be between 0 and 4,294,967,296 bytes",
+                              "最大要求バイト数は0〜4,294,967,296で指定してください")
+            return
+        }
+        guard 1...1024 ~= maxConnections else {
+            errorMessage = ui("Maximum connections must be between 1 and 1,024",
+                              "最大同時接続数は1〜1,024で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["api": [
+                "maxRequestBytes": maxRequestBytes,
+                "maxConcurrentConnections": maxConnections,
+            ]])
+            await self.refreshSettings()
+        }
+    }
+
     func setMaxTokenLimit(_ value: Int) async {
         guard 1...2_000_000 ~= value else {
             errorMessage = ui("Maximum tokens must be between 1 and 2,000,000", "Max token上限は1〜2,000,000で指定してください")
@@ -1002,10 +1103,10 @@ final class MenuBarViewModel: ObservableObject {
 
     func setModelPoolSettings(enabled: Bool, maximum: Int, ttl: Int,
                               perModelGB: Int, totalRatio: Double, reserveGB: Int,
-                              generationConcurrency: Int) async {
+                              generationConcurrency: Int, maxReplicas: Int) async {
         guard 1...8 ~= maximum, 30...86400 ~= ttl, 1...512 ~= perModelGB,
               0.5...0.9 ~= totalRatio, 1...128 ~= reserveGB,
-              1...8 ~= generationConcurrency else {
+              1...8 ~= generationConcurrency, 1...8 ~= maxReplicas else {
             errorMessage = ui("One or more model residency limits are outside the supported range",
                               "モデル常駐設定に範囲外の値があります")
             return
@@ -1019,6 +1120,51 @@ final class MenuBarViewModel: ObservableObject {
                 "totalMemoryRatio": totalRatio,
                 "minimumSystemReserveGB": reserveGB,
                 "generationConcurrency": generationConcurrency,
+                "maxReplicasPerModel": maxReplicas,
+            ]]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// Per-concurrent-generation memory head-room (v2.4.0). 0 derives a
+    /// conservative value from the per-model limit; otherwise 0.25–32 GB.
+    /// Takes effect for lanes started after the change.
+    func setGenerationHeadroom(_ gb: Double) async {
+        guard gb == 0 || (0.25...32).contains(gb) else {
+            errorMessage = ui("Headroom must be 0 (automatic) or between 0.25 and 32 GB",
+                              "ヘッドルームは0（自動）または0.25〜32 GBで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
+                "perGenerationHeadroomGB": gb,
+            ]]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// Per-model resident memory ceiling for one pinned profile (v2.4.0).
+    /// Other profile fields (keepLoaded, replicas) are preserved: the whole
+    /// profiles array is rewritten with only this entry's maxMemoryGB changed.
+    func setModelMemoryLimit(_ modelId: String, maxGB: Double) async {
+        guard (1...512).contains(maxGB) else {
+            errorMessage = ui("Per-model memory must be between 1 and 512 GB",
+                              "モデルごとの上限は1〜512 GBで指定してください")
+            return
+        }
+        await perform {
+            let pool = (self.settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
+            var profiles = (pool["profiles"] as? [[String: Any]]) ?? []
+            guard let index = profiles.firstIndex(where: { ($0["modelId"] as? String) == modelId }) else {
+                self.errorMessage = self.ui("Pin the model as resident first",
+                                            "先にモデルを常駐指定してください")
+                return
+            }
+            var updated = profiles[index]
+            updated["maxMemoryGB"] = maxGB
+            profiles[index] = updated
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
+                "profiles": profiles,
             ]]])
             await self.refreshSettings()
         }
@@ -1048,7 +1194,8 @@ final class MenuBarViewModel: ObservableObject {
     func setAdaptiveMemorySettings(enabled: Bool, policy: String, triggerPercent: Int,
                                    memoryPressurePercent: Int, keepTailMessages: Int,
                                    maxLatentTokens: Int, maxRetrievedSegments: Int,
-                                   verbatimProtection: Bool, softToken: Bool) async {
+                                   verbatimProtection: Bool, softToken: Bool,
+                                   fallbackToExact: Bool = true) async {
         guard ["fidelity", "balanced", "memorySaver"].contains(policy),
               50...95 ~= triggerPercent, 50...95 ~= memoryPressurePercent,
               2...50 ~= keepTailMessages, 16...2048 ~= maxLatentTokens,
@@ -1068,6 +1215,7 @@ final class MenuBarViewModel: ObservableObject {
                 "maxRetrievedSegments": maxRetrievedSegments,
                 "verbatimProtection": verbatimProtection,
                 "softToken": softToken,
+                "fallbackToExact": fallbackToExact,
             ]]])
             await self.refreshSettings()
         }
@@ -1135,9 +1283,12 @@ final class MenuBarViewModel: ObservableObject {
 
     func setRagSettings(enabled: Bool, baseURL: String, model: String,
                         chunkSize: Int, chunkOverlap: Int, defaultTopK: Int,
-                        maxContextChars: Int) async {
+                        maxContextChars: Int, timeoutSeconds: Int = 30,
+                        batchSize: Int = 32, maxChunks: Int = 5000) async {
         guard 100...8000 ~= chunkSize, 0...(chunkSize / 2) ~= chunkOverlap,
               1...20 ~= defaultTopK, 500...32000 ~= maxContextChars,
+              5...300 ~= timeoutSeconds, 1...256 ~= batchSize,
+              100...50000 ~= maxChunks,
               baseURL.hasPrefix("http://") || baseURL.hasPrefix("https://") else {
             errorMessage = ui("One or more knowledge-base settings are outside the supported range",
                               "知識ベースの設定に範囲外の値があります")
@@ -1146,11 +1297,14 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["rag": [
                 "enabled": enabled,
-                "embedding": ["baseUrl": baseURL, "model": model],
+                "embedding": ["baseUrl": baseURL, "model": model,
+                              "timeoutSeconds": timeoutSeconds,
+                              "batchSize": batchSize],
                 "chunkSize": chunkSize,
                 "chunkOverlap": chunkOverlap,
                 "defaultTopK": defaultTopK,
                 "maxContextChars": maxContextChars,
+                "maxChunksPerCollection": maxChunks,
             ]])
             await self.refreshSettings()
             await self.refreshRag()
@@ -1347,6 +1501,43 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["promptCache": [
                 "diskEnabled": enabled, "diskMaxGB": maximumGB,
+            ]])
+            await self.refreshSettings()
+            self.promptCacheMessage = self.ui(
+                "The setting applies the next time the model worker starts",
+                "設定は次にモデルWorkerを起動したときに反映されます")
+        }
+    }
+
+    /// Advanced prompt-cache tuning (v2.4.0). Ranges mirror
+    /// SettingsStore._validate; the write budget note (one snapshot of a
+    /// long conversation costs gigabytes) is stated in the Settings view.
+    func setPromptCacheAdvanced(keepGenerations: Int, memoryRatio: Double,
+                                branchCheckpoint: String, writeBudgetGB: Double) async {
+        guard 1...10 ~= keepGenerations else {
+            errorMessage = ui("Generations to keep must be between 1 and 10",
+                              "世代保持数は1〜10で指定してください")
+            return
+        }
+        guard (0...0.5).contains(memoryRatio) else {
+            errorMessage = ui("Memory ratio must be between 0 and 0.5",
+                              "メモリ比率は0〜0.5で指定してください")
+            return
+        }
+        guard ["auto", "off"].contains(branchCheckpoint) else {
+            errorMessage = ui("Branch checkpoint must be auto or off",
+                              "分岐チェックポイントはautoかoffで指定してください")
+            return
+        }
+        guard (0...4096).contains(writeBudgetGB) else {
+            errorMessage = ui("Write budget must be between 0 and 4,096 GB",
+                              "書き込み予算は0〜4,096 GBで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["promptCache": [
+                "keepGenerations": keepGenerations, "memoryRatio": memoryRatio,
+                "branchCheckpoint": branchCheckpoint, "diskWriteBudgetGB": writeBudgetGB,
             ]])
             await self.refreshSettings()
             self.promptCacheMessage = self.ui(

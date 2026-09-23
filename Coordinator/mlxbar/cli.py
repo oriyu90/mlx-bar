@@ -100,6 +100,8 @@ def parser() -> argparse.ArgumentParser:
     set_pool.add_argument("--system-reserve-gb", type=int, default=None)
     set_pool.add_argument("--generation-concurrency", type=int, default=None)
     set_pool.add_argument("--max-replicas-per-model", type=int, default=None)
+    set_pool.add_argument("--per-generation-headroom-gb", type=float, default=None,
+                          help="同時生成ヘッドルームGB（0で自動導出、または0.25〜32）")
     set_compression = config.add_parser(
         "set-context-compression",
         help="長い会話の古い部分を要約して短縮する設定（指定したオプションだけ変更）")
@@ -127,6 +129,8 @@ def parser() -> argparse.ArgumentParser:
     set_adaptive.add_argument("--verbatim-protection", choices=["true", "false"], default=None)
     set_adaptive.add_argument("--soft-token", choices=["true", "false"], default=None,
                               help="ソフトトークンのHybrid Prefill（実験、既定で無効）")
+    set_adaptive.add_argument("--fallback-to-exact", choices=["true", "false"], default=None,
+                              help="失敗時は通常のEXACT推論へ戻す（既定で有効）")
     set_paged = config.add_parser(
         "set-paged-kv-cache",
         help="実験的な分岐対応Paged KVキャッシュ（mlx-lm plain KVのみ、既定で無効）")
@@ -136,9 +140,31 @@ def parser() -> argparse.ArgumentParser:
     set_paged.add_argument("--branch-reuse", choices=["true", "false"], default=None)
     set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
     set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
-                                           "require-token", "continue-after-gui-exit"])
+                                           "require-token", "continue-after-gui-exit",
+                                           "preload-last-model", "lmstudio-enabled"])
     set_flag.add_argument("value", choices=["true", "false"])
     set_language = config.add_parser("set-language"); set_language.add_argument("language", choices=["en", "ja"])
+    set_log_level = config.add_parser("set-log-level", help="一般ログレベル（debug/info/warning/error）")
+    set_log_level.add_argument("level", choices=["debug", "info", "warning", "error"])
+    set_api_limits = config.add_parser(
+        "set-api-limits", help="APIサーバーの要求上限（指定したオプションだけ変更）")
+    set_api_limits.add_argument("--max-request-bytes", type=int, default=None,
+                                help="最大要求バイト数（0で生成上限から自動導出、〜4294967296）")
+    set_api_limits.add_argument("--max-concurrent-connections", type=int, default=None,
+                                help="最大同時接続数（1〜1024）")
+    set_gen_limits = config.add_parser(
+        "set-generation-limits", help="生成の入力上限・タイムアウト・メモリガード（指定したオプションだけ変更）")
+    set_gen_limits.add_argument("--max-prompt-characters", type=int, default=None)
+    set_gen_limits.add_argument("--max-images", type=int, default=None)
+    set_gen_limits.add_argument("--max-image-bytes", type=int, default=None)
+    set_gen_limits.add_argument("--load-timeout-seconds", type=int, default=None)
+    set_gen_limits.add_argument("--token-idle-timeout-seconds", type=int, default=None)
+    set_gen_limits.add_argument("--stream-heartbeat-seconds", type=int, default=None)
+    set_gen_limits.add_argument("--total-timeout-seconds", type=int, default=None)
+    set_gen_limits.add_argument("--cancel-grace-seconds", type=int, default=None)
+    set_gen_limits.add_argument("--memory-limit-ratio", type=float, default=None)
+    set_gen_limits.add_argument("--wired-limit-ratio", type=float, default=None)
+    set_gen_limits.add_argument("--cache-limit-ratio", type=float, default=None)
     set_max_tokens = config.add_parser("set-max-tokens"); set_max_tokens.add_argument("value", type=int)
     set_queue = config.add_parser("set-queue-limits")
     set_queue.add_argument("--max-queued", type=int, required=True)
@@ -209,9 +235,19 @@ def parser() -> argparse.ArgumentParser:
     pcache_set = pcache.add_parser("set", help="永続（ディスク）プロンプトキャッシュの設定")
     pcache_set.add_argument("--disk-enabled", choices=["true", "false"], default=None)
     pcache_set.add_argument("--max-gb", type=int, default=None)
+    pcache_set.add_argument("--keep-generations", type=int, default=None,
+                            help="世代保持数（1〜10）")
+    pcache_set.add_argument("--memory-ratio", type=float, default=None,
+                            help="メモリキャッシュ比率（0〜0.5）")
+    pcache_set.add_argument("--branch-checkpoint", choices=["auto", "off"], default=None,
+                            help="分岐チェックポイント（auto/off）")
+    pcache_set.add_argument("--write-budget-gb", type=float, default=None,
+                            help="ディスク書き込み予算GB（0〜4096）")
     lmstudio = sub.add_parser("lmstudio").add_subparsers(dest="action", required=True)
     lm_base = lmstudio.add_parser("set-base-url"); lm_base.add_argument("url")
     lm_auto = lmstudio.add_parser("set-auto-load"); lm_auto.add_argument("value", choices=["true", "false"])
+    lm_enabled = lmstudio.add_parser("set-enabled"); lm_enabled.add_argument("value", choices=["true", "false"])
+    lm_folder = lmstudio.add_parser("set-folder"); lm_folder.add_argument("path", nargs="?", default="")
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
@@ -401,6 +437,11 @@ def execute(args, client: Client):
                 if not 1 <= args.max_replicas_per_model <= 8:
                     raise ValueError("モデルごとの並列数上限は1〜8で指定してください")
                 pool["maxReplicasPerModel"] = args.max_replicas_per_model
+            if getattr(args, "per_generation_headroom_gb", None) is not None:
+                headroom = args.per_generation_headroom_gb
+                if headroom != 0 and not 0.25 <= headroom <= 32:
+                    raise ValueError("同時生成ヘッドルームは0（自動）または0.25〜32 GBで指定してください")
+                pool["perGenerationHeadroomGB"] = headroom
             if not pool:
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings", {"models": {"pool": pool}}).json()
@@ -458,6 +499,8 @@ def execute(args, client: Client):
                 patch["verbatimProtection"] = args.verbatim_protection == "true"
             if args.soft_token is not None:
                 patch["softToken"] = args.soft_token == "true"
+            if getattr(args, "fallback_to_exact", None) is not None:
+                patch["fallbackToExact"] = args.fallback_to_exact == "true"
             if not patch:
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings",
@@ -483,11 +526,66 @@ def execute(args, client: Client):
                     "anthropic-api": "api.anthropic.enabled",
                     "remote-image-urls": "security.allowRemoteImageUrls",
                     "require-token": "api.requireToken",
-                    "continue-after-gui-exit": "general.continueAfterGUIExit"}
+                    "continue-after-gui-exit": "general.continueAfterGUIExit",
+                    "preload-last-model": "general.preloadLastModel",
+                    "lmstudio-enabled": "models.lmStudio.enabled"}
             return client.request("PUT", "/api/v1/settings",
                                   nested_patch(keys[args.name], args.value)).json()
         if args.action == "set-language":
             return client.request("PUT", "/api/v1/settings", {"general": {"language": args.language}}).json()
+        if args.action == "set-log-level":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"general": {"logLevel": args.level}}).json()
+        if args.action == "set-api-limits":
+            patch: dict = {}
+            if getattr(args, "max_request_bytes", None) is not None:
+                if not 0 <= args.max_request_bytes <= 4_294_967_296:
+                    raise ValueError("最大要求バイト数は0〜4,294,967,296で指定してください")
+                patch["maxRequestBytes"] = args.max_request_bytes
+            if getattr(args, "max_concurrent_connections", None) is not None:
+                if not 1 <= args.max_concurrent_connections <= 1024:
+                    raise ValueError("最大同時接続数は1〜1024で指定してください")
+                patch["maxConcurrentConnections"] = args.max_concurrent_connections
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"api": patch}).json()
+        if args.action == "set-generation-limits":
+            # Mirror the GUI's Settings > Models > "Generation limits" panel.
+            # Ranges match settings.py's _validate; the server re-validates
+            # the cross-field wired <= memory rule.
+            integer_ranges = {
+                "max_prompt_characters": ("maxPromptCharacters", 1, 10_000_000, "プロンプト最大文字数"),
+                "max_images": ("maxImages", 0, 128, "画像最大枚数"),
+                "max_image_bytes": ("maxImageBytes", 1, 2_147_483_648, "画像最大バイト数"),
+                "load_timeout_seconds": ("loadTimeoutSeconds", 10, 3600, "ロードタイムアウト"),
+                "token_idle_timeout_seconds": ("tokenIdleTimeoutSeconds", 5, 600, "トークン無出力タイムアウト"),
+                "stream_heartbeat_seconds": ("streamHeartbeatSeconds", 1, 30, "ストリームハートビート間隔"),
+                "total_timeout_seconds": ("totalTimeoutSeconds", 10, 7200, "全体タイムアウト"),
+                "cancel_grace_seconds": ("cancelGraceSeconds", 1, 30, "キャンセル猶予"),
+            }
+            ratio_ranges = {
+                "memory_limit_ratio": ("memoryLimitRatio", 0.5, 0.99, "メモリ上限比率"),
+                "wired_limit_ratio": ("wiredLimitRatio", 0.0, 0.95, "wired上限比率"),
+                "cache_limit_ratio": ("cacheLimitRatio", 0.0, 0.5, "キャッシュ上限比率"),
+            }
+            patch = {}
+            for field, (key, minimum, maximum, label) in integer_ranges.items():
+                value = getattr(args, field, None)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not minimum <= value <= maximum:
+                    raise ValueError(f"{label}は{minimum:,}〜{maximum:,}で指定してください")
+                patch[key] = value
+            for field, (key, minimum, maximum, label) in ratio_ranges.items():
+                value = getattr(args, field, None)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not minimum <= float(value) <= maximum:
+                    raise ValueError(f"{label}は{minimum}〜{maximum}で指定してください")
+                patch[key] = value
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"generation": patch}).json()
         if args.action == "set-max-tokens":
             if not 1 <= args.value <= 2_000_000:
                 raise ValueError("Max token上限は1〜2,000,000で指定してください")
@@ -606,8 +704,24 @@ def execute(args, client: Client):
                 if not 1 <= args.max_gb <= 100:
                     raise ValueError("ディスクキャッシュ上限は1〜100 GBで指定してください")
                 patch["diskMaxGB"] = args.max_gb
+            if getattr(args, "keep_generations", None) is not None:
+                if not 1 <= args.keep_generations <= 10:
+                    raise ValueError("世代保持数は1〜10で指定してください")
+                patch["keepGenerations"] = args.keep_generations
+            if getattr(args, "memory_ratio", None) is not None:
+                if not 0 <= args.memory_ratio <= 0.5:
+                    raise ValueError("メモリキャッシュ比率は0〜0.5で指定してください")
+                patch["memoryRatio"] = args.memory_ratio
+            if getattr(args, "branch_checkpoint", None) is not None:
+                patch["branchCheckpoint"] = args.branch_checkpoint
+            if getattr(args, "write_budget_gb", None) is not None:
+                if not 0 <= args.write_budget_gb <= 4096:
+                    raise ValueError("ディスク書き込み予算は0〜4096 GBで指定してください")
+                patch["diskWriteBudgetGB"] = args.write_budget_gb
             if not patch:
-                raise ValueError("--disk-enabled または --max-gb を指定してください")
+                raise ValueError("--disk-enabled、--max-gb、--keep-generations、"
+                                 "--memory-ratio、--branch-checkpoint、"
+                                 "--write-budget-gb のいずれかを指定してください")
             return client.request("PUT", "/api/v1/settings", {"promptCache": patch}).json()
     if args.command == "lmstudio":
         if args.action == "set-base-url":
@@ -616,6 +730,13 @@ def execute(args, client: Client):
         if args.action == "set-auto-load":
             return client.request("PUT", "/api/v1/settings",
                                   {"models": {"lmStudio": {"autoLoad": args.value == "true"}}}).json()
+        if args.action == "set-enabled":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"lmStudio": {"enabled": args.value == "true"}}}).json()
+        if args.action == "set-folder":
+            folder = (args.path or "").strip() or None
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"lmStudio": {"folder": folder}}}).json()
     if args.command == "rag":
         if args.action == "status":
             return client.request("GET", "/api/v1/rag/status").json()

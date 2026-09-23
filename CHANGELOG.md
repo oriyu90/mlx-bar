@@ -2,6 +2,34 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.4.0] - 2026-09-23
+
+v2.3.0までに搭載したOMLX相当機能の設定キーを、GUIの「Settings…」と`mlxbarctl`の
+namedコマンドの両方から管理できるようにしました。新規エンジン機能の追加はありません。
+将来phase用のゲート（RAMホット層、`hybridKVReuse`）は状態表示のみで、有効化手段は
+提供しません。
+
+### 追加
+
+- モデル常駐：モデルごとの並列数上限、同時生成ヘッドルーム（0＝自動導出）、常駐モデル別の
+  メモリ上限をGUIとCLIで設定。適用タイミング（再起動反映／新規レーンから反映）を画面に明示。
+- プロンプトキャッシュ詳細：世代保持数、メモリ比率、分岐チェックポイント、ディスク書き込み
+  予算をGUIと`mlxbarctl prompt-cache set`で設定。`memoryBlocks`は未計測のため無効固定のまま表示のみ。
+- 生成制限：プロンプト入力上限、画像上限、タイムアウト5種、メモリガード3比率をGUIと新規
+  `mlxbarctl config set-generation-limits`で設定。wired≤memoryの相互検査付き。
+- API要求上限：最大要求バイト数（0＝自動導出）、最大同時接続数をGUIと新規
+  `mlxbarctl config set-api-limits`で設定。
+- 一般・LM Studio：ログレベル、前回モデル復元、LM Studio連携の有効化とフォルダ選択／クリア。
+- RAG：埋め込みタイムアウト、バッチサイズ、コレクション上限をGUIから設定（CLIは既存）。
+- Adaptive Memory：失敗時EXACTフォールバックのトグルを追加。将来ゲート3種は表示のみ。
+- `hybridKVReuse: true`をサーバ検証で拒否（将来phase出荷時の無言有効化を防止するfail-closed）。
+
+### 安全性と互換性
+
+- 既定値は全てv2.3.0と同一。既存`config.json`はそのまま動作します。
+- 検証範囲は`settings.py:_validate`が唯一の正本で、GUI/CLIは同一範囲を mirror します。
+- 詳細は[`DESIGN_v2.4.0.md`](DESIGN_v2.4.0.md)、検証記録は[`TEST_PLAN_v2.4.0.md`](TEST_PLAN_v2.4.0.md)を参照してください。
+
 ## [2.3.0] - 2026-09-15
 
 oMLXの実装思想を参考に、mlx-lmのplain `KVCache`を固定長ブロックで永続化する

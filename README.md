@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.3.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.4.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -36,6 +36,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 既定で無効なローカル知識ベース（RAG）：文書分割・外部OpenAI互換`/v1/embeddings`での埋め込み生成・純Pythonのベクトル検索・取得文のプロンプト注入。リクエストに`rag`フィールドを付けたときだけ動作
 - 既定で無効な実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」（v2.2.0）：古い会話ターンをEXACT（逐語）／LATENT（短い要約、任意でソフトトークンのHybrid Prefill）／COLD（推論から除外、元メッセージから復元）へ動的に振り分けてTTFTとKVメモリを削減。コンテキスト自動圧縮とは排他。あらゆる失敗は通常のEXACT推論へ自動フォールバック
 - GUIと同じ管理APIを利用する`mlxbarctl`
+- OMLX相当機能の設定一元管理（v2.4.0）：モデル常駐上限・同時生成ヘッドルーム・モデル別メモリ上限、プロンプトキャッシュ詳細（世代保持・メモリ比率・分岐チェックポイント・書き込み予算）、生成の入力上限・タイムアウト・メモリガード比率、API要求上限、ログレベル、前回モデル復元、LM Studio連携、RAG埋め込み調整、Adaptive Memoryフォールバックを「Settings…」と`mlxbarctl`のnamedコマンドの両方から操作。将来phase用のゲート（RAMホット層・Hybrid KV再利用）は状態表示のみで有効化手段を提供しない
 
 ## 動作要件
 
@@ -46,7 +47,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.3.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.4.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -573,7 +574,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.3.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.4.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

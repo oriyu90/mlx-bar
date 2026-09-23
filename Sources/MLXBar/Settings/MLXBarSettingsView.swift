@@ -35,6 +35,10 @@ struct PromptCacheSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var diskEnabled = true
     @State private var diskMaxGB = 5
+    @State private var keepGenerations = 2
+    @State private var memoryRatio = 0.10
+    @State private var branchCheckpointAuto = true
+    @State private var writeBudgetGB = 32.0
     @State private var pagedEnabled = false
     @State private var pagedDiskEnabled = true
     @State private var pagedDiskMaxGB = 10
@@ -81,6 +85,30 @@ struct PromptCacheSettingsView: View {
                 Text(LS("ZCodeの長いsystem promptとtools定義をローカルディスクへ保存します。設定変更は次回のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section(LS("詳細キャッシュ設定")) {
+                Stepper("\(LS("世代保持数")): \(keepGenerations)", value: $keepGenerations, in: 1...10)
+                Stepper("\(LS("メモリ比率")): \(String(format: "%.2f", memoryRatio))",
+                        value: $memoryRatio, in: 0...0.5, step: 0.05)
+                Picker(LS("分岐チェックポイント"), selection: $branchCheckpointAuto) {
+                    Text(LS("自動")).tag(true)
+                    Text(LS("無効")).tag(false)
+                }
+                Stepper("\(LS("ディスク書き込み予算")): \(String(format: "%.0f", writeBudgetGB)) GB",
+                        value: $writeBudgetGB, in: 0...4096, step: 8)
+                Button(LS("詳細設定を適用")) {
+                    Task {
+                        await model.setPromptCacheAdvanced(
+                            keepGenerations: keepGenerations, memoryRatio: memoryRatio,
+                            branchCheckpoint: branchCheckpointAuto ? "auto" : "off",
+                            writeBudgetGB: writeBudgetGB)
+                    }
+                }.buttonStyle(.borderedProminent)
+                let blocks = configured["memoryBlocks"] as? String ?? "off"
+                LabeledContent(LS("インメモリブロックプール"),
+                               value: blocks == "auto" ? LS("有効") : LS("無効"))
+                Text(LS("長い会話1件のスナップショットはギガバイト級になるため、書き込み予算で上限を管理します。インメモリブロックプールは27B級ハイブリッドでの未計測のため、この版では無効固定です。設定変更は次回のモデルWorker起動時に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section(LS("Paged KVキャッシュ（実験）")) {
                 Toggle(LS("Paged KVキャッシュを有効化"), isOn: $pagedEnabled)
                 Toggle(LS("Paged SSD保存"), isOn: $pagedDiskEnabled)
@@ -118,6 +146,9 @@ struct PromptCacheSettingsView: View {
                 if rejected > 0 {
                     LabeledContent(LS("メモリ保護によるスキップ"), value: "\(rejected)")
                 }
+                LabeledContent(LS("メモリ層"), value: LS("無効（将来用）"))
+                Text(LS("RAMホット層とKV量子化は実機計測後の別phaseのため、この版ではSSD層のみです。"))
+                    .font(.caption).foregroundStyle(.secondary)
                 Button(LS("Pagedキャッシュを消去…"), role: .destructive) {
                     confirmsPagedClear = true
                 }
@@ -168,6 +199,10 @@ struct PromptCacheSettingsView: View {
             await model.refreshSettings()
             diskEnabled = configured["diskEnabled"] as? Bool ?? true
             diskMaxGB = (configured["diskMaxGB"] as? NSNumber)?.intValue ?? 5
+            keepGenerations = (configured["keepGenerations"] as? NSNumber)?.intValue ?? 2
+            memoryRatio = (configured["memoryRatio"] as? NSNumber)?.doubleValue ?? 0.10
+            branchCheckpointAuto = (configured["branchCheckpoint"] as? String ?? "auto") == "auto"
+            writeBudgetGB = (configured["diskWriteBudgetGB"] as? NSNumber)?.doubleValue ?? 32
             let paged = ((model.settings["experimental"] as? [String: Any])?["pagedKVCache"] as? [String: Any]) ?? [:]
             pagedEnabled = paged["enabled"] as? Bool ?? false
             pagedDiskEnabled = paged["diskEnabled"] as? Bool ?? true
@@ -291,6 +326,19 @@ struct GeneralSettingsView: View {
                 get: { general["launchAtLogin"] as? Bool ?? false },
                 set: { value in Task { await model.setLaunchAtLogin(value) } }
             ))
+            Picker(LS("ログレベル"), selection: Binding(
+                get: { general["logLevel"] as? String ?? "info" },
+                set: { value in Task { await model.setConfig("general.logLevel", value: value) } }
+            )) {
+                Text("debug").tag("debug")
+                Text("info").tag("info")
+                Text("warning").tag("warning")
+                Text("error").tag("error")
+            }
+            Toggle(LS("前回使用モデルを起動時に復元"), isOn: Binding(
+                get: { general["preloadLastModel"] as? Bool ?? true },
+                set: { value in Task { await model.setConfig("general.preloadLastModel", value: value) } }
+            ))
             Text(LS("バックグラウンド時は30秒間隔で状態を確認します。")).foregroundStyle(.secondary)
         }.padding()
     }
@@ -302,6 +350,17 @@ struct ModelSourceSettingsView: View {
     @State private var maxTokenLimit = 8192
     @State private var maxQueuedRequests = 16
     @State private var queueTimeoutSeconds = 3600
+    @State private var maxPromptChars = 100000
+    @State private var maxImages = 8
+    @State private var maxImageMB = 25
+    @State private var loadTimeoutSeconds = 600
+    @State private var tokenIdleTimeoutSeconds = 60
+    @State private var heartbeatSeconds = 10
+    @State private var totalTimeoutSeconds = 3600
+    @State private var cancelGraceSeconds = 5
+    @State private var memoryLimitPercent = 90
+    @State private var wiredLimitPercent = 80
+    @State private var cacheLimitPercent = 10
     @State private var defaultTemperature = 0.7
     @State private var defaultTopP = 1.0
     @State private var defaultRepetitionPenalty = 1.0
@@ -314,6 +373,7 @@ struct ModelSourceSettingsView: View {
     @State private var systemReserveGB = 4
     @State private var generationConcurrency = 2
     @State private var maxReplicasPerModel = 2
+    @State private var headroomGB = 0.0
     @State private var contextCompressionEnabled = false
     @State private var contextCompressionTriggerPercent = 70
     @State private var contextCompressionKeepTail = 8
@@ -327,10 +387,17 @@ struct ModelSourceSettingsView: View {
     @State private var adaptiveMemoryMaxLatentTokens = 256
     @State private var adaptiveMemoryMaxRetrievedSegments = 8
     @State private var adaptiveMemoryVerbatimProtection = true
+    @State private var adaptiveMemoryFallbackToExact = true
     @State private var pinnedModelIds: Set<String> = []
     @State private var pinnedModelReplicas: [String: Int] = [:]
+    @State private var pinnedModelMaxGB: [String: Int] = [:]
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
+    private var headroomLabel: String {
+        headroomGB == 0
+            ? "\(LS("同時生成ヘッドルーム")): \(LS("自動"))"
+            : "\(LS("同時生成ヘッドルーム")): \(String(format: "%.2f", headroomGB)) GB"
+    }
     var body: some View {
         // A plain `Form` doesn't reliably scroll on macOS when embedded in a
         // `NavigationSplitView` detail column, so this section's content (the
@@ -362,6 +429,8 @@ struct ModelSourceSettingsView: View {
                         value: $systemReserveGB, in: 1...128)
                 Stepper("\(LS("同時生成の上限")): \(generationConcurrency)",
                         value: $generationConcurrency, in: 1...8)
+                Stepper("\(LS("モデルごとの並列数上限")): \(maxReplicasPerModel)",
+                        value: $maxReplicasPerModel, in: 1...8)
                 Button(LS("モデル常駐設定を適用")) {
                     Task {
                         await model.setModelPoolSettings(
@@ -369,10 +438,19 @@ struct ModelSourceSettingsView: View {
                             ttl: idleTTLSeconds, perModelGB: perModelMaxGB,
                             totalRatio: Double(totalMemoryPercent) / 100,
                             reserveGB: systemReserveGB,
-                            generationConcurrency: generationConcurrency)
+                            generationConcurrency: generationConcurrency,
+                            maxReplicas: maxReplicasPerModel)
                     }
                 }.buttonStyle(.borderedProminent)
-                Text(LS("有効／無効の切り替えと同時生成の上限は次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。"))
+                Text(LS("有効／無効の切り替えと同時生成の上限、モデルごとの並列数上限は次回サービス起動時に反映されます。その他の上限は待機中モデルから安全に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Stepper(headroomLabel,
+                        value: $headroomGB, in: 0...32, step: 0.25)
+                Button(LS("同時生成ヘッドルームを適用")) {
+                    Task { await model.setGenerationHeadroom(headroomGB) }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("同時に生成する2件目以降の開始前に確保する予備メモリです。0（自動）ではモデルごとの上限から控えめな値を導出します。新しく開始する生成から反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 LabeledContent(LS("現在の常駐数"), value: "\(model.residentModelCount)")
@@ -433,6 +511,7 @@ struct ModelSourceSettingsView: View {
                         value: $adaptiveMemoryMaxRetrievedSegments, in: 1...64)
                 Toggle(LS("コード・数値・ツール出力をEXACTで保護"), isOn: $adaptiveMemoryVerbatimProtection)
                 Toggle(LS("ソフトトークンのHybrid Prefill（実験）"), isOn: $adaptiveMemorySoftToken)
+                Toggle(LS("失敗時は通常のEXACT推論へ戻す"), isOn: $adaptiveMemoryFallbackToExact)
                 Button(LS("アダプティブメモリ設定を適用")) {
                     Task {
                         await model.setAdaptiveMemorySettings(
@@ -444,9 +523,20 @@ struct ModelSourceSettingsView: View {
                             maxLatentTokens: adaptiveMemoryMaxLatentTokens,
                             maxRetrievedSegments: adaptiveMemoryMaxRetrievedSegments,
                             verbatimProtection: adaptiveMemoryVerbatimProtection,
-                            softToken: adaptiveMemorySoftToken)
+                            softToken: adaptiveMemorySoftToken,
+                            fallbackToExact: adaptiveMemoryFallbackToExact)
                     }
                 }.buttonStyle(.borderedProminent)
+                let adaptive = ((model.settings["experimental"] as? [String: Any])?["adaptiveMemory"] as? [String: Any]) ?? [:]
+                LabeledContent(LS("LATENT永続キャッシュ"),
+                               value: (adaptive["persistentLatentCache"] as? Bool) ?? true ? LS("有効") : LS("無効"))
+                LabeledContent(LS("Hybrid KV永続化"),
+                               value: (adaptive["persistentHybridKV"] as? Bool) ?? true ? LS("有効") : LS("無効"))
+                LabeledContent(LS("Hybrid KV再利用"),
+                               value: (adaptive["hybridKVReuse"] as? Bool) ?? false ? LS("有効") : LS("無効"))
+                Text(LS("Hybrid KV再利用は将来実装用のゲートです。この版では無効固定であり、ここからは変更できません。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Text(LS("実験的機能です。既定では無効です。古い会話を「EXACT／LATENT（短い要約）／COLD（推論から除外）」へ振り分けてTTFTとKVメモリを削減します。要約は元の発言そのものではありません。コンテキスト自動圧縮とは同時に使用できません。ソフトトークンのHybrid PrefillはApple Siliconでの実測用の試験実装で、対応していないモデルでは自動的にEXACTへフォールバックします。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -478,6 +568,16 @@ struct ModelSourceSettingsView: View {
                                         Task { await model.setModelReplicas(item.id, replicas: value) }
                                     }),
                                 in: 1...max(1, maxReplicasPerModel))
+                            .font(.caption)
+                            .padding(.leading, 20)
+                        Stepper("\(LS("メモリ上限")): \(pinnedModelMaxGB[item.id] ?? perModelMaxGB) GB",
+                                value: Binding(
+                                    get: { pinnedModelMaxGB[item.id] ?? perModelMaxGB },
+                                    set: { value in
+                                        pinnedModelMaxGB[item.id] = value
+                                        Task { await model.setModelMemoryLimit(item.id, maxGB: Double(value)) }
+                                    }),
+                                in: 1...512)
                             .font(.caption)
                             .padding(.leading, 20)
                     }
@@ -540,6 +640,74 @@ struct ModelSourceSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            Section(LS("プロンプト入力上限")) {
+                HStack {
+                    TextField(LS("最大文字数"), value: $maxPromptChars, format: .number)
+                        .frame(width: 160)
+                    Text(LS("文字"))
+                    Button(LS("適用")) {
+                        Task {
+                            await model.setPromptInputLimits(
+                                maxPromptChars: maxPromptChars, maxImages: maxImages,
+                                maxImageBytes: max(1, maxImageMB * 1_048_576))
+                        }
+                    }.buttonStyle(.borderedProminent)
+                }
+                Stepper("\(LS("画像最大枚数")): \(maxImages)", value: $maxImages, in: 0...128)
+                Stepper("\(LS("画像1件の上限")): \(maxImageMB) MB", value: $maxImageMB, in: 1...2048)
+                Button(LS("入力上限を適用")) {
+                    Task {
+                        await model.setPromptInputLimits(
+                            maxPromptChars: maxPromptChars, maxImages: maxImages,
+                            maxImageBytes: max(1, maxImageMB * 1_048_576))
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("上限を超えるプロンプトや画像は要求時に拒否されます。0枚にすると画像入力を全面禁止します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("生成タイムアウト")) {
+                Stepper("\(LS("モデルロード")): \(loadTimeoutSeconds) \(LS("秒"))",
+                        value: $loadTimeoutSeconds, in: 10...3600, step: 10)
+                Stepper("\(LS("トークン無出力")): \(tokenIdleTimeoutSeconds) \(LS("秒"))",
+                        value: $tokenIdleTimeoutSeconds, in: 5...600, step: 5)
+                Stepper("\(LS("ストリーム維持通知")): \(heartbeatSeconds) \(LS("秒"))",
+                        value: $heartbeatSeconds, in: 1...30)
+                Stepper("\(LS("全体")): \(totalTimeoutSeconds) \(LS("秒"))",
+                        value: $totalTimeoutSeconds, in: 10...7200, step: 10)
+                Stepper("\(LS("キャンセル猶予")): \(cancelGraceSeconds) \(LS("秒"))",
+                        value: $cancelGraceSeconds, in: 1...30)
+                Button(LS("タイムアウトを適用")) {
+                    Task {
+                        await model.setGenerationTimeouts(
+                            load: loadTimeoutSeconds, tokenIdle: tokenIdleTimeoutSeconds,
+                            heartbeat: heartbeatSeconds, total: totalTimeoutSeconds,
+                            cancelGrace: cancelGraceSeconds)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("応答が止まった生成の検出と打ち切りの条件です。短くしすぎると大きなモデルの初回ロードや長い生成が中断されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("メモリガード")) {
+                Stepper("\(LS("メモリ上限")): \(memoryLimitPercent)%",
+                        value: $memoryLimitPercent, in: 50...99)
+                Stepper("\(LS("wired上限")): \(wiredLimitPercent)%",
+                        value: $wiredLimitPercent, in: 0...95)
+                Stepper("\(LS("キャッシュ上限")): \(cacheLimitPercent)%",
+                        value: $cacheLimitPercent, in: 0...50)
+                Button(LS("メモリガードを適用")) {
+                    Task {
+                        await model.setMemoryGuardRatios(
+                            memory: Double(memoryLimitPercent) / 100,
+                            wired: Double(wiredLimitPercent) / 100,
+                            cache: Double(cacheLimitPercent) / 100)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("物理メモリに対するMLXの上限比率です。0%はその制限を無効化し、ランタイム既定に戻します。wired上限はメモリ上限を超えられません。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             Section(LS("追加フォルダ")) {
                 ForEach(roots, id: \.self) { path in
                     HStack {
@@ -575,6 +743,17 @@ struct ModelSourceSettingsView: View {
             let generation = model.settings["generation"] as? [String: Any] ?? [:]
             maxQueuedRequests = (generation["maxQueuedRequests"] as? NSNumber)?.intValue ?? 16
             queueTimeoutSeconds = (generation["queueTimeoutSeconds"] as? NSNumber)?.intValue ?? 3600
+            maxPromptChars = (generation["maxPromptCharacters"] as? NSNumber)?.intValue ?? 100000
+            maxImages = (generation["maxImages"] as? NSNumber)?.intValue ?? 8
+            maxImageMB = max(1, ((generation["maxImageBytes"] as? NSNumber)?.intValue ?? 26214400) / 1_048_576)
+            loadTimeoutSeconds = (generation["loadTimeoutSeconds"] as? NSNumber)?.intValue ?? 600
+            tokenIdleTimeoutSeconds = (generation["tokenIdleTimeoutSeconds"] as? NSNumber)?.intValue ?? 60
+            heartbeatSeconds = (generation["streamHeartbeatSeconds"] as? NSNumber)?.intValue ?? 10
+            totalTimeoutSeconds = (generation["totalTimeoutSeconds"] as? NSNumber)?.intValue ?? 3600
+            cancelGraceSeconds = (generation["cancelGraceSeconds"] as? NSNumber)?.intValue ?? 5
+            memoryLimitPercent = Int(((generation["memoryLimitRatio"] as? NSNumber)?.doubleValue ?? 0.90) * 100)
+            wiredLimitPercent = Int(((generation["wiredLimitRatio"] as? NSNumber)?.doubleValue ?? 0.80) * 100)
+            cacheLimitPercent = Int(((generation["cacheLimitRatio"] as? NSNumber)?.doubleValue ?? 0.10) * 100)
             let pool = ((model.settings["models"] as? [String: Any])?["pool"] as? [String: Any]) ?? [:]
             poolEnabled = pool["enabled"] as? Bool ?? true
             maxResidentModels = (pool["maxResidentModels"] as? NSNumber)?.intValue ?? 2
@@ -584,6 +763,7 @@ struct ModelSourceSettingsView: View {
             systemReserveGB = (pool["minimumSystemReserveGB"] as? NSNumber)?.intValue ?? 4
             generationConcurrency = (pool["generationConcurrency"] as? NSNumber)?.intValue ?? 2
             maxReplicasPerModel = (pool["maxReplicasPerModel"] as? NSNumber)?.intValue ?? 2
+            headroomGB = (pool["perGenerationHeadroomGB"] as? NSNumber)?.doubleValue ?? 0
             let compression = (model.settings["contextCompression"] as? [String: Any]) ?? [:]
             contextCompressionEnabled = compression["enabled"] as? Bool ?? false
             contextCompressionTriggerPercent = Int((((compression["triggerRatio"] as? NSNumber)?.doubleValue ?? 0.7) * 100).rounded())
@@ -599,6 +779,7 @@ struct ModelSourceSettingsView: View {
             adaptiveMemoryMaxLatentTokens = (adaptive["maxLatentTokens"] as? NSNumber)?.intValue ?? 256
             adaptiveMemoryMaxRetrievedSegments = (adaptive["maxRetrievedSegments"] as? NSNumber)?.intValue ?? 8
             adaptiveMemoryVerbatimProtection = adaptive["verbatimProtection"] as? Bool ?? true
+            adaptiveMemoryFallbackToExact = adaptive["fallbackToExact"] as? Bool ?? true
             let profiles = pool["profiles"] as? [[String: Any]] ?? []
             pinnedModelIds = Set(profiles
                 .filter { ($0["keepLoaded"] as? Bool) ?? false }
@@ -606,6 +787,14 @@ struct ModelSourceSettingsView: View {
             pinnedModelReplicas = Dictionary(
                 profiles.compactMap { profile in
                     (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
+                },
+                uniquingKeysWith: { first, _ in first })
+            let defaultGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
+            pinnedModelMaxGB = Dictionary(
+                profiles.compactMap { profile in
+                    (profile["modelId"] as? String).map {
+                        ($0, (profile["maxMemoryGB"] as? NSNumber)?.intValue ?? defaultGB)
+                    }
                 },
                 uniquingKeysWith: { first, _ in first })
         }
@@ -662,6 +851,8 @@ struct ModelSourceSettingsView: View {
 struct APISettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var port = 11435
+    @State private var maxRequestMB = 0
+    @State private var maxConnections = 64
     @State private var showsToken = false
     @State private var confirmsRegeneration = false
     @State private var confirmsLANEnable = false
@@ -704,8 +895,23 @@ struct APISettingsView: View {
                     }
                 }
             }
-            Section("Anthropic API (Claude Code)") {
-                Toggle(LS("Anthropic互換API（/anthropic）を有効化"), isOn: Binding(
+            Section(LS("要求上限")) {
+                Stepper("\(LS("最大要求サイズ")): \(maxRequestMB == 0 ? LS("自動") : "\(maxRequestMB) MB")",
+                        value: $maxRequestMB, in: 0...4096, step: 16)
+                Stepper("\(LS("最大同時接続数")): \(maxConnections)",
+                        value: $maxConnections, in: 1...1024)
+                Button(LS("要求上限を適用")) {
+                    Task {
+                        await model.setApiLimits(
+                            maxRequestBytes: max(0, maxRequestMB * 1_048_576),
+                            maxConnections: maxConnections)
+                    }
+                }.buttonStyle(.borderedProminent)
+                Text(LS("1要求の本文サイズ上限と同時接続数の上限です。0 MB（自動）では生成上限から上限を導出します。ポートやLAN公開の変更は上の項目で行います。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section("Anthropic API (Claude Code)") {                Toggle(LS("Anthropic互換API（/anthropic）を有効化"), isOn: Binding(
                     get: { (((model.settings["api"] as? [String: Any])?["anthropic"] as? [String: Any])?["enabled"] as? Bool) ?? true },
                     set: { value in Task { await model.setConfig("api.anthropic.enabled", value: value) } }
                 ))
@@ -756,7 +962,12 @@ struct APISettingsView: View {
             }
         }
         .padding()
-        .onAppear { port = Int(URL(string: model.apiURL)?.port ?? 11435) }
+        .onAppear {
+            port = Int(URL(string: model.apiURL)?.port ?? 11435)
+            let api = model.settings["api"] as? [String: Any] ?? [:]
+            maxRequestMB = ((api["maxRequestBytes"] as? NSNumber)?.intValue ?? 0) / 1_048_576
+            maxConnections = (api["maxConcurrentConnections"] as? NSNumber)?.intValue ?? 64
+        }
         .confirmationDialog(LS("APIキーを再生成しますか？"), isPresented: $confirmsRegeneration) {
             Button(LS("再生成"), role: .destructive) { Task { await model.regenerateAPIToken() } }
         } message: {
@@ -777,6 +988,7 @@ struct LMStudioSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var baseURL = "http://127.0.0.1:1234"
     @State private var showsToken = false
+    @State private var isSelectingFolder = false
     private var lmStudio: [String: Any] { ((model.settings["models"] as? [String: Any])?["lmStudio"] as? [String: Any]) ?? [:] }
     var body: some View {
         Form {
@@ -790,6 +1002,17 @@ struct LMStudioSettingsView: View {
                 }
             }
             Toggle(LS("自動ロード"), isOn: Binding(get: { lmStudio["autoLoad"] as? Bool ?? true }, set: { value in Task { await model.setConfig("models.lmStudio.autoLoad", value: value) } }))
+            Toggle(LS("LM Studio連携を有効化"), isOn: Binding(get: { lmStudio["enabled"] as? Bool ?? true }, set: { value in Task { await model.setConfig("models.lmStudio.enabled", value: value) } }))
+            HStack {
+                Text(lmStudio["folder"] as? String ?? LS("未設定"))
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button(LS("フォルダを選択…")) { chooseLMStudioFolder() }
+                    .disabled(isSelectingFolder)
+                Button(LS("クリア")) {
+                    Task { await model.setConfig("models.lmStudio.folder", value: NSNull()) }
+                }.disabled((lmStudio["folder"] as? String)?.isEmpty ?? true)
+            }
             HStack {
                 Button(LS("適用")) {
                     Task {
@@ -805,5 +1028,22 @@ struct LMStudioSettingsView: View {
             if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
             Text(LS("LM Studioが停止中でもMLXBarは動作を継続します。GGUFはLM Studio Providerのみに送られます。")).foregroundStyle(.secondary)
         }.padding().onAppear { baseURL = lmStudio["baseUrl"] as? String ?? baseURL }
+    }
+
+    private func chooseLMStudioFolder() {
+        isSelectingFolder = true
+        Task { @MainActor in
+            defer { isSelectingFolder = false }
+            switch await FileSelectionService.shared.chooseFolder() {
+            case .chosen(let urls):
+                if let url = urls.first {
+                    await model.setConfig("models.lmStudio.folder", value: url.path)
+                }
+            case .busy:
+                model.errorMessage = LS("別のファイル選択画面が開いています。先にそちらを閉じてください。")
+            case .cancelled:
+                break
+            }
+        }
     }
 }
