@@ -42,5 +42,5 @@ SHA-256は `2722c048b28b41bd8ceb725fd6ec1890bb1e94ab686d38cb6cba8d4fcbf11de6`。
 - [x] `studio-rizi.pages.dev/projects/mlx-bar/` の4言語、ダウンロードURL、構造化データ、トップNEWSを確認。
 
 結果: GitHub Release `v2.4.1` はLatest（draft=false / prerelease=false）。studio-rizi
-`（コミット後に記入）`のCloudflare Pages反映後、公開HTMLの `softwareVersion: 2.4.1`、
+`f63af88`のCloudflare Pages反映後、公開HTMLの `softwareVersion: 2.4.1`、
 4言語DMG名、`2026.09.23`の4言語UPDATEを確認した。
