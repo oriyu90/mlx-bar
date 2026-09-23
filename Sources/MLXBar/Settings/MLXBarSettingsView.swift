@@ -335,6 +335,8 @@ struct GeneralSettingsView: View {
                 Text("warning").tag("warning")
                 Text("error").tag("error")
             }
+            Text(LS("ログレベルの変更は次回サービス起動時に反映されます。"))
+                .font(.caption).foregroundStyle(.secondary)
             Toggle(LS("前回使用モデルを起動時に復元"), isOn: Binding(
                 get: { general["preloadLastModel"] as? Bool ?? true },
                 set: { value in Task { await model.setConfig("general.preloadLastModel", value: value) } }
@@ -704,7 +706,7 @@ struct ModelSourceSettingsView: View {
                             cache: Double(cacheLimitPercent) / 100)
                     }
                 }.buttonStyle(.borderedProminent)
-                Text(LS("物理メモリに対するMLXの上限比率です。0%はその制限を無効化し、ランタイム既定に戻します。wired上限はメモリ上限を超えられません。"))
+                Text(LS("物理メモリに対するMLXの上限比率です。0%はその制限を無効化し、ランタイム既定に戻します。wired上限はメモリ上限を超えられません。実行中の生成への反映にはモデルの再ロードが必要です。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -907,7 +909,7 @@ struct APISettingsView: View {
                             maxConnections: maxConnections)
                     }
                 }.buttonStyle(.borderedProminent)
-                Text(LS("1要求の本文サイズ上限と同時接続数の上限です。0 MB（自動）では生成上限から上限を導出します。ポートやLAN公開の変更は上の項目で行います。"))
+                Text(LS("1要求の本文サイズ上限と同時接続数の上限です。0 MB（自動）では生成上限から上限を導出します。1MB未満の値は0MBと表示されます。ポートやLAN公開の変更は上の項目で行います。同時接続数の変更は次回サービス起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

@@ -402,12 +402,12 @@
 "wired上限" = "Wired limit";
 "キャッシュ上限" = "Cache limit";
 "メモリガードを適用" = "Apply Memory Guard";
-"物理メモリに対するMLXの上限比率です。0%はその制限を無効化し、ランタイム既定に戻します。wired上限はメモリ上限を超えられません。" = "MLX ceilings as fractions of physical memory. 0% disables that limit and restores the runtime default. The wired limit cannot exceed the memory limit.";
+"物理メモリに対するMLXの上限比率です。0%はその制限を無効化し、ランタイム既定に戻します。wired上限はメモリ上限を超えられません。実行中の生成への反映にはモデルの再ロードが必要です。" = "MLX ceilings as fractions of physical memory. 0% disables that limit and restores the runtime default. The wired limit cannot exceed the memory limit. A running generation only picks the change up when its model reloads.";
 "要求上限" = "Request Limits";
 "最大要求サイズ" = "Max request size";
 "最大同時接続数" = "Max concurrent connections";
 "要求上限を適用" = "Apply Request Limits";
-"1要求の本文サイズ上限と同時接続数の上限です。0 MB（自動）では生成上限から上限を導出します。ポートやLAN公開の変更は上の項目で行います。" = "Caps a single request body and the concurrent connection count. 0 MB (automatic) derives the ceiling from the generation limits. Change the port or LAN exposure above.";
+"1要求の本文サイズ上限と同時接続数の上限です。0 MB（自動）では生成上限から上限を導出します。1MB未満の値は0MBと表示されます。ポートやLAN公開の変更は上の項目で行います。同時接続数の変更は次回サービス起動時に反映されます。" = "Caps a single request body and the concurrent connection count. 0 MB (automatic) derives the ceiling from the generation limits. Values under 1 MB display as 0 MB. Change the port or LAN exposure above. Connection-count changes take effect at the next service start.";
 "ログレベル" = "Log level";
 "前回使用モデルを起動時に復元" = "Restore the last used model at launch";
 "LM Studio連携を有効化" = "Enable LM Studio integration";
@@ -421,3 +421,4 @@
 "メモリ層" = "Memory tier";
 "無効（将来用）" = "Off (reserved for future use)";
 "RAMホット層とKV量子化は実機計測後の別phaseのため、この版ではSSD層のみです。" = "The RAM hot tier and KV quantization wait for on-device measurements in a later phase; this version offers the SSD tier only.";
+"ログレベルの変更は次回サービス起動時に反映されます。" = "Log level changes take effect at the next service start.";

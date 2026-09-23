@@ -39,6 +39,18 @@ DEFAULT_MAX_IMAGES = 8
 DEFAULT_MAX_IMAGE_BYTES = 26_214_400
 FALLBACK_MAX_REQUEST_BYTES = 512 << 20
 
+# general.logLevel is restart-latched: both uvicorn servers read it when they
+# start. SettingsStore._validate restricts it to these four, so a stored
+# value is always safe to hand to uvicorn; anything else falls back to warning.
+SERVER_LOG_LEVELS = ("debug", "info", "warning", "error")
+
+
+def server_log_level(settings) -> str:
+    """Uvicorn log level for the public and management listeners (v2.4.1)."""
+    data = getattr(settings, "data", {}) or {}
+    level = data.get("general", {}).get("logLevel", "warning")
+    return level if level in SERVER_LOG_LEVELS else "warning"
+
 
 def max_request_bytes(settings) -> int:
     """Largest request body the current settings could legitimately produce.
@@ -376,7 +388,7 @@ class PublicListener:
         except OSError as exc:
             listener_socket.close()
             raise RuntimeError(f"port {port} を使用できません: {exc}") from exc
-        config = uvicorn.Config(self.app, host=host, port=port, log_level="warning",
+        config = uvicorn.Config(self.app, host=host, port=port, log_level=server_log_level(self.state.settings),
                                 access_log=False, timeout_graceful_shutdown=60, lifespan="off",
                                 limit_concurrency=int(self.state.settings.data["api"].get(
                                     "maxConcurrentConnections", 64)))
@@ -541,7 +553,7 @@ async def serve(root: Path | None = None) -> None:
         except RuntimeError as exc:
             state.public_listener_error = str(exc)
     management = uvicorn.Server(uvicorn.Config(make_management_app(state), uds=str(socket_path),
-                                                log_level="warning", access_log=False,
+                                                log_level=server_log_level(state.settings), access_log=False,
                                                 timeout_graceful_shutdown=10, lifespan="off"))
     state.management_server = management
     management_task = asyncio.create_task(management.serve())

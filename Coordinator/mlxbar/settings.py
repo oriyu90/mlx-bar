@@ -462,6 +462,9 @@ class SettingsStore:
                 raise ValueError(f"rag.{key} must be between {minimum} and {maximum}")
         if data.get("general", {}).get("language") not in {"en", "ja"}:
             raise ValueError("general.language must be en or ja")
+        if data.get("general", {}).get("logLevel", "info") not in {"debug", "info", "warning", "error"}:
+            raise ValueError("general.logLevel must be debug, info, warning or error / "
+                             "general.logLevelはdebug/info/warning/errorで指定してください")
         if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):
             raise ValueError("general.preloadLastModel must be boolean")
         generation = data.get("generation", {})

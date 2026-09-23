@@ -384,5 +384,47 @@ class AdaptiveFallbackTests(unittest.TestCase):
                              ["fallbackToExact"])
 
 
+class LogLevelTests(unittest.TestCase):
+    def test_valid_levels_accepted(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(root=Path(directory))
+            for level in ("debug", "info", "warning", "error"):
+                public = store.update({"general": {"logLevel": level}})
+                self.assertEqual(public["general"]["logLevel"], level)
+
+    def test_invalid_level_rejected(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(root=Path(directory))
+            for level in ("verbose", "INFO", "", None):
+                with self.assertRaises(ValueError, msg=str(level)):
+                    store.update({"general": {"logLevel": level}})
+
+    def test_server_log_level_wiring(self):
+        from mlxbar.main import server_log_level, SERVER_LOG_LEVELS
+        from mlxbar.settings import DEFAULTS
+        from copy import deepcopy
+
+        class FakeSettings:
+            def __init__(self, data):
+                self.data = data
+
+        self.assertEqual(tuple(SERVER_LOG_LEVELS),
+                         ("debug", "info", "warning", "error"))
+        for level in SERVER_LOG_LEVELS:
+            data = deepcopy(DEFAULTS)
+            data["general"]["logLevel"] = level
+            self.assertEqual(server_log_level(FakeSettings(data)), level)
+        # Anything unexpected (e.g. a hand-edited config) falls back to
+        # warning instead of crashing uvicorn at listener startup.
+        data = deepcopy(DEFAULTS)
+        data["general"]["logLevel"] = "verbose"
+        self.assertEqual(server_log_level(FakeSettings(data)), "warning")
+        self.assertEqual(server_log_level(FakeSettings({})), "warning")
+
+
 if __name__ == "__main__":
     unittest.main()
