@@ -6,6 +6,7 @@ import json
 import platform
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -13,6 +14,11 @@ from fastapi.responses import StreamingResponse
 
 from .. import __version__
 from ..errors import MLXBarError
+from ..presets import apply_payload, status_payload
+from ..settings import deep_merge
+from ..settings_export import apply_import, build_export
+from ..system_info import collect as collect_hardware
+from ..system_info import lm_studio_default_folder
 
 
 router = APIRouter(prefix="/api/v1")
@@ -363,6 +369,16 @@ async def get_settings(request: Request):
     return state(request).settings.public()
 
 
+@router.get("/settings/export")
+async def export_settings(request: Request):
+    """Full settings plus version metadata for `config export` (v2.6.0).
+
+    Secrets are never included; they must be re-entered on the destination.
+    """
+    app = state(request)
+    return build_export(app.settings.public(), _hardware(app))
+
+
 @router.get("/prompt-cache")
 async def prompt_cache(request: Request):
     try:
@@ -594,3 +610,145 @@ async def system_reset(request: Request):
     """
     await state(request).reset_all()
     return {"status": "resetting"}
+
+
+def _hardware(app) -> dict:
+    return collect_hardware(app.root)
+
+
+@router.get("/system/hardware")
+async def system_hardware(request: Request):
+    """Live hardware inventory for presets, setup, and export (v2.6.0)."""
+    return _hardware(state(request))
+
+
+@router.get("/presets/status")
+async def presets_status(request: Request):
+    """Stored mode, effective mode, and both hardware-derived profiles."""
+    app = state(request)
+    return status_payload(app.settings.data, _hardware(app))
+
+
+@router.post("/presets/apply", status_code=202)
+async def presets_apply(request: Request, body: dict = Body(default_factory=dict)):
+    """Apply the light/full hardware profile, then rescan models.
+
+    Only keys a service restart does not require take effect immediately;
+    the KV quantization change is reported in `warnings` with the same
+    restart notice the Settings screen already shows.
+    """
+    mode = body.get("mode")
+    if mode not in {"light", "full"}:
+        raise HTTPException(400, detail={"code": "INVALID_PRESET_MODE",
+                                         "message": "modeはlight/fullで指定してください"})
+    app = state(request)
+    patch, record, warnings = apply_payload(mode, _hardware(app))
+    try:
+        values = app.settings.update(patch)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_SETTINGS", "message": str(exc)})
+    return {"mode": mode, "applied": record["values"], "warnings": warnings,
+            "settings": values, "scanJob": app.scan_job()}
+
+
+@router.post("/settings/import")
+async def import_settings(request: Request, body: dict):
+    """Apply an export envelope leaf-by-leaf (v2.6.0).
+
+    Leaves this machine cannot honor fail into `skipped` with a reason;
+    everything else applies in one atomic write.
+    """
+    app = state(request)
+    export = body.get("export")
+    if not isinstance(export, dict):
+        raise HTTPException(400, detail={"code": "INVALID_IMPORT",
+                                         "message": "exportを指定してください"})
+    try:
+        return apply_import(
+            app.settings, export,
+            port_available=lambda port: _port_available(app, port))
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_IMPORT", "message": str(exc)})
+
+
+def _port_available(app, port: int) -> bool:
+    return app.test_port(port, app.settings.data["api"]["host"]).get("available", False)
+
+
+@router.get("/setup/status")
+async def setup_status(request: Request):
+    """Whether the first-launch wizard must show (fresh installs only)."""
+    app = state(request)
+    setup = app.settings.data.get("setup", {}) or {}
+    completed = bool(setup.get("completed", False))
+    return {"required": bool(getattr(app.settings, "fresh_install", False)) and not completed,
+            "completed": completed,
+            "skipped": bool(setup.get("skipped", False)),
+            "version": setup.get("version"),
+            "freshInstall": bool(getattr(app.settings, "fresh_install", False)),
+            "hardware": _hardware(app)}
+
+
+@router.post("/setup/complete")
+async def setup_complete(request: Request, body: dict = Body(default_factory=dict)):
+    """Record the first-launch wizard result and apply its choices (v2.6.0).
+
+    `{"skipped": true}` changes nothing. Otherwise `choices` may carry
+    `modelsFolder` (added to models.roots when it is a real directory other
+    than the LM Studio default), `maxResidentModels` (1-8), and
+    `preset` (light/full, applied through the same path as /presets/apply).
+    """
+    app = state(request)
+    skipped = bool(body.get("skipped", False))
+    patch: dict = {}
+    scan_job = None
+    warnings: list[str] = []
+    if not skipped:
+        choices = body.get("choices") or {}
+        if not isinstance(choices, dict):
+            raise HTTPException(400, detail={"code": "INVALID_SETUP",
+                                             "message": "choicesを指定してください"})
+        folder = choices.get("modelsFolder")
+        if folder is not None:
+            if not isinstance(folder, str) or not folder.strip():
+                raise HTTPException(400, detail={"code": "INVALID_SETUP",
+                                                 "message": "modelsFolderが不正です"})
+            candidate = str(Path(folder).expanduser())
+            default_folder = lm_studio_default_folder()["defaultFolder"]
+            if candidate != default_folder:
+                if not Path(candidate).is_dir():
+                    raise HTTPException(400, detail={"code": "INVALID_SETUP",
+                                                     "message": "フォルダが存在しません"})
+                roots = list(app.settings.data.get("models", {}).get("roots", []))
+                if candidate not in roots:
+                    roots.append(candidate)
+                patch.setdefault("models", {})["roots"] = roots
+        max_resident = choices.get("maxResidentModels")
+        if max_resident is not None:
+            if (isinstance(max_resident, bool) or not isinstance(max_resident, int)
+                    or not 1 <= max_resident <= 8):
+                raise HTTPException(400, detail={"code": "INVALID_SETUP",
+                                                 "message": "maxResidentModelsは1〜8で指定してください"})
+            patch.setdefault("models", {}).setdefault("pool", {})["maxResidentModels"] = max_resident
+        preset = choices.get("preset")
+        if preset is not None:
+            if preset not in {"light", "full"}:
+                raise HTTPException(400, detail={"code": "INVALID_SETUP",
+                                                 "message": "presetはlight/fullで指定してください"})
+            preset_patch, _, preset_warnings = apply_payload(preset, _hardware(app))
+            patch = deep_merge(patch, preset_patch)
+            warnings.extend(preset_warnings)
+    patch.setdefault("setup", {}).update({
+        "completed": True,
+        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "skipped": skipped,
+        "version": __version__,
+    })
+    try:
+        values = app.settings.update(patch)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_SETTINGS", "message": str(exc)})
+    if not skipped:
+        scan_job = app.scan_job()
+    return {"completed": True, "skipped": skipped, "warnings": warnings,
+            "settings": values, "scanJob": scan_job}

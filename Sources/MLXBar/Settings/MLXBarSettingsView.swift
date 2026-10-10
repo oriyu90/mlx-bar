@@ -292,6 +292,26 @@ struct DiagnosticsSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
+                Text(LS("診断サマリ")).font(.headline)
+                Spacer()
+                Button(LS("更新")) { Task { await model.refreshDiagnosticsSummary() } }
+            }
+            if model.diagnosticsSummary.isEmpty {
+                Text(LS("版数・実行環境の概要を表示します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                LabeledContent(LS("アプリ版数"), value: model.diagnosticsSummary["version"] ?? "")
+                LabeledContent(LS("Python"), value: model.diagnosticsSummary["python"] ?? "")
+                Text(model.diagnosticsSummary["platform"] ?? "")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(model.diagnosticsSummary["root"] ?? "")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider()
+            HStack {
                 Text(LS("最近のAPIログ")).font(.headline)
                 Spacer()
                 Button(LS("更新")) { Task { await model.refreshRecentLogs() } }
@@ -314,7 +334,10 @@ struct DiagnosticsSettingsView: View {
             }
         }
         .padding()
-        .task { await model.refreshRecentLogs() }
+        .task {
+            await model.refreshRecentLogs()
+            await model.refreshDiagnosticsSummary()
+        }
         .confirmationDialog(LS("APIログを消去しますか？"), isPresented: $confirmsClear) {
             Button(LS("ログを消去"), role: .destructive) { Task { await model.clearRecentLogs() } }
             Button(LS("キャンセル"), role: .cancel) {}
@@ -366,9 +389,49 @@ struct DataRemovalSettingsView: View {
 
 struct GeneralSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
+    @State private var pendingPreset: String?
+    @State private var isImporting = false
     private var general: [String: Any] { model.settings["general"] as? [String: Any] ?? [:] }
+    private var effectivePreset: String {
+        if let effective = model.presetStatus["effective"] as? String { return effective }
+        return (model.settings["presets"] as? [String: Any])?["mode"] as? String ?? "custom"
+    }
     var body: some View {
+        ScrollView {
         Form {
+            Section(LS("一括設定モード")) {
+                Picker(LS("モード"), selection: Binding(
+                    get: { effectivePreset },
+                    set: { value in pendingPreset = value }
+                )) {
+                    Text(LS("軽量")).tag("light")
+                    Text(LS("フル")).tag("full")
+                    Text(LS("カスタム")).tag("custom")
+                }
+                Text(LS("軽量はKVキャッシュ8bit・メモリ上限はPCの80%・ディスク控えめで、すぐに使えます。フルはKVキャッシュbf16・ディスク少し多めです。カスタムは変更なしで記録だけします。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let message = model.presetMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            Section(LS("設定の書き出し・読み込み")) {
+                HStack {
+                    Button(LS("設定を書き出す…")) {
+                        Task { await exportSettings() }
+                    }
+                    Button(LS("設定を読み込む…")) { isImporting = true }
+                }
+                Text(LS("全設定と版数情報をJSONで書き出します。APIキー類は含みません。読み込み時はこのPCで適用できない項目だけ除外し、理由を表示します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let message = model.exportImportMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            Section(LS("言語・起動")) {
             Picker("Language", selection: Binding(
                 get: { model.guiLanguage },
                 set: { value in Task { await model.setGUILanguage(value) } }
@@ -404,7 +467,47 @@ struct GeneralSettingsView: View {
             Text(LS("バックグラウンド時は30秒間隔で状態を確認します。")).foregroundStyle(.secondary)
                 .font(.caption)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
         }.padding()
+        .task { await model.refreshPresetStatus() }
+        .confirmationDialog(LS("一括設定モードを適用しますか？"), isPresented: Binding(
+            get: { pendingPreset == "light" || pendingPreset == "full" },
+            set: { if !$0 { pendingPreset = nil } }
+        ), presenting: pendingPreset) { preset in
+            Button(LS(preset == "light" ? "軽量を適用" : "フルを適用")) {
+                pendingPreset = nil
+                Task { await model.applyPreset(mode: preset) }
+            }
+            Button(LS("キャンセル"), role: .cancel) { pendingPreset = nil }
+        } message: { preset in
+            Text(LS(preset == "light"
+                ? "KVキャッシュ8bit・メモリ上限80%など、ハードウェアに合わせた軽量設定を適用します。"
+                : "KVキャッシュbf16・ディスク少し多めなど、ハードウェアに合わせたフル設定を適用します。"))
+        }
+        .onChange(of: pendingPreset) { _, value in
+            if value == "custom" {
+                pendingPreset = nil
+                Task { await model.applyPreset(mode: "custom") }
+            }
+        }
+        .fileImporter(isPresented: $isImporting, allowedContentTypes: [.json]) { result in
+            if case .success(let url) = result {
+                Task { await model.importSettingsFile(url) }
+            }
+        }
+    }
+
+    private func exportSettings() async {
+        guard let text = await model.exportSettingsJSON() else { return }
+        guard let url = await FileSelectionService.shared.chooseSaveURL(
+            suggestedName: "mlxbar-settings.json") else { return }
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            model.exportImportMessage = LS("設定を書き出しました。APIキー類は含まれていません。")
+        } catch {
+            model.exportImportMessage = LS("書き出しに失敗しました。")
+        }
     }
 }
 

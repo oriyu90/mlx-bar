@@ -170,6 +170,11 @@ struct MenuBarView: View {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+        // First-launch wizard (v2.6.0): the coordinator reports `required`
+        // only on fresh installs, so updates never open this window.
+        .onChange(of: model.showSetupWizard) { _, shown in
+            if shown { open("setup") }
+        }
     }
 
     /// One row of the v1.10.0 unified model list: name (with a left-side copy

@@ -105,10 +105,11 @@ class WorkerSupervisor:
         return mode if mode in {"bf16", "8bit", "4bit"} else "bf16"
 
     def _configure_kv_quant_environment(self, env: dict[str, str], engine: str) -> None:
-        # Live KV quantization is an mlx-lm-only path. The mlx-vlm worker
-        # never reads these variables. bf16 (the default) leaves the
-        # environment untouched so v2.4.1 behaviour is byte-for-byte.
-        if engine != "mlx-lm":
+        # Live KV quantization reaches both workers (v2.6.0 extends the
+        # mlx-lm-only v2.5.0 path to mlx-vlm, whose generate_step accepts the
+        # same kv_bits/kv_group_size in 0.7.6). bf16 (the default) leaves the
+        # environment untouched so earlier behaviour is byte-for-byte.
+        if engine not in {"mlx-lm", "mlx-vlm"}:
             return
         mode = self._kv_quant_mode()
         if mode == "bf16":

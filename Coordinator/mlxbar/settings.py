@@ -211,6 +211,15 @@ DEFAULTS: dict[str, Any] = {
                  "allowRemoteImageUrls": False},
     "general": {"continueAfterGUIExit": True, "launchAtLogin": False, "logLevel": "info",
                 "language": "en", "preloadLastModel": True},
+    # Bulk setting mode (DESIGN_v2.6.0.md section 1). "custom" is the default
+    # so existing installs keep byte-identical behaviour and simply display
+    # as Custom. Selecting "custom" records the mode without changing any
+    # setting; light/full apply the hardware-derived profile in presets.py.
+    "presets": {"mode": "custom", "lastApplied": None},
+    # First-launch setup state (DESIGN_v2.6.0.md section 3). The wizard only
+    # shows on a genuinely fresh install (see SettingsStore.fresh_install);
+    # updates never trigger it. Completing or skipping records completed=true.
+    "setup": {"completed": False, "completedAt": None, "skipped": False, "version": None},
 }
 
 
@@ -242,6 +251,13 @@ class SettingsStore:
         (self.root / "control").mkdir(mode=0o700, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
         self.recovered_from: str | None = None
+        # True only when config.json did not exist and was just created with
+        # defaults: a genuinely fresh install. Updates (existing file),
+        # invalid-config recovery, and --home test setups that reuse a
+        # directory all leave this False. The first-launch wizard
+        # (DESIGN_v2.6.0.md section 3) keys off this transient flag plus
+        # setup.completed so it never appears on updates.
+        self.fresh_install: bool = False
         self.data = self._load()
         self._ensure_token()
 
@@ -249,6 +265,7 @@ class SettingsStore:
         if not self.path.exists():
             data = deepcopy(DEFAULTS)
             self._atomic_write(data)
+            self.fresh_install = True
             return data
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -481,6 +498,42 @@ class SettingsStore:
                              "general.logLevelはdebug/info/warning/errorで指定してください")
         if not isinstance(data.get("general", {}).get("preloadLastModel", True), bool):
             raise ValueError("general.preloadLastModel must be boolean")
+        presets = data.get("presets", {})
+        if presets.get("mode", "custom") not in {"light", "full", "custom"}:
+            raise ValueError("presets.mode must be light, full or custom / "
+                             "presets.modeはlight/full/customで指定してください")
+        last_applied = presets.get("lastApplied", None)
+        if last_applied is not None and not isinstance(last_applied, dict):
+            raise ValueError("presets.lastApplied must be an object or null")
+        setup = data.get("setup", {})
+        if not isinstance(setup.get("completed", False), bool):
+            raise ValueError("setup.completed must be boolean")
+        if not isinstance(setup.get("skipped", False), bool):
+            raise ValueError("setup.skipped must be boolean")
+        completed_at = setup.get("completedAt", None)
+        if completed_at is not None and not isinstance(completed_at, str):
+            raise ValueError("setup.completedAt must be a string or null")
+        setup_version = setup.get("version", None)
+        if setup_version is not None and not isinstance(setup_version, str):
+            raise ValueError("setup.version must be a string or null")
+        runtimes = data.get("runtimes", {})
+        for engine in ("mlx-lm", "mlx-vlm"):
+            channel = (runtimes.get(engine, {}) or {}).get("channel", "stable")
+            if channel not in {"stable"}:
+                raise ValueError(f"runtimes.{engine}.channel must be stable in this version")
+            auto_check = (runtimes.get(engine, {}) or {}).get("autoCheck", False)
+            if not isinstance(auto_check, bool):
+                raise ValueError(f"runtimes.{engine}.autoCheck must be boolean")
+        if not isinstance(runtimes.get("autoInstallMissing", True), bool):
+            raise ValueError("runtimes.autoInstallMissing must be boolean")
+        check_interval = runtimes.get("checkIntervalHours", 168)
+        if (isinstance(check_interval, bool) or not isinstance(check_interval, int)
+                or not 1 <= check_interval <= 87600):
+            raise ValueError("runtimes.checkIntervalHours must be between 1 and 87600")
+        keep_slots = runtimes.get("keepSlots", 3)
+        if (isinstance(keep_slots, bool) or not isinstance(keep_slots, int)
+                or not 0 <= keep_slots <= 100):
+            raise ValueError("runtimes.keepSlots must be between 0 and 100")
         generation = data.get("generation", {})
         integer_ranges = {
             "maxTokens": (1, 2_000_000),

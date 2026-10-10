@@ -69,6 +69,39 @@ final class FileSelectionService {
         return await present(panel)
     }
 
+    func chooseJSONFile(startingAt directory: URL? = nil) async -> Selection {
+        let panel = NSOpenPanel()
+        panel.title = LS("設定ファイルを選択")
+        panel.prompt = LS("読み込む")
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.directoryURL = validDirectory(directory)
+        return await present(panel)
+    }
+
+    /// Save-panel counterpart of `present(_:)` for settings export.
+    func chooseSaveURL(suggestedName: String) async -> URL? {
+        if activePanel != nil { return nil }
+        let panel = NSSavePanel()
+        panel.title = LS("設定ファイルの保存先")
+        panel.prompt = LS("書き出す")
+        panel.nameFieldStringValue = suggestedName
+        panel.allowedContentTypes = [.json]
+        panel.level = .floating
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        return await withCheckedContinuation { continuation in
+            panel.begin { response in
+                let url = response == .OK ? panel.url : nil
+                panel.orderOut(nil)
+                continuation.resume(returning: url)
+            }
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
     private func validDirectory(_ url: URL?) -> URL? {
         guard let url else { return nil }
         var isDirectory: ObjCBool = false

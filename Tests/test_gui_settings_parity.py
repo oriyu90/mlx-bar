@@ -467,5 +467,76 @@ class LogLevelTests(unittest.TestCase):
         self.assertEqual(server_log_level(FakeSettings({})), "warning")
 
 
+class PresetApplyContractTests(unittest.TestCase):
+    """v2.6.0: the General panel's preset picker payload shape.
+
+    The GUI sends the six managed keys plus the mode record in one PUT
+    (the same shape POST /presets/apply builds server-side); selecting
+    Custom sends only the mode record.
+    """
+
+    def test_light_apply_payload_accepted(self):
+        import tempfile
+        from pathlib import Path
+        from mlxbar.presets import apply_payload
+        hardware = {"memory": {"physicalGB": 96}, "disk": {"freeGB": 500}}
+        patch, record, _warnings = apply_payload("light", hardware)
+        with tempfile.TemporaryDirectory() as directory:
+            public = SettingsStore(root=Path(directory)).update(patch)
+        self.assertEqual(public["presets"]["mode"], "light")
+        self.assertEqual(public["experimental"]["kvCacheQuantization"]["mode"], "8bit")
+        self.assertEqual(public["models"]["pool"]["totalMemoryRatio"], 0.80)
+        self.assertEqual(record["mode"], "light")
+
+    def test_custom_selection_changes_nothing(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            public = SettingsStore(root=Path(directory)).update(
+                {"presets": {"mode": "custom"}})
+        self.assertEqual(public["models"]["pool"]["totalMemoryRatio"], 0.75)
+        self.assertEqual(public["experimental"]["kvCacheQuantization"]["mode"], "bf16")
+
+
+class RuntimeSettingsContractTests(unittest.TestCase):
+    """v2.6.0: the Runtime panel's settings payload mirrors set-runtime."""
+
+    def test_runtime_payload_accepted(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            public = SettingsStore(root=Path(directory)).update({
+                "runtimes": {"mlx-lm": {"autoCheck": True},
+                             "checkIntervalHours": 24, "keepSlots": 5}})
+        self.assertTrue(public["runtimes"]["mlx-lm"]["autoCheck"])
+        self.assertEqual(public["runtimes"]["checkIntervalHours"], 24)
+
+    def test_runtime_cli_ranges_rejected(self):
+        args = argparse.Namespace(
+            command="config", action="set-runtime",
+            channel_mlx_lm=None, channel_mlx_vlm=None,
+            auto_check_mlx_lm=None, auto_check_mlx_vlm=None,
+            auto_install_missing=None, check_interval_hours=0, keep_slots=None)
+        with self.assertRaises(ValueError):
+            execute(args, Mock())
+
+
+class ModelMemoryLimitContractTests(unittest.TestCase):
+    """v2.6.0: `model set-memory-limit` keeps every other profile field."""
+
+    def test_memory_limit_payload_accepted(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(root=Path(directory))
+            store.update({"models": {"pool": {"profiles": [
+                {"modelId": "a", "keepLoaded": True, "replicas": 2}]}}})
+            public = store.update({"models": {"pool": {"profiles": [
+                {"modelId": "a", "keepLoaded": True, "replicas": 2,
+                 "maxMemoryGB": 48}]}}})
+        self.assertEqual(public["models"]["pool"]["profiles"][0]["maxMemoryGB"], 48)
+        self.assertEqual(public["models"]["pool"]["profiles"][0]["replicas"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

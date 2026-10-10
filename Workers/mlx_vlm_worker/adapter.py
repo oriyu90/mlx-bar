@@ -52,6 +52,15 @@ class MLXVLMAdapter(BaseAdapter):
         self._persisted_tokens = 0
         self._chars_per_token = 0.0
         self._cold_prompt_tps = 0.0
+        # Live KV quantization (v2.6.0 extends the v2.5.0 mlx-lm path).
+        # bf16 leaves everything untouched; 8bit/4bit quantize text-only
+        # generations and keep a mode-suffixed namespace so precisions
+        # never share bytes.
+        self.kv_mode = "bf16"
+        self.kv_bits: int | None = None
+        self.kv_group_size = 64
+        self.kv_start = 0
+        self.kv_fallback_reason: str | None = None
 
     def capabilities(self) -> dict:
         result = super().capabilities()
@@ -60,11 +69,63 @@ class MLXVLMAdapter(BaseAdapter):
         result["promptCache"] = self.prompt_cache_stats()
         result["cacheBudget"] = dict(self.cache_budget)
         result["rollbackCapability"] = self.rollback_capability
+        result["kvQuant"] = self._kv_quant_status()
         return result
 
     @staticmethod
     def _truthy(value: str | None) -> bool:
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _init_kv_quant_from_env(self) -> None:
+        """Read the coordinator-latched quantization mode without failing load.
+
+        Unknown or malformed values fall back to full-precision bf16: losing
+        a memory saving must never keep a model from loading.
+        """
+        raw_bits = (os.environ.get("MLXBAR_KV_QUANT_BITS") or "").strip()
+        raw_mode = (os.environ.get("MLXBAR_KV_QUANT_MODE") or "").strip()
+        try:
+            group_size = int(os.environ.get("MLXBAR_KV_QUANT_GROUP_SIZE", "64"))
+        except (TypeError, ValueError):
+            group_size = 64
+        try:
+            start = int(os.environ.get("MLXBAR_KV_QUANT_START", "0"))
+        except (TypeError, ValueError):
+            start = 0
+        if group_size not in {32, 64, 128}:
+            group_size = 64
+        if start < 0:
+            start = 0
+        self.kv_group_size = group_size
+        self.kv_start = start
+        self.kv_fallback_reason = None
+        if raw_bits == "8" or raw_mode == "8bit":
+            self.kv_bits, self.kv_mode = 8, "8bit"
+        elif raw_bits == "4" or raw_mode == "4bit":
+            self.kv_bits, self.kv_mode = 4, "4bit"
+        else:
+            self.kv_bits, self.kv_mode = None, "bf16"
+
+    def _kv_generate_kwargs(self) -> dict:
+        if self.kv_bits is None:
+            return {}
+        return {"kv_bits": self.kv_bits, "kv_group_size": self.kv_group_size,
+                "quantized_kv_start": self.kv_start}
+
+    def _kv_quant_status(self) -> dict:
+        return {
+            "mode": self.kv_mode,
+            "bits": self.kv_bits,
+            "groupSize": self.kv_group_size,
+            "quantizedStart": self.kv_start,
+            "active": self.kv_bits is not None,
+            "fallbackReason": self.kv_fallback_reason,
+        }
+
+    def _kv_namespace_suffix(self) -> str:
+        # bf16 keeps the pre-v2.6.0 namespace byte-for-byte so existing disk
+        # caches survive the upgrade; quantized modes get their own.
+        return "" if self.kv_bits is None else f"-kv-{self.kv_mode}"
 
     @staticmethod
     def _model_fingerprint(path: Path, runtime_version: str) -> str:
@@ -132,7 +193,8 @@ class MLXVLMAdapter(BaseAdapter):
             self.apc_root = Path(root_value)
             self.apc_root.mkdir(parents=True, exist_ok=True)
             os.chmod(self.apc_root, 0o700)
-            self.apc_namespace = APC_NAMESPACE_PREFIX + fingerprint
+            self.apc_namespace = (APC_NAMESPACE_PREFIX + fingerprint
+                                   + self._kv_namespace_suffix())
             maximum = int(os.environ.get("MLXBAR_PROMPT_CACHE_MAX_BYTES", str(5 << 30)))
             disk = DiskBlockStore(
                 self.apc_root,
@@ -316,6 +378,7 @@ class MLXVLMAdapter(BaseAdapter):
             "budget": dict(self.cache_budget),
             "lastColdReason": self.last_cold_reason,
             "promptGrowthTokens": self.prompt_growth,
+            "kvQuant": self._kv_quant_status(),
         }
         if self.checkpoints is not None:
             result["checkpoint"] = self.checkpoints.stats()
@@ -432,7 +495,8 @@ class MLXVLMAdapter(BaseAdapter):
             runtime_version = importlib.metadata.version("mlx-vlm")
         except Exception:
             runtime_version = "unknown"
-        namespace = f"mlxbar-vlm-ckpt-v1-{self._model_fingerprint(Path(model_path), runtime_version)}"
+        namespace = (f"mlxbar-vlm-ckpt-v1-{self._model_fingerprint(Path(model_path), runtime_version)}"
+                     f"{self._kv_namespace_suffix()}")
         disk_enabled = self._truthy(os.environ.get("MLXBAR_PROMPT_CACHE_DISK_ENABLED", "1"))
         self.checkpoints = CheckpointStore(
             root=(Path(root_value) / "checkpoints") if root_value else None,
@@ -487,6 +551,7 @@ class MLXVLMAdapter(BaseAdapter):
         # how the APC pool and the checkpoint store are sized.
         self.cache_budget = cache_state.model_cache_budget(config)
         self._probe_rollback_capability()
+        self._init_kv_quant_from_env()
         self._init_apc(path)
         self._init_checkpoints(path)
         self._log_cache_plan()
@@ -651,6 +716,11 @@ class MLXVLMAdapter(BaseAdapter):
                 self._tune_apc_guard()
                 kwargs["apc_manager"] = self.apc_manager
                 kwargs["apc_tenant"] = "mlxbar-local"
+        if not images and self.kv_bits is not None:
+            # Quantized live KV is text-only: image turns never share the
+            # token cache, and mixing precisions across modalities is an
+            # unmeasured combination. Image requests stay on the bf16 path.
+            kwargs.update(self._kv_generate_kwargs())
         estimate = self._prefill_estimate(prompt)
         if estimate is not None:
             yield {"type": "prefill_estimate", **estimate}
@@ -694,42 +764,71 @@ class MLXVLMAdapter(BaseAdapter):
             except Exception as exc:
                 apc_failed = kwargs.get("apc_manager") is not None and self._is_apc_failure(exc)
                 reuse_failed = kwargs.get("prompt_cache_state") is not None and self._is_cache_reuse_failure(exc)
-                if not (apc_failed or reuse_failed) or received_response:
+                quant_failed = ("kv_bits" in kwargs and not received_response
+                                and not apc_failed and not reuse_failed)
+                if quant_failed:
+                    # The quantized path failed before producing anything, so
+                    # retrying once at full precision cannot double-emit. The
+                    # reason is recorded in kvQuant for status, mirroring the
+                    # mlx-lm worker's first-output-only retry contract.
+                    self.kv_fallback_reason = f"first_evaluation:{type(exc).__name__}"
+                    LOGGER.warning("Quantized KV failed before first output; "
+                                   "retrying once at bf16: %s", exc)
+                    for key in ("kv_bits", "kv_group_size", "quantized_kv_start"):
+                        kwargs.pop(key, None)
+                    self._reset_prompt_cache()
+                    kwargs["prompt_cache_state"] = self.prompt_cache_state
+                    last_response = None
+                    generated_ids = []
+                    for response in stream_generate(**kwargs):
+                        _collect_token(generated_ids, response)
+                        if request_id in self.cancelled:
+                            return
+                        generated += 1
+                        last_response = response
+                        text = getattr(response, "text", response if isinstance(response, str) else "")
+                        if text:
+                            yield {"type": "delta", "text": text, **_live_progress(response)}
+                        elif ticker.due():
+                            yield {"type": "token_progress", **_live_progress(response)}
+                    completed = True
+                elif not (apc_failed or reuse_failed) or received_response:
                     if apc_failed:
                         self._disable_apc_after_failure(exc)
                     raise
-                # Reuse can fail because a runtime or cache format changed, or
-                # because the runtime cannot roll a cache back to a shorter
-                # shared prefix for this architecture. Before anything was
-                # emitted it is safe to retry once with a fresh cache, which
-                # skips reuse entirely for this request.
-                retry_probe = dict(getattr(self.prompt_cache_state, "last_probe", None) or {})
-                retry_probe.update({"action": "cold",
-                                    "reason": cache_state.COLD_REUSE_UNSUPPORTED})
-                if apc_failed:
-                    self._disable_apc_after_failure(exc)
-                    kwargs.pop("apc_manager", None)
-                    kwargs.pop("apc_tenant", None)
                 else:
-                    logging.getLogger(__name__).warning(
-                        "Prompt cache reuse failed; retrying with a fresh cache: %s", exc)
-                    self.prompt_cache_reuse_failures += 1
-                self._reset_prompt_cache()
-                kwargs["prompt_cache_state"] = self.prompt_cache_state
-                last_response = None
-                generated_ids = []
-                for response in stream_generate(**kwargs):
-                    _collect_token(generated_ids, response)
-                    if request_id in self.cancelled:
-                        return
-                    generated += 1
-                    last_response = response
-                    text = getattr(response, "text", response if isinstance(response, str) else "")
-                    if text:
-                        yield {"type": "delta", "text": text, **_live_progress(response)}
-                    elif ticker.due():
-                        yield {"type": "token_progress", **_live_progress(response)}
-                completed = True
+                    # Reuse can fail because a runtime or cache format changed, or
+                    # because the runtime cannot roll a cache back to a shorter
+                    # shared prefix for this architecture. Before anything was
+                    # emitted it is safe to retry once with a fresh cache, which
+                    # skips reuse entirely for this request.
+                    retry_probe = dict(getattr(self.prompt_cache_state, "last_probe", None) or {})
+                    retry_probe.update({"action": "cold",
+                                        "reason": cache_state.COLD_REUSE_UNSUPPORTED})
+                    if apc_failed:
+                        self._disable_apc_after_failure(exc)
+                        kwargs.pop("apc_manager", None)
+                        kwargs.pop("apc_tenant", None)
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "Prompt cache reuse failed; retrying with a fresh cache: %s", exc)
+                        self.prompt_cache_reuse_failures += 1
+                    self._reset_prompt_cache()
+                    kwargs["prompt_cache_state"] = self.prompt_cache_state
+                    last_response = None
+                    generated_ids = []
+                    for response in stream_generate(**kwargs):
+                        _collect_token(generated_ids, response)
+                        if request_id in self.cancelled:
+                            return
+                        generated += 1
+                        last_response = response
+                        text = getattr(response, "text", response if isinstance(response, str) else "")
+                        if text:
+                            yield {"type": "delta", "text": text, **_live_progress(response)}
+                        elif ticker.due():
+                            yield {"type": "token_progress", **_live_progress(response)}
+                    completed = True
         finally:
             if not completed and kwargs.get("prompt_cache_state") is not None:
                 # stream_generate mutates a reused cache in place, and it only

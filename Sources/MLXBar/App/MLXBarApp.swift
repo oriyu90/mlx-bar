@@ -36,5 +36,12 @@ struct MLXBarApp: App {
                 .frame(minWidth: 820, idealWidth: 920, minHeight: 620, idealHeight: 720)
                 .environment(\.locale, Locale(identifier: model.guiLanguage))
         }
+        // First-launch setup wizard (v2.6.0). Opened from MenuBarView when
+        // the coordinator reports a fresh install; closing it records a skip.
+        Window("Setup", id: "setup") {
+            SetupWizardView(model: model)
+                .frame(minWidth: 560, minHeight: 480)
+                .environment(\.locale, Locale(identifier: model.guiLanguage))
+        }
     }
 }

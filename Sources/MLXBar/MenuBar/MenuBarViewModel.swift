@@ -292,6 +292,14 @@ final class MenuBarViewModel: ObservableObject {
     @Published var updatingEngines: Set<String> = []
     @Published var checkingRuntimeEngines: Set<String> = []
     @Published var runtimeJobs: [String: RuntimeJobInfo] = [:]
+    // Bulk presets + setup wizard + settings export/import (v2.6.0).
+    @Published var presetStatus: [String: Any] = [:]
+    @Published var presetMessage: String?
+    @Published var setupStatus: [String: Any] = [:]
+    @Published var showSetupWizard = false
+    @Published var setupMessage: String?
+    @Published var exportImportMessage: String?
+    @Published var diagnosticsSummary: [String: String] = [:]
     @Published var busy = false
     @Published var errorMessage: String?
     @Published var chatOutput = ""
@@ -370,6 +378,7 @@ final class MenuBarViewModel: ObservableObject {
         started = true
         do { try await client.startService() } catch { errorMessage = presentError(error) }
         await refreshAll()
+        await refreshSetupStatus()
         polling?.cancel()
         polling = Task { [weak self] in
             while !Task.isCancelled {
@@ -1255,6 +1264,127 @@ final class MenuBarViewModel: ObservableObject {
                 "The setting applies the next time the model worker starts",
                 "設定は次にモデルWorkerを起動したときに反映されます")
         }
+    }
+
+    // MARK: - Bulk presets (v2.6.0)
+
+    /// Stored mode, effective mode, and both hardware-derived profiles.
+    func refreshPresetStatus() async {
+        do {
+            if let status = try await json("GET", "/api/v1/presets/status") as? [String: Any] {
+                presetStatus = status
+            }
+        } catch { presetMessage = presentError(error) }
+    }
+
+    /// Applies light/full through POST /presets/apply; records custom without
+    /// changing any setting. Ranges are enforced server-side; the GUI only
+    /// mirrors the mode names.
+    func applyPreset(mode: String) async {
+        guard ["light", "full", "custom"].contains(mode) else {
+            errorMessage = ui("Preset must be light, full or custom",
+                              "一括設定モードは軽量/フル/カスタムで指定してください")
+            return
+        }
+        await perform {
+            if mode == "custom" {
+                _ = try await self.json("PUT", "/api/v1/settings", ["presets": ["mode": "custom"]])
+                await self.refreshSettings()
+                await self.refreshPresetStatus()
+                self.presetMessage = self.ui("Recorded as Custom. No settings were changed.",
+                                             "カスタムとして記録しました。設定は変更していません。")
+                return
+            }
+            guard let result = try await self.json(
+                "POST", "/api/v1/presets/apply", ["mode": mode]) as? [String: Any] else { return }
+            await self.refreshSettings()
+            await self.refreshPresetStatus()
+            let warnings = (result["warnings"] as? [String]) ?? []
+            let applied = self.ui("Applied the \(mode) profile.", "プロファイルを適用しました。")
+            self.presetMessage = ([applied] + warnings).joined(separator: "\n")
+        }
+    }
+
+    // MARK: - First-launch setup (v2.6.0)
+
+    /// Polls once at startup; the wizard shows only on fresh installs.
+    func refreshSetupStatus() async {
+        do {
+            if let status = try await json("GET", "/api/v1/setup/status") as? [String: Any] {
+                setupStatus = status
+                if status["required"] as? Bool == true { showSetupWizard = true }
+            }
+        } catch { setupMessage = presentError(error) }
+    }
+
+    /// Completes the wizard (or records a skip) and hides it.
+    func completeSetup(skipped: Bool, choices: [String: Any]? = nil) async {
+        await perform {
+            var body: [String: Any] = ["skipped": skipped]
+            if let choices { body["choices"] = choices }
+            _ = try await self.json("POST", "/api/v1/setup/complete", body)
+            await self.refreshSettings()
+            await self.refreshSetupStatus()
+            self.showSetupWizard = false
+        }
+    }
+
+    // MARK: - Settings export / import (v2.6.0)
+
+    /// Pretty JSON text of GET /settings/export for the save panel.
+    func exportSettingsJSON() async -> String? {
+        do {
+            let export = try await json("GET", "/api/v1/settings/export")
+            let data = try JSONSerialization.data(withJSONObject: export,
+                                                  options: [.prettyPrinted, .sortedKeys])
+            return String(decoding: data, as: UTF8.self)
+        } catch { exportImportMessage = presentError(error); return nil }
+    }
+
+    /// Posts a file chosen in the GUI to POST /settings/import and reports
+    /// what applied and what had to be skipped on this machine.
+    func importSettingsFile(_ url: URL) async {
+        await perform {
+            let raw = try Data(contentsOf: url)
+            guard let envelope = try JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+                throw ClientError.command(self.ui("The file is not a settings export.",
+                                                  "設定ファイルとして読み込めませんでした"))
+            }
+            guard let result = try await self.json(
+                "POST", "/api/v1/settings/import", ["export": envelope]) as? [String: Any] else { return }
+            await self.refreshSettings()
+            await self.refreshPresetStatus()
+            let applied = (result["applied"] as? [String]) ?? []
+            let skipped = (result["skipped"] as? [[String: Any]]) ?? []
+            var lines = [self.ui("Applied \(applied.count) settings.",
+                                 "\(applied.count)件の設定を適用しました。")]
+            if !skipped.isEmpty {
+                lines.append(self.ui("\(skipped.count) items were left unchanged:",
+                                      "\(skipped.count)件は変更しませんでした:"))
+                lines += skipped.prefix(8).map { entry in
+                    "• \(entry["key"] as? String ?? "?"): \(entry["reason"] as? String ?? "")"
+                }
+                if skipped.count > 8 {
+                    lines.append(self.ui("…and \(skipped.count - 8) more.",
+                                          "…ほか\(skipped.count - 8)件"))
+                }
+            }
+            self.exportImportMessage = lines.joined(separator: "\n")
+        }
+    }
+
+    // MARK: - Diagnostics summary (v2.6.0)
+
+    /// Version/platform/root snapshot for the Details panel (display only).
+    func refreshDiagnosticsSummary() async {
+        do {
+            guard let diagnostics = try await json("GET", "/api/v1/diagnostics") as? [String: Any] else { return }
+            var summary: [String: String] = [:]
+            for key in ["version", "python", "platform", "root"] {
+                if let value = diagnostics[key] as? String { summary[key] = value }
+            }
+            diagnosticsSummary = summary
+        } catch { logStatus = presentError(error) }
     }
 
     // MARK: - Knowledge base (RAG)

@@ -19,6 +19,11 @@ struct RuntimeManagerView: View {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.red)
             }
+            Section {
+                RuntimeSettingsSection(model: model)
+            } header: {
+                Label(LS("更新の設定"), systemImage: "gearshape")
+            }
             ForEach(model.runtimes) { runtime in
                 Section {
                     runtimeSummary(runtime)
@@ -332,5 +337,69 @@ private extension [String: Any] {
         let action = self["action"] as? String ?? ""
         let slotID = self["slot_id"] as? String ?? ""
         return "\(createdAt)|\(action)|\(slotID)"
+    }
+}
+
+/// Update channel + auto-check settings (v2.6.0).
+///
+/// Display and mutation for the `runtimes.*` keys, which previously had
+/// neither a GUI nor a named CLI command (`config set` only). Ranges mirror
+/// `config set-runtime`; the server re-validates.
+private struct RuntimeSettingsSection: View {
+    @ObservedObject var model: MenuBarViewModel
+    @State private var checkInterval = ""
+    @State private var keepSlots = ""
+
+    private var runtimes: [String: Any] { model.settings["runtimes"] as? [String: Any] ?? [:] }
+
+    private func engine(_ name: String) -> [String: Any] {
+        runtimes[name] as? [String: Any] ?? [:]
+    }
+
+    var body: some View {
+        Toggle(LS("mlx-lm の更新を自動確認"), isOn: Binding(
+            get: { engine("mlx-lm")["autoCheck"] as? Bool ?? false },
+            set: { value in Task { await model.setConfig("runtimes.mlx-lm.autoCheck", value: value) } }
+        ))
+        Toggle(LS("mlx-vlm の更新を自動確認"), isOn: Binding(
+            get: { engine("mlx-vlm")["autoCheck"] as? Bool ?? false },
+            set: { value in Task { await model.setConfig("runtimes.mlx-vlm.autoCheck", value: value) } }
+        ))
+        Toggle(LS("不足ランタイムを自動導入"), isOn: Binding(
+            get: { runtimes["autoInstallMissing"] as? Bool ?? true },
+            set: { value in Task { await model.setConfig("runtimes.autoInstallMissing", value: value) } }
+        ))
+        HStack {
+            Text(LS("更新確認の間隔（時間）"))
+            Spacer()
+            TextField("168", text: $checkInterval)
+                .frame(width: 80).multilineTextAlignment(.trailing)
+            Button(LS("適用")) {
+                if let hours = Int(checkInterval) {
+                    Task { await model.setConfig("runtimes.checkIntervalHours", value: hours) }
+                }
+            }
+        }
+        HStack {
+            Text(LS("保持する世代数"))
+            Spacer()
+            TextField("3", text: $keepSlots)
+                .frame(width: 80).multilineTextAlignment(.trailing)
+            Button(LS("適用")) {
+                if let slots = Int(keepSlots) {
+                    Task { await model.setConfig("runtimes.keepSlots", value: slots) }
+                }
+            }
+        }
+        Text(LS("更新チャンネルは安定版（stable）固定です。無効な値はサーバー側で拒否されます。"))
+            .font(.caption).foregroundStyle(.secondary)
+            .onAppear {
+                if checkInterval.isEmpty, let hours = runtimes["checkIntervalHours"] {
+                    checkInterval = "\(hours)"
+                }
+                if keepSlots.isEmpty, let slots = runtimes["keepSlots"] {
+                    keepSlots = "\(slots)"
+                }
+            }
     }
 }

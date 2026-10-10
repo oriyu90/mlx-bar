@@ -154,11 +154,13 @@ class SettingsTests(unittest.TestCase):
             env: dict = {}
             supervisor._configure_kv_quant_environment(env, "mlx-lm")
             self.assertEqual(env, {})
-            # mlx-vlm never receives the variables.
+            # v2.6.0 extends quantization to mlx-vlm: both engines receive
+            # the variables, bf16 still leaves them untouched.
             store.update({"experimental": {"kvCacheQuantization": {"mode": "8bit"}}})
             env_vlm: dict = {}
             supervisor._configure_kv_quant_environment(env_vlm, "mlx-vlm")
-            self.assertEqual(env_vlm, {})
+            self.assertEqual(env_vlm["MLXBAR_KV_QUANT_BITS"], "8")
+            self.assertEqual(env_vlm["MLXBAR_KV_QUANT_MODE"], "8bit")
             env_lm: dict = {}
             supervisor._configure_kv_quant_environment(env_lm, "mlx-lm")
             self.assertEqual(env_lm["MLXBAR_KV_QUANT_BITS"], "8")

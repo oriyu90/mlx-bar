@@ -69,6 +69,9 @@ def parser() -> argparse.ArgumentParser:
     set_replicas = model.add_parser(
         "set-replicas", help="pin済みモデルの並列数（replicas）だけ変更（再ロードしない）")
     set_replicas.add_argument("model_id"); set_replicas.add_argument("count", type=int)
+    set_memory = model.add_parser(
+        "set-memory-limit", help="pin済みモデルのメモリ上限（maxMemoryGB）だけ変更（再ロードしない）")
+    set_memory.add_argument("model_id"); set_memory.add_argument("gb", type=float)
     add_folder = model.add_parser("add-folder"); add_folder.add_argument("path")
     remove_folder = model.add_parser("remove-folder"); remove_folder.add_argument("path")
     gen = sub.add_parser("generate"); gen.add_argument("--prompt", required=True); gen.add_argument("--image", action="append", default=[])
@@ -181,6 +184,27 @@ def parser() -> argparse.ArgumentParser:
     set_sampling.add_argument("--repetition-context-size", type=int, required=True)
     set_login = config.add_parser("set-launch-at-login")
     set_login.add_argument("value", choices=["true", "false"])
+    apply_preset = config.add_parser(
+        "apply-preset", help="一括設定モードを適用（軽量=KV 8bit・メモリ80% / フル=KV bf16・少し多め）")
+    apply_preset.add_argument("mode", choices=["light", "full"])
+    apply_preset.add_argument("--wait", action="store_true", help="適用後のモデル再スキャンを待つ")
+    apply_preset.add_argument("--no-scan", action="store_true", help="モデル再スキャンを行わない")
+    config.add_parser("preset-status", help="一括設定モードの状態と両プロファイル値を表示")
+    export_cmd = config.add_parser("export", help="設定全量をJSONで書き出す（トークン類は含まない）")
+    export_cmd.add_argument("--file", default=None, help="省略時は標準出力")
+    import_cmd = config.add_parser("import", help="書き出したJSONを読み込む（適用不可は理由付きで除外）")
+    import_cmd.add_argument("--file", required=True)
+    set_runtime = config.add_parser(
+        "set-runtime", help="ランタイムの更新チャンネルと自動確認（指定したオプションだけ変更）")
+    set_runtime.add_argument("--channel-mlx-lm", choices=["stable"], default=None)
+    set_runtime.add_argument("--channel-mlx-vlm", choices=["stable"], default=None)
+    set_runtime.add_argument("--auto-check-mlx-lm", choices=["true", "false"], default=None)
+    set_runtime.add_argument("--auto-check-mlx-vlm", choices=["true", "false"], default=None)
+    set_runtime.add_argument("--auto-install-missing", choices=["true", "false"], default=None)
+    set_runtime.add_argument("--check-interval-hours", type=int, default=None,
+                             help="更新確認の間隔（1〜87600時間）")
+    set_runtime.add_argument("--keep-slots", type=int, default=None,
+                             help="保持するランタイム世代数（0〜100）")
     set_rag = config.add_parser(
         "set-rag", help="ナレッジベース（RAG）の設定（指定したオプションだけ変更）")
     set_rag.add_argument("--enabled", choices=["true", "false"], default=None)
@@ -256,6 +280,16 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
+    setup = sub.add_parser("setup").add_subparsers(dest="action", required=True)
+    setup.add_parser("scan", help="PCのスペック（メモリ・CPU・ディスク）を表示")
+    setup.add_parser("status", help="初回セットアップの状態を表示")
+    run = setup.add_parser("run", help="初回セットアップを実行（スキップ可）")
+    run.add_argument("--skip", action="store_true", help="何も変えずに完了扱いにする")
+    run.add_argument("--models-folder", default=None, help="モデルの追加フォルダ（既定はLM Studio標準）")
+    run.add_argument("--max-resident", type=int, default=None, help="同時に使うモデル数（1〜8）")
+    run.add_argument("--preset", choices=["light", "full"], default=None, help="一括設定モード")
+    run.add_argument("--non-interactive", action="store_true",
+                     help="質問せず既定値で実行（未指定はメモリ連動の既定）")
     return root
 
 
@@ -360,6 +394,28 @@ def execute(args, client: Client):
                            {"models": {"pool": {"profiles": profiles}}})
             return {"profiles": profiles,
                     "note": "並列数の変更は次回サービス起動時、またはreaperによる補充時に反映されます"}
+        if args.action == "set-memory-limit":
+            # Mirror the GUI's Settings > Models memory stepper
+            # (setModelMemoryLimit): rewrite the profiles array, keeping every
+            # other field of every profile, so a CLI addition cannot drift
+            # from the GUI shape.
+            if not 1 <= args.gb <= 512:
+                raise ValueError("メモリ上限は1〜512 GBで指定してください")
+            settings = client.request("GET", "/api/v1/settings").json()
+            pool = settings.get("models", {}).get("pool", {})
+            profiles = [dict(item) for item in pool.get("profiles", [])]
+            matched = False
+            for profile in profiles:
+                if profile.get("modelId") == args.model_id:
+                    profile["maxMemoryGB"] = args.gb
+                    matched = True
+            if not matched:
+                profiles.append({"modelId": args.model_id, "keepLoaded": True,
+                                 "maxMemoryGB": args.gb})
+            client.request("PUT", "/api/v1/settings",
+                           {"models": {"pool": {"profiles": profiles}}})
+            return {"profiles": profiles,
+                    "note": "メモリ上限の変更は次回サービス起動時に反映されます"}
         if args.action == "add-folder":
             roots = client.request("GET", "/api/v1/settings").json().get("models", {}).get("roots", [])
             if args.path not in roots: roots.append(args.path)
@@ -623,6 +679,62 @@ def execute(args, client: Client):
             # against the real registration on its next launch/refresh.
             return client.request("PUT", "/api/v1/settings",
                                   {"general": {"launchAtLogin": args.value == "true"}}).json()
+        if args.action == "apply-preset":
+            result = client.request("POST", "/api/v1/presets/apply",
+                                    {"mode": args.mode}).json()
+            if not args.no_scan:
+                job = result.get("scanJob")
+                if args.wait and job:
+                    result["scanResult"] = wait_job(client, job, args.global_json)
+            else:
+                result.pop("scanJob", None)
+            return result
+        if args.action == "preset-status":
+            return client.request("GET", "/api/v1/presets/status").json()
+        if args.action == "export":
+            export = client.request("GET", "/api/v1/settings/export").json()
+            text = json.dumps(export, ensure_ascii=False, indent=2)
+            if args.file:
+                Path(args.file).expanduser().write_text(text + "\n", encoding="utf-8")
+                return {"exported": args.file, "appVersion": export.get("appVersion"),
+                        "exportedAt": export.get("exportedAt")}
+            print(text)
+            return {"exported": "stdout"}
+        if args.action == "import":
+            raw = Path(args.file).expanduser().read_text(encoding="utf-8")
+            try:
+                export = json.loads(raw)
+            except json.JSONDecodeError:
+                raise ValueError("JSONファイルとして読み込めませんでした")
+            return client.request("POST", "/api/v1/settings/import",
+                                  {"export": export}).json()
+        if args.action == "set-runtime":
+            # Mirror the GUI's Settings > Runtime section. Ranges match
+            # settings.py's _validate; the server re-validates.
+            patch: dict = {}
+            engines: dict = {}
+            if args.channel_mlx_lm is not None:
+                engines.setdefault("mlx-lm", {})["channel"] = args.channel_mlx_lm
+            if args.channel_mlx_vlm is not None:
+                engines.setdefault("mlx-vlm", {})["channel"] = args.channel_mlx_vlm
+            if args.auto_check_mlx_lm is not None:
+                engines.setdefault("mlx-lm", {})["autoCheck"] = args.auto_check_mlx_lm == "true"
+            if args.auto_check_mlx_vlm is not None:
+                engines.setdefault("mlx-vlm", {})["autoCheck"] = args.auto_check_mlx_vlm == "true"
+            patch.update(engines)
+            if args.auto_install_missing is not None:
+                patch["autoInstallMissing"] = args.auto_install_missing == "true"
+            if args.check_interval_hours is not None:
+                if not 1 <= args.check_interval_hours <= 87600:
+                    raise ValueError("更新確認の間隔は1〜87,600時間で指定してください")
+                patch["checkIntervalHours"] = args.check_interval_hours
+            if args.keep_slots is not None:
+                if not 0 <= args.keep_slots <= 100:
+                    raise ValueError("保持するランタイム世代数は0〜100で指定してください")
+                patch["keepSlots"] = args.keep_slots
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings", {"runtimes": patch}).json()
         if args.action == "set-rag":
             # Mirror the GUI's Settings > Knowledge base panel: only the given
             # options change; ranges match settings.py's _validate.
@@ -783,10 +895,77 @@ def execute(args, client: Client):
             return client.request(
                 "POST", f"/api/v1/rag/collections/{args.collection}/query", payload).json()
     if args.command == "diagnostics": return client.request("GET", "/api/v1/diagnostics").json()
+    if args.command == "setup": return setup_command(args, client)
     if args.command == "remove-all-data": return remove_all_data(args, client)
 
 
 SERVICE_LABEL = "com.yukiorita.MLXBar.Coordinator"
+
+
+def setup_command(args, client: Client) -> dict:
+    """First-launch setup over the CLI (DESIGN_v2.6.0.md section 3)."""
+    if args.action == "scan":
+        return client.request("GET", "/api/v1/system/hardware").json()
+    if args.action == "status":
+        status = client.request("GET", "/api/v1/setup/status").json()
+        status.pop("hardware", None)
+        return status
+    if args.action == "run":
+        if args.skip:
+            return client.request("POST", "/api/v1/setup/complete", {"skipped": True}).json()
+        status = client.request("GET", "/api/v1/setup/status").json()
+        hardware = status.get("hardware", {})
+        lm_studio = hardware.get("lmStudio", {})
+        default_folder = lm_studio.get("defaultFolder") or str(Path.home() / ".lmstudio" / "models")
+        default_resident = hardware.get("defaultMaxResidentModels") or 2
+        interactive = not args.non_interactive and sys.stdin.isatty()
+        folder = args.models_folder
+        max_resident = args.max_resident
+        preset = args.preset
+        if interactive:
+            if folder is None:
+                answer = input(f"モデルの追加フォルダ [{default_folder}]: ").strip()
+                folder = answer or None
+            if max_resident is None:
+                while True:
+                    answer = input(f"同時に使うモデル数 (1〜8) [{default_resident}]: ").strip()
+                    if not answer:
+                        max_resident = None
+                        break
+                    try:
+                        max_resident = int(answer)
+                    except ValueError:
+                        print("1〜8の整数で指定してください", file=sys.stderr)
+                        continue
+                    if 1 <= max_resident <= 8:
+                        break
+                    print("1〜8の整数で指定してください", file=sys.stderr)
+            if preset is None:
+                while True:
+                    answer = input("一括設定モード (light=軽量/full=フル) [light]: ").strip().lower()
+                    if not answer:
+                        preset = None
+                        break
+                    if answer in {"light", "full"}:
+                        preset = answer
+                        break
+                    print("light または full で指定してください", file=sys.stderr)
+        if max_resident is not None and not 1 <= max_resident <= 8:
+            raise ValueError("同時に使うモデル数は1〜8で指定してください")
+        choices: dict = {}
+        if folder:
+            choices["modelsFolder"] = folder
+        if max_resident is not None:
+            choices["maxResidentModels"] = max_resident
+        elif not interactive and args.max_resident is None:
+            choices["maxResidentModels"] = default_resident
+        if preset is not None:
+            choices["preset"] = preset
+        elif not interactive and args.preset is None:
+            choices["preset"] = "light"
+        return client.request("POST", "/api/v1/setup/complete",
+                              {"skipped": False, "choices": choices}).json()
+    raise ValueError(f"不明なsetup操作です: {args.action}")
 
 
 def remove_all_data(args, client: Client) -> dict:

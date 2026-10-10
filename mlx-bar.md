@@ -3,6 +3,33 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.6.0の一括設定・初回セットアップで守ること（2026-10-11リリース）
+
+- preset footprintは6キー固定（`presets.py:MANAGED_KEYS`）。同時使用数・
+  同時生成数はwizard/ユーザーの領域でpresetは触らない。footprint拡張時は
+  effective判定・export適用・GUI説明文・TEST_PLAN境界値を同時更新すること。
+- プロファイル計算はサーバ側単一実装（`presets.py`）。GUI/CLIは表示・転送のみ。
+  clampは`_validate`範囲内に収めることが単体テストの契約
+  （`Tests/test_v2_6_profiles.py`のtiny/hugeケース）。
+- importはleaf単位のwhole-config検証。cross-field制約（host/allowLan同時変更・
+  wired≤memory・adaptive/compression排他）は片方leafのskipとして自然に扱われる。
+  機械依存の明示skipは`settings_export.py:_filter_machine_specific`に集約
+  （roots要素・lmStudio.folder・使用中port）。除外は理由付き報告が契約。
+- `SettingsStore.fresh_install`はプロセス内transient（永続化しない）。
+  config新規作成時のみTrue。破損復旧・既存config・`--home`再利用はFalse。
+  wizard表示条件は`fresh_install and not setup.completed`。
+- mlx-vlm量子化はテキスト生成のみ（画像付きはbf16経路）。namespaceはbf16無接尾辞・
+  量子化時のみ`-kv-<mode>`（lmと異なりbf16既存キャッシュをorphanにしない）。
+  vlmの再試行分岐はif/elif/else構造（quant成功後にreuseフォールスルーへ
+  落下させない。v2.6.0開発中に二重生成バグを検出・修正済み）。
+- SwiftUI追加制約：wizardは単独Window＋VStack/ScrollView（NavigationSplitViewなし）。
+  Windowを閉じたらskip扱い（`onDisappear`で完了記録）。一般ページも長くなったため
+  `ScrollView`化済み。preset Pickerは`pendingPreset`経由で確認ダイアログを挟む
+  （直接`applyPreset`しない）。fileImporterは`.json`指定。
+- 未実施：wizardウィンドウの実画面レンダリング（サーバ側E2Eは分離ホームで検証済み。
+  本番config退避を伴うため次回新規インストール時にオーナー確認を求めること）。
+  英語UI実画面も次版で確認すること。
+
 ## v2.5.1の設定画面表示崩れ修正で守ること（2026-10-11リリース）
 
 - v2.5.0実機で設定画面の説明文が右端へ突き抜け、下端で切れてスクロールできなかった。
@@ -29,7 +56,8 @@
   PromptCacheStoreの両方にあり、片方だけ削らない。
 - 量子化失敗は最初のモデル出力前だけfresh bf16で1回再試行し、
   `kvQuant.fallbackReason`に記録する。出力開始後は再試行禁止（二重応答防止）。
-- mlx-vlmへ量子化envを渡さない。`RotatingKVCache.to_quantized`はNYIのため、
+- mlx-vlmへ量子化envを渡さない（v2.5.0時点。v2.6.0で両engineへ拡張したため、
+  現行契約はv2.6.0節を参照）。`RotatingKVCache.to_quantized`はNYIのため、
   回転・複合キャッシュは量子化対象外としてbf16へ戻す（クラス名推測で対応扱いにしない）。
 - 検証の正本は`settings.py:_validate`。GUI/CLI/TESTはmirror。`en.lproj`新規キーに
   英訳必須・重複禁止。`uv.lock`のmlxbar版数は手動管理。
