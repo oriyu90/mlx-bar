@@ -90,9 +90,28 @@ mlx-vlm slot 20261011-015507-000（mlx-vlm 0.7.6/mlx 0.32.3）。
 - [ ] private `mlx-bar.md` §0-F 記録＋push。
 - [ ] `/Applications/MLXBar.app` 入替（旧版backup）＋`diagnostics`版数確認。
 
-## 検証結果（実施時に記入）
+## 検証結果（2026-10-11実施）
 
-- 自動ゲート: 566 passed＋1 failed（既知flake、クリーンツリー再現済み）。
-- slot smoke: lm-8bit完走／vlm-bf16完走／vlm-8bit完走（namespace分離）／
-  fault-injection 2呼出のみ・fallback記録・二重生成なし。
-- GUI目視: （実施時に記入。英語・ウィザード含む）
+- 自動ゲート: 566 passed＋1 failed（既知flake
+  `test_ttl_starts_when_a_slow_load_finishes`。クリーンツリー `7f88979`
+  でも失敗することをstashで確認済み）。
+- `swift build` 成功。`.strings` 新規重複なし（既存1件のみ）。
+  `grep fixedSize` 空。
+- DMG `MLXBar-2.6.0.dmg` SHA-256
+  `77a11afd08e522a89227139b816583e6be8bac0c56c6b9f3a0a8524e7713cf1f`、
+  `verify-release.sh` exit 0、`hdiutil verify` VALID、ad-hoc署名。
+- slot smoke（最新slot直結）: lm-8bit完走（SmolLM2-135M、fallbackなし）／
+  vlm-bf16完走／vlm-8bit完走（namespace `-kv-8bit` 分離、metrics正常）／
+  fault-injectionは呼出列 [kv, bf16] の2回のみ・fallback記録・
+  reuseFailures増加なし・二重生成なし。
+  品質注記: 256Mモデルの算数はbf16でも不正解（能力の問題。対照実験済み）。
+- 分離ホームE2E: required=true → complete(light, maxResident 3) →
+  required=false・effective=light（reserve 14/perModel 24/disk 3/budget 9）。
+  skip版・既存ホーム required=false も確認。本番config無接触。
+- 本番GUI目視: 一般（日英・カスタム表示・折り返し・書出読込ボタン）、
+  ランタイム更新設定、診断サマリ（App 2.6.0/Python 3.12.11）。
+- 本番preset往復: light適用（stored/effective=light）→ 全6キー＋modeを
+  元値へ復元し一致確認（budgetのint型まで復元）。
+- 未実施（持越し）: ウィザードウィンドウの実画面レンダリング
+  （サーバ側は分離ホームで検証済み。Swiftはbuildのみ）。次回新規
+  インストール時にオーナー確認を求めること。
