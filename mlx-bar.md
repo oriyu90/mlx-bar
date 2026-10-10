@@ -3,6 +3,19 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.5.1の設定画面表示崩れ修正で守ること（2026-10-11リリース）
+
+- v2.5.0実機で設定画面の説明文が右端へ突き抜け、下端で切れてスクロールできなかった。
+  原因は「SwiftUIの既知の罠」節の2件（素の`Form`の非スクロール、`LabeledContent`共有
+  カラム破壊によるキャプション突き抜け）。v2.5.0のKV量子化セクション追加で
+  キャッシュページが長大化して表面化した。
+- 修正はモデルページの確立パターンへ統一：長い3ページ（キャッシュ・知識ベース・
+  APIサーバー）の`Form`を`ScrollView`で包み、`Form`内の説明文・注意文へ
+  `.frame(maxWidth: .infinity, alignment: .leading)`を付与。
+  `.fixedSize`は禁止（サイドバー空白化）。新規リテラルなし（`.strings`不変）。
+- ランタイムページは`List`基盤のため対象外。一般/LM Studio/削除/詳細はframe付与のみ。
+- 新規キー・既定値変更なし。Coordinator/Worker/CLIは無変更。
+
 ## v2.5.0のKV量子化で守ること（2026-10-10リリース）
 
 - `experimental.kvCacheQuantization.mode`は既定bf16。bf16時はCoordinatorが

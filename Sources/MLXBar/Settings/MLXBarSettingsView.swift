@@ -85,6 +85,13 @@ struct PromptCacheSettingsView: View {
     }
 
     var body: some View {
+        // A plain `Form` doesn't reliably scroll on macOS when embedded in a
+        // `NavigationSplitView` detail column, so this page's content (which
+        // keeps growing with the Paged KV and KV quantization sections) could
+        // get clipped at the bottom of the window with no way to reach it.
+        // Wrapping it explicitly guarantees scrolling regardless of window
+        // height (same pattern as `ModelSourceSettingsView`).
+        ScrollView {
         Form {
             Section(LS("永続プロンプトキャッシュ")) {
                 Toggle(LS("再起動後もプロンプトキャッシュを再利用"), isOn: $diskEnabled)
@@ -94,6 +101,7 @@ struct PromptCacheSettingsView: View {
                 }.buttonStyle(.borderedProminent)
                 Text(LS("ZCodeの長いsystem promptとtools定義をローカルディスクへ保存します。設定変更は次回のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("詳細キャッシュ設定")) {
                 Stepper("\(LS("世代保持数")): \(keepGenerations)", value: $keepGenerations, in: 1...10)
@@ -118,6 +126,7 @@ struct PromptCacheSettingsView: View {
                                value: blocks == "auto" ? LS("有効") : LS("無効"))
                 Text(LS("長い会話1件のスナップショットはギガバイト級になるため、書き込み予算で上限を管理します。インメモリブロックプールは27B級ハイブリッドでの未計測のため、この版では無効固定です。設定変更は次回のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("Paged KVキャッシュ（実験）")) {
                 Toggle(LS("Paged KVキャッシュを有効化"), isOn: $pagedEnabled)
@@ -150,6 +159,7 @@ struct PromptCacheSettingsView: View {
                 if let reason = paged["disabledReason"] as? String {
                     Text("\(LS("無効理由")): \(pagedReason(reason))")
                         .font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 let rejected = ((paged["restoreBudgetRejects"] as? NSNumber)?.intValue ?? 0)
                     + ((paged["storeBudgetRejects"] as? NSNumber)?.intValue ?? 0)
@@ -159,12 +169,14 @@ struct PromptCacheSettingsView: View {
                 LabeledContent(LS("メモリ層"), value: LS("無効（将来用）"))
                 Text(LS("RAMホット層は実機計測後の別phaseのため、この版ではSSD層のみです。KV量子化は下の専用セクションで設定します。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Button(LS("Pagedキャッシュを消去…"), role: .destructive) {
                     confirmsPagedClear = true
                 }
                 .disabled(((paged["diskBytes"] as? NSNumber)?.int64Value ?? 0) == 0)
                 Text(LS("plain mlx-lm KVCacheだけが対象です。非対応モデル、量子化・回転・複合キャッシュ、メモリ不足、破損時は通常のEXACT生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("KVキャッシュ量子化（実験）")) {
                 Picker(LS("KVキャッシュの精度"), selection: $kvQuantMode) {
@@ -183,13 +195,16 @@ struct PromptCacheSettingsView: View {
                 if let reason = kv["fallbackReason"] as? String {
                     Text("\(LS("無効理由")): \(reason)")
                         .font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if kvQuantMode != "bf16" {
                     Text(LS("KV量子化が有効のためPaged KVは休止します。"))
                         .font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Text(LS("mlx-lmのライブKVのみが対象です。8bitはほぼ無劣化、4bitは長い推論・コード生成で劣化する場合があります。非対応モデル・回転キャッシュ・複合キャッシュ・失敗時は通常のbf16生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("キャッシュ状態")) {
                 LabeledContent(LS("メモリー"), value: (model.promptCacheStatus["memory"] as? Bool) == true ? LS("有効") : LS("無効"))
@@ -198,6 +213,7 @@ struct PromptCacheSettingsView: View {
                 LabeledContent(LS("ディスクヒット"), value: "\((model.promptCacheStatus["disk_hits"] as? NSNumber)?.intValue ?? 0)")
                 if let reason = model.promptCacheStatus["disabledReason"] as? String {
                     Text("\(LS("無効理由")): \(reason)").font(.caption).foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if let summary = model.cacheSummaryText {
                     LabeledContent(LS("再利用方式"), value: summary)
@@ -226,6 +242,7 @@ struct PromptCacheSettingsView: View {
                 }
                 if let message = model.promptCacheMessage {
                     Text(message).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
@@ -264,6 +281,7 @@ struct PromptCacheSettingsView: View {
         } message: {
             Text(LS("次の会話ではPaged KVを再構築します。モデルや会話履歴は削除しません。"))
         }
+        }
     }
 }
 
@@ -282,7 +300,9 @@ struct DiagnosticsSettingsView: View {
             }
             Text(LS("リクエスト本文、応答本文、APIキーは記録しません。最新2,000件だけを保存し、この画面には500件まで表示します。"))
                 .font(.caption).foregroundStyle(.secondary)
-            if let status = model.logStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let status = model.logStatus { Text(status).font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading) }
             if model.recentLogs.isEmpty {
                 ContentUnavailableView(LS("ログはありません"), systemImage: "doc.text.magnifyingglass")
             } else {
@@ -310,8 +330,10 @@ struct DataRemovalSettingsView: View {
         Form {
             Section(LS("MLXBarのデータを削除")) {
                 Text(LS("設定、履歴、APIキー、MLXBarがダウンロードしたランタイム、ログをこのMacから削除します。"))
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Text(LS("Hugging FaceやLM Studioなど、外部のモデルフォルダにあるモデル本体は削除しません。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 if model.isRemovingAllData {
                     HStack {
                         ProgressView().controlSize(.small)
@@ -327,6 +349,7 @@ struct DataRemovalSettingsView: View {
             Section {
                 Text(LS("削除完了後にMLXBarは終了します。その後、MLXBar.appをゴミ箱へ移動してください。"))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding()
@@ -379,6 +402,8 @@ struct GeneralSettingsView: View {
                 set: { value in Task { await model.setConfig("general.preloadLastModel", value: value) } }
             ))
             Text(LS("バックグラウンド時は30秒間隔で状態を確認します。")).foregroundStyle(.secondary)
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }.padding()
     }
 }
@@ -900,6 +925,10 @@ struct APISettingsView: View {
     private var allowsLAN: Bool { security["allowLan"] as? Bool ?? false }
     private var allowsRemoteImages: Bool { security["allowRemoteImageUrls"] as? Bool ?? false }
     var body: some View {
+        // Same reason as `PromptCacheSettingsView` and
+        // `ModelSourceSettingsView`: a plain `Form` doesn't reliably scroll
+        // in a `NavigationSplitView` detail column.
+        ScrollView {
         Form {
             Section(LS("APIサーバー")) {
                 Toggle(LS("ローカルネットワークへ公開"), isOn: Binding(
@@ -920,9 +949,11 @@ struct APISettingsView: View {
                     Label(LS("LAN内の端末からAPIへ接続できます。信頼できるネットワークでのみ使用してください。"),
                           systemImage: "network.badge.shield.half.filled")
                         .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     if model.lanAPIURLs.isEmpty {
                         Text(LS("LAN用IPを取得できませんでした。Macのネットワーク接続を確認してください。"))
                             .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     } else {
                         ForEach(model.lanAPIURLs, id: \.self) { url in
                             HStack {
@@ -972,6 +1003,7 @@ struct APISettingsView: View {
                 ))
                 Text(LS("既定ではAPIの画像はdata URI（base64）のみ受け付けます。有効にすると、MLXBarがhttp(s)の画像URLを代理取得します。プライベートアドレスへの取得は常に拒否します。"))
                     .font(.caption).foregroundStyle(allowsRemoteImages ? .orange : .secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("APIキー")) {
                 Toggle(LS("APIキーを要求"), isOn: Binding(
@@ -997,7 +1029,9 @@ struct APISettingsView: View {
                         ? "OpenAI互換APIでは Authorization: Bearer <APIキー> を指定します。"
                         : "APIキーなしで利用できます。同じMac上の他のアプリからもアクセス可能になります。"))
                     .font(.caption).foregroundStyle(.secondary)
-                if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading) }
             }
         }
         .padding()
@@ -1019,6 +1053,7 @@ struct APISettingsView: View {
             Button(LS("キャンセル"), role: .cancel) {}
         } message: {
             Text(LS("同じネットワーク内の端末からMLXBarへ接続可能になります。信頼できるLANでのみ有効にしてください。"))
+        }
         }
     }
 }
@@ -1064,8 +1099,11 @@ struct LMStudioSettingsView: View {
                     Task { await model.saveLMStudioToken("") }
                 }.disabled(model.lmStudioToken.isEmpty)
             }
-            if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary) }
+            if let status = model.secretStatus { Text(status).font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading) }
             Text(LS("LM Studioが停止中でもMLXBarは動作を継続します。GGUFはLM Studio Providerのみに送られます。")).foregroundStyle(.secondary)
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }.padding().onAppear { baseURL = lmStudio["baseUrl"] as? String ?? baseURL }
     }
 

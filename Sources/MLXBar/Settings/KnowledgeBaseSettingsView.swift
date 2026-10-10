@@ -32,18 +32,24 @@ struct KnowledgeBaseSettingsView: View {
     private func t(_ ja: String, _ en: String) -> String { model.guiLanguage == "ja" ? ja : en }
 
     var body: some View {
+        // Same reason as `PromptCacheSettingsView` and
+        // `ModelSourceSettingsView`: a plain `Form` doesn't reliably scroll
+        // in a `NavigationSplitView` detail column.
+        ScrollView {
         Form {
             Section(t("ナレッジベース（RAG）", "Knowledge Base (RAG)")) {
                 Toggle(t("ナレッジベースを有効にする", "Enable the knowledge base"), isOn: $enabled)
                 Text(t("有効にすると、リクエストに rag フィールドを付けたときだけ、コレクションから関連文を検索してプロンプト先頭に注入します。rag を付けない通常のリクエストの動作は一切変わりません。",
                        "When enabled, a request that carries a `rag` field has relevant passages retrieved from a collection and prepended to the prompt. Ordinary requests without `rag` behave exactly as before."))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Section(t("埋め込みエンドポイント", "Embedding endpoint")) {
                 Text(t("MLXBar自身は埋め込みを計算しません。OpenAI互換の /v1/embeddings を提供するサーバー（LM Studio、Ollama など）を指定してください。",
                        "MLXBar does not compute embeddings itself. Point this at any server that exposes an OpenAI-compatible /v1/embeddings endpoint (LM Studio, Ollama, ...)."))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 TextField("Base URL", text: $baseURL)
                 TextField(t("埋め込みモデル名", "Embedding model name"), text: $embeddingModel)
                 HStack {
@@ -85,6 +91,7 @@ struct KnowledgeBaseSettingsView: View {
                           systemImage: reachable ? "checkmark.circle" : "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(reachable ? .green : .orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
@@ -109,6 +116,7 @@ struct KnowledgeBaseSettingsView: View {
                 Text(t("取得は全件読みの純Python検索のため、上限を上げる前に取得速度を確認してください。",
                        "Retrieval scans all vectors in pure Python; check retrieval speed before raising the cap."))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Section {
@@ -125,6 +133,7 @@ struct KnowledgeBaseSettingsView: View {
                 }.buttonStyle(.borderedProminent)
                 if let message = model.ragStatusMessage {
                     Text(message).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
@@ -132,6 +141,7 @@ struct KnowledgeBaseSettingsView: View {
                 if model.ragCollections.isEmpty {
                     Text(t("コレクションがありません。", "No collections yet."))
                         .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 ForEach(model.ragCollections) { collection in
                     HStack {
@@ -166,6 +176,7 @@ struct KnowledgeBaseSettingsView: View {
                 Text(t("コレクション名は英数字で始まり、英数字・ドット・ハイフン・アンダースコアのみ（64文字以内）。",
                        "A collection name starts with an alphanumeric and uses only letters, digits, dot, hyphen and underscore (max 64 chars)."))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if let collection = selectedCollection,
@@ -204,6 +215,7 @@ struct KnowledgeBaseSettingsView: View {
             Text(t("コレクション内のすべてのドキュメントとチャンクが削除されます。この操作は取り消せません。",
                    "Every document and chunk in the collection is removed. This cannot be undone."))
         }
+        }
     }
 
     @ViewBuilder
@@ -216,6 +228,7 @@ struct KnowledgeBaseSettingsView: View {
                         Text(t("\(document.charCount)文字 / \(document.chunkCount)チャンク",
                                "\(document.charCount) chars · \(document.chunkCount) chunks"))
                             .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer()
                     Button(role: .destructive) {
@@ -226,6 +239,7 @@ struct KnowledgeBaseSettingsView: View {
             if model.ragDocuments.isEmpty {
                 Text(t("ドキュメントがありません。", "No documents yet."))
                     .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Button(t("ファイルから追加…", "Add from file…")) {
                 Task {
