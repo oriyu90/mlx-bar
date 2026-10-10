@@ -298,3 +298,29 @@ def test_symlink_cache_root_is_fail_closed(tmp_path, fake_runtime):
     assert store.disk is None
     assert store.stats()["enabled"] is False
     assert store.stats()["disabledReason"].startswith("disk_init_failed:")
+
+
+def test_kv_quant_namespaces_never_mix_and_paged_stays_off(tmp_path, fake_runtime):
+    from mlx_lm_worker.prompt_cache import PromptCacheStore
+    bf16 = PromptCacheStore(
+        str(tmp_path), "runtime", root=str(tmp_path / "pc"), disk_enabled=True,
+        model=fake_runtime.model, cache_budget={"known": False},
+        paged_enabled=False, kv_mode="bf16", kv_bits=None)
+    q8 = PromptCacheStore(
+        str(tmp_path), "runtime", root=str(tmp_path / "pc"), disk_enabled=True,
+        model=fake_runtime.model, cache_budget={"known": False},
+        paged_enabled=True, paged_root=str(tmp_path / "paged"),
+        paged_max_bytes=1 << 30, kv_mode="8bit", kv_bits=8)
+    assert bf16.namespace != q8.namespace
+    assert bf16.model_key != q8.model_key
+    assert q8.paged is None
+    assert q8.stats()["pagedKV"]["disabledReason"] == "kv_quantized"
+    assert q8.stats()["kvQuant"] == {"mode": "8bit", "bits": 8, "active": True}
+    plain = [SimpleNamespace(offset=10)]
+    quant = [SimpleNamespace(offset=10, bits=8, group_size=64)]
+    assert bf16._cache_matches_kv_mode(plain) is True
+    assert bf16._cache_matches_kv_mode(quant) is False
+    assert q8._cache_matches_kv_mode(quant) is True
+    assert q8._cache_matches_kv_mode(plain) is True
+    wrong_bits = [SimpleNamespace(offset=10, bits=4, group_size=64)]
+    assert q8._cache_matches_kv_mode(wrong_bits) is False

@@ -3,6 +3,26 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.5.0のKV量子化で守ること（2026-10-10リリース）
+
+- `experimental.kvCacheQuantization.mode`は既定bf16。bf16時はCoordinatorが
+  `MLXBAR_KV_QUANT_*`を渡さず、Workerは量子化分岐へ到達しない（v2.4.1とバイト等価）。
+  groupSize 64・start 0は本版固定で、statusに実効値を載せている。
+- 量子化とPagedは排他。量子化中はPaged envを立てず、Paged tierを未構築とし、
+  理由`kv_quantized`を表示する。設定の両on自体は422にしない（量子化優先のfail-closed）。
+- プロンプト再利用はKVモード別namespace（`-kv-bf16/-kv-8bit/-kv-4bit`）と
+  メモリキー（`:kv-<mode>`）で分離する。型不一致のfetchはcold miss、storeは拒否。
+  budgetはbf16のまま（保守側へ倒れる）。`_cache_matches_kv_mode`はadapterと
+  PromptCacheStoreの両方にあり、片方だけ削らない。
+- 量子化失敗は最初のモデル出力前だけfresh bf16で1回再試行し、
+  `kvQuant.fallbackReason`に記録する。出力開始後は再試行禁止（二重応答防止）。
+- mlx-vlmへ量子化envを渡さない。`RotatingKVCache.to_quantized`はNYIのため、
+  回転・複合キャッシュは量子化対象外としてbf16へ戻す（クラス名推測で対応扱いにしない）。
+- 検証の正本は`settings.py:_validate`。GUI/CLI/TESTはmirror。`en.lproj`新規キーに
+  英訳必須・重複禁止。`uv.lock`のmlxbar版数は手動管理。
+- 実モデルでの品質・TTFT・ピークメモリの定量比較は未実施。次版で実測し、
+  既定値・文言（「実験」表示）・group/start可変化を見直すこと。
+
 ## v2.4.1の監査修正で守ること（2026-09-23リリース）
 
 - `general.logLevel`は当初consumerが無く、GUI/CLIだけが存在するプラセボだった。

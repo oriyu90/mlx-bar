@@ -43,6 +43,7 @@ struct PromptCacheSettingsView: View {
     @State private var pagedDiskEnabled = true
     @State private var pagedDiskMaxGB = 10
     @State private var pagedBranchReuse = true
+    @State private var kvQuantMode = "bf16"
     @State private var confirmsDiskClear = false
     @State private var confirmsPagedClear = false
 
@@ -69,8 +70,17 @@ struct PromptCacheSettingsView: View {
         case "non_plain_kv_layout": return LS("plain KVCacheではないモデルです")
         case "budget_unknown": return LS("モデルのKVメモリ量を安全に算出できません")
         case "disk_disabled": return LS("Paged SSD保存が無効です")
+        case "kv_quantized": return LS("KV量子化が有効のためPagedは休止中です")
         case "circuit_open": return LS("安全装置が作動したためWorker再起動まで無効です")
         default: return reason
+        }
+    }
+
+    private func kvQuantModeText(_ mode: String) -> String {
+        switch mode {
+        case "8bit": return LS("8bit（省メモリ・ほぼ無劣化）")
+        case "4bit": return LS("4bit（最大省メモリ・品質低下あり）")
+        default: return LS("bf16（無効・最高品質）")
         }
     }
 
@@ -147,13 +157,38 @@ struct PromptCacheSettingsView: View {
                     LabeledContent(LS("メモリ保護によるスキップ"), value: "\(rejected)")
                 }
                 LabeledContent(LS("メモリ層"), value: LS("無効（将来用）"))
-                Text(LS("RAMホット層とKV量子化は実機計測後の別phaseのため、この版ではSSD層のみです。"))
+                Text(LS("RAMホット層は実機計測後の別phaseのため、この版ではSSD層のみです。KV量子化は下の専用セクションで設定します。"))
                     .font(.caption).foregroundStyle(.secondary)
                 Button(LS("Pagedキャッシュを消去…"), role: .destructive) {
                     confirmsPagedClear = true
                 }
                 .disabled(((paged["diskBytes"] as? NSNumber)?.int64Value ?? 0) == 0)
                 Text(LS("plain mlx-lm KVCacheだけが対象です。非対応モデル、量子化・回転・複合キャッシュ、メモリ不足、破損時は通常のEXACT生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section(LS("KVキャッシュ量子化（実験）")) {
+                Picker(LS("KVキャッシュの精度"), selection: $kvQuantMode) {
+                    Text(LS("bf16（無効・最高品質）")).tag("bf16")
+                    Text(LS("8bit（省メモリ・ほぼ無劣化）")).tag("8bit")
+                    Text(LS("4bit（最大省メモリ・品質低下あり）")).tag("4bit")
+                }
+                Button(LS("KV量子化設定を適用")) {
+                    Task { await model.setKVCacheQuantization(mode: kvQuantMode) }
+                }.buttonStyle(.borderedProminent)
+                let kv = model.promptCacheStatus["kvQuant"] as? [String: Any] ?? [:]
+                LabeledContent(LS("現在の動作"),
+                               value: ((kv["active"] as? Bool) == true
+                                       ? (kv["mode"] as? String ?? kvQuantMode)
+                                       : LS("bf16（無効）")))
+                if let reason = kv["fallbackReason"] as? String {
+                    Text("\(LS("無効理由")): \(reason)")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if kvQuantMode != "bf16" {
+                    Text(LS("KV量子化が有効のためPaged KVは休止します。"))
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Text(LS("mlx-lmのライブKVのみが対象です。8bitはほぼ無劣化、4bitは長い推論・コード生成で劣化する場合があります。非対応モデル・回転キャッシュ・複合キャッシュ・失敗時は通常のbf16生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。"))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section(LS("キャッシュ状態")) {
@@ -208,6 +243,8 @@ struct PromptCacheSettingsView: View {
             pagedDiskEnabled = paged["diskEnabled"] as? Bool ?? true
             pagedDiskMaxGB = (paged["diskMaxGB"] as? NSNumber)?.intValue ?? 10
             pagedBranchReuse = paged["branchReuse"] as? Bool ?? true
+            let kvQuant = ((model.settings["experimental"] as? [String: Any])?["kvCacheQuantization"] as? [String: Any]) ?? [:]
+            kvQuantMode = kvQuant["mode"] as? String ?? "bf16"
             await model.refreshPromptCache()
         }
         .confirmationDialog(LS("ディスクキャッシュを消去しますか？"), isPresented: $confirmsDiskClear) {

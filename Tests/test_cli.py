@@ -257,6 +257,18 @@ class CLIParityTests(unittest.TestCase):
         execute(argparse.Namespace(command="prompt-cache", action="clear-paged"), client)
         client.request.assert_called_once_with("POST", "/api/v1/prompt-cache/paged/clear")
 
+    def test_set_kv_cache_quantization_sends_mode(self):
+        client = Mock()
+        client.request.return_value = response({})
+        execute(argparse.Namespace(command="config", action="set-kv-cache-quantization",
+                                   mode="4bit"), client)
+        client.request.assert_called_once_with(
+            "PUT", "/api/v1/settings",
+            {"experimental": {"kvCacheQuantization": {"mode": "4bit"}}})
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(command="config", action="set-kv-cache-quantization",
+                                       mode=None), client)
+
     def test_set_flag_maps_names_to_dotted_keys(self):
         cases = {
             "auto-load-on-api": {"models": {"autoLoadOnAPIRequest": True}},

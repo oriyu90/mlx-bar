@@ -26,6 +26,13 @@ class MLXLMAdapter(BaseAdapter):
         self.last_cold_reason: str | None = None
         self._pending_cold_reason: str | None = None
         self._cold_prompt_tps = 0.0
+        # Live KV quantization (v2.5.0). None means full-precision bf16,
+        # matching the pre-v2.5.0 behaviour byte-for-byte.
+        self.kv_bits: int | None = None
+        self.kv_group_size = 64
+        self.kv_start = 0
+        self.kv_mode = "bf16"
+        self.kv_fallback_reason: str | None = None
 
     def capabilities(self) -> dict:
         result = super().capabilities()
@@ -33,7 +40,18 @@ class MLXLMAdapter(BaseAdapter):
         result["promptCache"] = self.prompt_cache_stats()
         result["cacheBudget"] = dict(self.cache_budget)
         result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
+        result["kvQuant"] = self._kv_quant_status()
         return result
+
+    def _kv_quant_status(self) -> dict:
+        return {
+            "mode": self.kv_mode,
+            "bits": self.kv_bits,
+            "groupSize": self.kv_group_size,
+            "quantizedStart": self.kv_start,
+            "active": self.kv_bits is not None,
+            "fallbackReason": self.kv_fallback_reason,
+        }
 
     @staticmethod
     def _truthy(value: str | None) -> bool:
@@ -56,6 +74,7 @@ class MLXLMAdapter(BaseAdapter):
             paged_max_bytes = int(os.environ.get("MLXBAR_PAGED_KV_MAX_BYTES", "0"))
         except (TypeError, ValueError):
             paged_max_bytes = 0
+        self._init_kv_quant_from_env()
         self.prompt_cache = PromptCacheStore(
             path, runtime_version,
             root=os.environ.get("MLXBAR_PROMPT_CACHE_ROOT"),
@@ -69,7 +88,45 @@ class MLXLMAdapter(BaseAdapter):
             paged_disk_enabled=self._truthy(os.environ.get("MLXBAR_PAGED_KV_DISK_ENABLED", "1")),
             paged_max_bytes=max(0, paged_max_bytes),
             paged_branch_reuse=self._truthy(os.environ.get("MLXBAR_PAGED_KV_BRANCH_REUSE", "1")),
+            kv_mode=self.kv_mode,
+            kv_bits=self.kv_bits,
         )
+
+    def _init_kv_quant_from_env(self) -> None:
+        """Read the coordinator-latched quantization mode without failing load.
+
+        Unknown or malformed values fall back to full-precision bf16: losing
+        a memory saving must never keep a model from loading.
+        """
+        raw_bits = (os.environ.get("MLXBAR_KV_QUANT_BITS") or "").strip()
+        raw_mode = (os.environ.get("MLXBAR_KV_QUANT_MODE") or "").strip()
+        try:
+            group_size = int(os.environ.get("MLXBAR_KV_QUANT_GROUP_SIZE", "64"))
+        except (TypeError, ValueError):
+            group_size = 64
+        try:
+            start = int(os.environ.get("MLXBAR_KV_QUANT_START", "0"))
+        except (TypeError, ValueError):
+            start = 0
+        if group_size not in {32, 64, 128}:
+            group_size = 64
+        if start < 0:
+            start = 0
+        self.kv_group_size = group_size
+        self.kv_start = start
+        self.kv_fallback_reason = None
+        if raw_bits == "8" or raw_mode == "8bit":
+            self.kv_bits, self.kv_mode = 8, "8bit"
+        elif raw_bits == "4" or raw_mode == "4bit":
+            self.kv_bits, self.kv_mode = 4, "4bit"
+        else:
+            self.kv_bits, self.kv_mode = None, "bf16"
+
+    def _kv_generate_kwargs(self) -> dict:
+        if self.kv_bits is None:
+            return {}
+        return {"kv_bits": self.kv_bits, "kv_group_size": self.kv_group_size,
+                "quantized_kv_start": self.kv_start}
 
     def load(self, path: str, trust_remote_code: bool = False) -> dict:
         if not path:
@@ -109,11 +166,13 @@ class MLXLMAdapter(BaseAdapter):
     def prompt_cache_stats(self) -> dict:
         if self.prompt_cache is None:
             return {"enabled": False, "engine": self.engine,
-                    "budget": dict(self.cache_budget), "lastColdReason": self.last_cold_reason}
+                    "budget": dict(self.cache_budget), "lastColdReason": self.last_cold_reason,
+                    "kvQuant": self._kv_quant_status()}
         result = self.prompt_cache.stats()
         result["budget"] = dict(self.cache_budget)
         result["lastColdReason"] = self.last_cold_reason
         result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
+        result["kvQuant"] = self._kv_quant_status()
         return result
 
     def _encode(self, text: str) -> list[int]:
@@ -171,6 +230,8 @@ class MLXLMAdapter(BaseAdapter):
             yield {"type": "tool_support", "state": "degraded"}
         max_tokens = int(params.get("max_tokens", 512))
         kwargs = {"max_tokens": max_tokens}
+        kwargs.update(self._kv_generate_kwargs())
+        quantized_active = self.kv_bits is not None
         temperature = float(params.get("temperature", 0.7))
         top_p = float(params.get("top_p", 1.0))
         try:
@@ -237,6 +298,17 @@ class MLXLMAdapter(BaseAdapter):
             pass
         elif prompt_tokens:
             cache, remaining, cache_tier = self.prompt_cache.fetch(self.model, prompt_tokens)
+            if not self._cache_matches_kv_mode(cache):
+                # Mode changed without a worker restart, or a stale snapshot
+                # from another mode slipped through: never feed a quantized
+                # cache to a bf16 request (or vice versa with wrong bits).
+                try:
+                    from mlx_lm.models.cache import make_prompt_cache
+                    cache = make_prompt_cache(self.model)
+                except Exception:
+                    cache = None
+                remaining = prompt_tokens
+                cache_tier = "cold"
             if cache is None:
                 try:
                     from mlx_lm.models.cache import make_prompt_cache
@@ -291,16 +363,27 @@ class MLXLMAdapter(BaseAdapter):
                     completed = True
                     break
                 except Exception as exc:
-                    if (cache_tier != "paged_disk" or saw_model_event or retried_exact
-                            or request_id in self.cancelled):
+                    paged_failed = (cache_tier == "paged_disk" and not saw_model_event
+                                    and not retried_exact and request_id not in self.cancelled)
+                    quant_failed = (quantized_active and not saw_model_event
+                                    and not retried_exact and request_id not in self.cancelled)
+                    if not (paged_failed or quant_failed):
                         raise
-                    # A restored cache is an optimization only. Before the first
-                    # model event, discard it and replay exactly once from a
-                    # runtime-created empty cache. No public delta can duplicate.
-                    LOGGER.warning("Paged KV failed before first output; retrying EXACT: %s", exc)
-                    if self.prompt_cache is not None:
-                        self.prompt_cache.mark_paged_fallback(
-                            f"first_evaluation:{type(exc).__name__}")
+                    # A restored/quantized cache is an optimization only. Before
+                    # the first model event, discard it and replay exactly once
+                    # from a runtime-created empty cache. No public delta can
+                    # duplicate.
+                    if paged_failed:
+                        LOGGER.warning("Paged KV failed before first output; retrying EXACT: %s", exc)
+                        if self.prompt_cache is not None:
+                            self.prompt_cache.mark_paged_fallback(
+                                f"first_evaluation:{type(exc).__name__}")
+                    else:
+                        LOGGER.warning("Quantized KV failed before first output; retrying bf16: %s", exc)
+                        self.kv_fallback_reason = f"first_evaluation:{type(exc).__name__}"
+                        for key in ("kv_bits", "kv_group_size", "quantized_kv_start"):
+                            kwargs.pop(key, None)
+                        quantized_active = False
                     from mlx_lm.models.cache import make_prompt_cache
                     cache = make_prompt_cache(self.model)
                     kwargs["prompt"] = prompt_tokens
@@ -355,6 +438,32 @@ class MLXLMAdapter(BaseAdapter):
                    "generation_tps": float(getattr(last_response, "generation_tps", 0.0) or 0.0)}
         elif finish_reason:
             yield {"type": "metrics", "finish_reason": finish_reason}
+
+    def _cache_matches_kv_mode(self, cache) -> bool:
+        """Whether a reused cache belongs to the latched quantization mode.
+
+        A quantized cache carries a `bits` attribute on its layers; a
+        full-precision cache does not. Mixing them would silently run the
+        wrong attention path, so a mismatch is treated as a cold miss.
+        """
+        if cache is None:
+            return True
+        try:
+            layers = list(cache)
+        except TypeError:
+            return False
+        if not layers:
+            return True
+        if self.kv_bits is None:
+            return not any(hasattr(layer, "bits") for layer in layers)
+        for layer in layers:
+            bits = getattr(layer, "bits", None)
+            group = getattr(layer, "group_size", None)
+            if bits is None:
+                continue
+            if int(bits) != int(self.kv_bits) or int(group or 0) != int(self.kv_group_size):
+                return False
+        return True
 
     def _remember(self, cache, prompt_tokens: list[int], generated: list[int],
                   completed: bool, request_id: str) -> None:

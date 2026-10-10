@@ -98,10 +98,37 @@ class WorkerSupervisor:
         suffix = "" if self.instance_key == "legacy" else f"-{self.instance_key}"
         return self.root / "logs" / f"worker-{engine}{suffix}.log"
 
+    def _kv_quant_mode(self) -> str:
+        kv_quant = ((self.settings.data.get("experimental", {}) or {})
+                    .get("kvCacheQuantization", {}) or {})
+        mode = kv_quant.get("mode", "bf16")
+        return mode if mode in {"bf16", "8bit", "4bit"} else "bf16"
+
+    def _configure_kv_quant_environment(self, env: dict[str, str], engine: str) -> None:
+        # Live KV quantization is an mlx-lm-only path. The mlx-vlm worker
+        # never reads these variables. bf16 (the default) leaves the
+        # environment untouched so v2.4.1 behaviour is byte-for-byte.
+        if engine != "mlx-lm":
+            return
+        mode = self._kv_quant_mode()
+        if mode == "bf16":
+            return
+        env["MLXBAR_KV_QUANT_MODE"] = mode
+        env["MLXBAR_KV_QUANT_BITS"] = "8" if mode == "8bit" else "4"
+        # Fixed in v2.5.0 to keep the validation surface minimal. The worker
+        # reports the effective values in its status for future phases.
+        env["MLXBAR_KV_QUANT_GROUP_SIZE"] = "64"
+        env["MLXBAR_KV_QUANT_START"] = "0"
+
     def _configure_paged_cache_environment(self, env: dict[str, str], engine: str) -> None:
         paged = ((self.settings.data.get("experimental", {}) or {})
                  .get("pagedKVCache", {}) or {})
         if not paged.get("enabled", False):
+            return
+        # Quantized live KV and plain-KV SSD blocks are different layouts
+        # (different bytes/token and different restore path). Never combine
+        # them: quantization wins and paged stays off with a visible reason.
+        if self._kv_quant_mode() != "bf16":
             return
         # Separate roots make ownership and deletion unambiguous even when
         # replicas write concurrently. Divide the global quota by the latched
@@ -229,6 +256,7 @@ class WorkerSupervisor:
             min(10, max(1, int(cache_settings.get("keepGenerations", 2)))))
         env["MLXBAR_PROMPT_CACHE_MEMORY_RATIO"] = str(cache_settings.get("memoryRatio", 0.10))
         self._configure_paged_cache_environment(env, engine)
+        self._configure_kv_quant_environment(env, engine)
         # Stable block hashes are required for reuse across Python processes.
         # PromptCacheState owns the RAM tier, so do not duplicate exact hybrid
         # snapshots inside APC's separate in-memory LRU.

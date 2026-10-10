@@ -196,6 +196,16 @@ DEFAULTS: dict[str, Any] = {
             "memoryRatio": 0.05,
             "branchReuse": True,
         },
+        # Live KV cache quantization for the mlx-lm worker (DESIGN_v2.5.0.md).
+        # "bf16" keeps the pre-v2.5.0 full-precision behaviour byte-for-byte;
+        # "8bit"/"4bit" quantize via mlx-lm's native QuantizedKVCache
+        # (group_size 64, quantized from the first token). Entirely dormant
+        # until mode leaves "bf16". groupSize/start stay fixed in this
+        # version to keep the validation surface minimal; they are recorded
+        # in the worker status for future phases.
+        "kvCacheQuantization": {
+            "mode": "bf16",
+        },
     },
     "security": {"trustRemoteCodeDefault": False, "allowLan": False,
                  "allowRemoteImageUrls": False},
@@ -428,6 +438,10 @@ class SettingsStore:
                 or not isinstance(paged_memory_ratio, (int, float))
                 or not 0 <= float(paged_memory_ratio) <= 0.20):
             raise ValueError("experimental.pagedKVCache.memoryRatio must be between 0 and 0.20")
+        kv_quant = data.get("experimental", {}).get("kvCacheQuantization", {})
+        if kv_quant.get("mode", "bf16") not in {"bf16", "8bit", "4bit"}:
+            raise ValueError("experimental.kvCacheQuantization.mode must be bf16, 8bit or 4bit / "
+                             "experimental.kvCacheQuantization.modeはbf16/8bit/4bitで指定してください")
         rag = data.get("rag", {})
         if not isinstance(rag.get("enabled", False), bool):
             raise ValueError("rag.enabled must be boolean")

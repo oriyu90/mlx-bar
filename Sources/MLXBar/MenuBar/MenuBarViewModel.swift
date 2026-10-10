@@ -1240,6 +1240,23 @@ final class MenuBarViewModel: ObservableObject {
         }
     }
 
+    func setKVCacheQuantization(mode: String) async {
+        guard ["bf16", "8bit", "4bit"].contains(mode) else {
+            errorMessage = ui("KV cache mode must be bf16, 8bit or 4bit",
+                              "KVキャッシュのモードはbf16/8bit/4bitで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["experimental": ["kvCacheQuantization": [
+                "mode": mode,
+            ]]])
+            await self.refreshSettings()
+            self.promptCacheMessage = self.ui(
+                "The setting applies the next time the model worker starts",
+                "設定は次にモデルWorkerを起動したときに反映されます")
+        }
+    }
+
     // MARK: - Knowledge base (RAG)
 
     /// Config + collection list, no network probe of the embedding backend.

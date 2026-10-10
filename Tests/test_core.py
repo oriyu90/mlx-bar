@@ -137,6 +137,48 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(Path(env["MLXBAR_PAGED_KV_ROOT"]),
                              root / "paged-kv-cache" / "mlx-lm" / "model-1")
 
+    def test_kv_quant_defaults_to_bf16_and_rejects_unknown_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory))
+            self.assertEqual(store.data["experimental"]["kvCacheQuantization"]["mode"], "bf16")
+            updated = store.update({"experimental": {"kvCacheQuantization": {"mode": "8bit"}}})
+            self.assertEqual(updated["experimental"]["kvCacheQuantization"]["mode"], "8bit")
+            with self.assertRaisesRegex(ValueError, "kvCacheQuantization"):
+                store.update({"experimental": {"kvCacheQuantization": {"mode": "fp16"}}})
+
+    def test_kv_quant_environment_is_absent_for_bf16_and_set_for_quantized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            supervisor = WorkerSupervisor(root, store, instance_key="model-1", reap_orphans=False)
+            env: dict = {}
+            supervisor._configure_kv_quant_environment(env, "mlx-lm")
+            self.assertEqual(env, {})
+            # mlx-vlm never receives the variables.
+            store.update({"experimental": {"kvCacheQuantization": {"mode": "8bit"}}})
+            env_vlm: dict = {}
+            supervisor._configure_kv_quant_environment(env_vlm, "mlx-vlm")
+            self.assertEqual(env_vlm, {})
+            env_lm: dict = {}
+            supervisor._configure_kv_quant_environment(env_lm, "mlx-lm")
+            self.assertEqual(env_lm["MLXBAR_KV_QUANT_BITS"], "8")
+            self.assertEqual(env_lm["MLXBAR_KV_QUANT_MODE"], "8bit")
+
+    def test_paged_stays_off_while_kv_quant_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.update({"experimental": {
+                "pagedKVCache": {"enabled": True, "diskMaxGB": 12},
+                "kvCacheQuantization": {"mode": "4bit"}}})
+            supervisor = WorkerSupervisor(root, store, instance_key="model-1", reap_orphans=False)
+            env: dict = {}
+            supervisor._configure_paged_cache_environment(env, "mlx-lm")
+            self.assertEqual(env, {})
+            kv_env: dict = {}
+            supervisor._configure_kv_quant_environment(kv_env, "mlx-lm")
+            self.assertEqual(kv_env["MLXBAR_KV_QUANT_BITS"], "4")
+
     def test_preloading_the_last_model_is_on_by_default_and_type_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))

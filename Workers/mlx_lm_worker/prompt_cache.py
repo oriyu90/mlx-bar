@@ -46,7 +46,8 @@ class PromptCacheStore:
                  memory_max_bytes: int | None = None, model=None,
                  cache_budget: dict | None = None, paged_enabled: bool = False,
                  paged_root: str | None = None, paged_disk_enabled: bool = True,
-                 paged_max_bytes: int = 0, paged_branch_reuse: bool = True):
+                 paged_max_bytes: int = 0, paged_branch_reuse: bool = True,
+                 kv_mode: str = "bf16", kv_bits: int | None = None):
         self.model_path = model_path
         self.guard_tokens = max(0, guard_tokens)
         self.max_bytes = max(0, max_bytes)
@@ -57,6 +58,13 @@ class PromptCacheStore:
         self.disk_hits = 0
         self.memory_hits = 0
         self.paged = None
+        # Live KV quantization mode latched at worker startup. The disk
+        # namespace and the in-memory key both carry it so bf16/8bit/4bit
+        # snapshots never mix, even across a mode change without a restart.
+        self.kv_mode = kv_mode if kv_mode in {"bf16", "8bit", "4bit"} else "bf16"
+        self.kv_bits = kv_bits if self.kv_mode != "bf16" else None
+        if self.kv_mode != "bf16" and self.kv_bits not in {4, 8}:
+            self.kv_bits = 8 if self.kv_mode == "8bit" else 4
         # A single 8k-token snapshot of a 32B model is around a gigabyte, so an
         # unbounded warm tier would quietly undo the memory limits this release
         # adds. Cap it against physical RAM unless told otherwise.
@@ -65,7 +73,11 @@ class PromptCacheStore:
         # This import is deliberately behind the master switch. With the
         # feature absent/disabled, v2.2.0 neither imports the new package nor
         # probes a cache class nor creates a paged directory.
-        if paged_enabled and model is not None and paged_root:
+        # Quantized live KV and plain-KV SSD blocks never mix: when
+        # quantization is active the paged tier stays unconstructed and
+        # reports kv_quantized through stats().
+        paged_gated_by_quant = self.kv_bits is not None
+        if paged_enabled and model is not None and paged_root and not paged_gated_by_quant:
             try:
                 from .paged_cache import PagedKVStore
                 model_fingerprint = self._fingerprint(Path(model_path), runtime_version)
@@ -83,7 +95,8 @@ class PromptCacheStore:
             self.disabled_reason = "cache_root_missing"
             return
         try:
-            self.namespace = f"mlxbar-lm-v1-{self._fingerprint(Path(model_path), runtime_version)}"
+            self.namespace = (f"mlxbar-lm-v1-{self._fingerprint(Path(model_path), runtime_version)}"
+                              f"-kv-{self.kv_mode}")
             self.root = Path(root)
             (self.root / self.namespace).mkdir(parents=True, exist_ok=True)
             os.chmod(self.root, 0o700)
@@ -142,7 +155,7 @@ class PromptCacheStore:
         passing one makes every lookup raise and silently disable the tier.
         mlx-lm's own server passes a key string for the same reason.
         """
-        return f"{self.namespace or 'mlxbar-lm'}:{self.model_path}"
+        return f"{self.namespace or 'mlxbar-lm'}:{self.model_path}:kv-{self.kv_mode}"
 
     def fetch(self, model, tokens: list[int]):
         """Return ``(cache, remaining_tokens, tier)`` for this prompt.
@@ -154,6 +167,8 @@ class PromptCacheStore:
         if not tokens:
             return None, tokens, "cold"
         cache, remaining = self._fetch_memory(self.model_key, tokens)
+        if cache is not None and not self._cache_matches_kv_mode(cache):
+            cache, remaining = None, tokens
         if cache is not None and len(remaining) < len(tokens):
             self.memory_hits += 1
             return cache, remaining, "memory"
@@ -192,6 +207,17 @@ class PromptCacheStore:
         self._store_disk(model, tokens, cache, prompt_length or len(tokens))
 
     def stats(self) -> dict:
+        if self.kv_bits is not None and self.paged is None:
+            paged_stats: dict = {
+                "configured": False, "enabled": False, "eligible": False,
+                "capability": "disabled", "formatVersion": 1, "blockSize": 256,
+                "disabledReason": "kv_quantized",
+            }
+        else:
+            paged_stats = (self.paged.stats() if self.paged is not None else {
+                "configured": False, "enabled": False, "eligible": False,
+                "capability": "disabled", "formatVersion": 1, "blockSize": 256,
+            })
         result = {
             "enabled": self.memory is not None or self.root is not None,
             "engine": "mlx-lm",
@@ -203,10 +229,9 @@ class PromptCacheStore:
             "diskHits": self.disk_hits,
             "generations": self._namespace_count(),
             "diskBytes": self._namespace_bytes(),
-            "pagedKV": (self.paged.stats() if self.paged is not None else {
-                "configured": False, "enabled": False, "eligible": False,
-                "capability": "disabled", "formatVersion": 1, "blockSize": 256,
-            }),
+            "pagedKV": paged_stats,
+            "kvQuant": {"mode": self.kv_mode, "bits": self.kv_bits,
+                        "active": self.kv_bits is not None},
         }
         if self.memory is not None:
             with contextlib.suppress(Exception):
@@ -232,6 +257,36 @@ class PromptCacheStore:
     def mark_paged_fallback(self, reason: str) -> None:
         if self.paged is not None:
             self.paged.mark_exact_fallback(reason)
+
+    def _cache_matches_kv_mode(self, cache) -> bool:
+        """Whether a reused cache belongs to this store's quantization mode."""
+        if cache is None:
+            return True
+        try:
+            layers = list(cache)
+        except TypeError:
+            return False
+        if not layers:
+            return True
+        if self.kv_bits is None:
+            return not any(hasattr(layer, "bits") for layer in layers)
+        for layer in layers:
+            bits = getattr(layer, "bits", None)
+            if bits is None:
+                continue
+            try:
+                if int(bits) != int(self.kv_bits):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            group = getattr(layer, "group_size", None)
+            if group is not None:
+                try:
+                    if int(group) != 64:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        return True
 
     # ------------------------------------------------------------ memory tier
 
@@ -318,6 +373,12 @@ class PromptCacheStore:
                     path.unlink()
                 self._write_index([item for item in entries if item is not entry])
                 continue
+            if not self._cache_matches_kv_mode(cache):
+                LOGGER.warning("Discarding prompt-cache snapshot %s from another KV mode", path.name)
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                self._write_index([item for item in entries if item is not entry])
+                continue
             with contextlib.suppress(OSError):
                 os.utime(path)
             return cache, length
@@ -340,6 +401,8 @@ class PromptCacheStore:
         if any(item.get("digest") == digest for item in entries):
             return
         if not can_trim_prompt_cache(cache):
+            return
+        if not self._cache_matches_kv_mode(cache):
             return
         try:
             import copy

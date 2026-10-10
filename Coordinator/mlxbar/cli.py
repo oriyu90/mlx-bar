@@ -138,6 +138,11 @@ def parser() -> argparse.ArgumentParser:
     set_paged.add_argument("--disk-enabled", choices=["true", "false"], default=None)
     set_paged.add_argument("--disk-max-gb", type=int, default=None)
     set_paged.add_argument("--branch-reuse", choices=["true", "false"], default=None)
+    set_kv_quant = config.add_parser(
+        "set-kv-cache-quantization",
+        help="ライブKVキャッシュ量子化（mlx-lmのみ、bf16既定・8bit/4bit実験）")
+    set_kv_quant.add_argument("--mode", choices=["bf16", "8bit", "4bit"], default=None,
+                              help="bf16=無効（既定）、8bit=ほぼ無劣化、4bit=省メモリだが品質低下あり")
     set_flag = config.add_parser("set-flag", help="GUIのトグル設定を名前で切り替え")
     set_flag.add_argument("name", choices=["auto-load-on-api", "anthropic-api", "remote-image-urls",
                                            "require-token", "continue-after-gui-exit",
@@ -521,6 +526,11 @@ def execute(args, client: Client):
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings",
                                   {"experimental": {"pagedKVCache": patch}}).json()
+        if args.action == "set-kv-cache-quantization":
+            if args.mode is None:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/settings",
+                                  {"experimental": {"kvCacheQuantization": {"mode": args.mode}}}).json()
         if args.action == "set-flag":
             keys = {"auto-load-on-api": "models.autoLoadOnAPIRequest",
                     "anthropic-api": "api.anthropic.enabled",

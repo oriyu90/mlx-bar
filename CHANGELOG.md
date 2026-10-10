@@ -2,6 +2,26 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.5.0] - 2026-10-10
+
+既定bf16のまま互換性を保ち、mlx-lmのライブKVキャッシュ量子化（8bit/4bit）を
+実験的オプションとして追加しました。既定ではv2.4.1とバイト等価です。
+
+### 追加
+
+- `experimental.kvCacheQuantization.mode`（bf16/8bit/4bit、既定bf16）を追加。
+  8bitはほぼ無劣化、4bitは最大省メモリ・品質低下あり。groupSize 64・開始0固定。
+- mlx-lm Workerへ`MLXBAR_KV_QUANT_*`を配線し、`stream_generate`のネイティブ
+  `QuantizedKVCache`経路を使用。失敗時は最初のモデル出力前にbf16へ1回だけ
+  自動退避し、生成自体は失敗させない。
+- プロンプトキャッシュのnamespaceとメモリキーをKVモード別に分離し、
+  異モードのスナップショットを混ぜない。量子化中有効時はPaged KVを休止
+  （理由`kv_quantized`を表示）。
+- 「Settings…」→「キャッシュ」にKV量子化セクションを追加（日英対応）。
+  `mlxbarctl config set-kv-cache-quantization --mode`でCLIからも設定可能。
+
+詳細は[`DESIGN_v2.5.0.md`](DESIGN_v2.5.0.md)、検証記録は[`TEST_PLAN_v2.5.0.md`](TEST_PLAN_v2.5.0.md)を参照してください。
+
 ## [2.4.1] - 2026-09-23
 
 v2.4.0実装後の監査で検出した4件を修正するパッチリリースです。新規エンジン機能・

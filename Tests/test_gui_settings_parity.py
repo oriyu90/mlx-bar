@@ -349,6 +349,47 @@ class RagAdvancedTests(unittest.TestCase):
                 store.update({"rag": {"maxChunksPerCollection": 99}})
 
 
+class KVQuantizationTests(unittest.TestCase):
+    def test_cli_sends_mode_only(self):
+        client = Mock()
+        client.request.return_value = response({})
+        execute(argparse.Namespace(command="config", action="set-kv-cache-quantization",
+                                   mode="8bit"), client)
+        client.request.assert_called_once_with(
+            "PUT", "/api/v1/settings",
+            {"experimental": {"kvCacheQuantization": {"mode": "8bit"}}})
+
+    def test_cli_requires_mode(self):
+        client = Mock()
+        client.request.return_value = response({})
+        with self.assertRaises(ValueError):
+            execute(argparse.Namespace(command="config", action="set-kv-cache-quantization",
+                                       mode=None), client)
+
+    def test_gui_payload_accepted_and_invalid_rejected(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(root=Path(directory))
+            # Mirror MenuBarViewModel.setKVCacheQuantization.
+            public = store.update({"experimental": {"kvCacheQuantization": {"mode": "8bit"}}})
+            self.assertEqual(public["experimental"]["kvCacheQuantization"]["mode"], "8bit")
+            public = store.update({"experimental": {"kvCacheQuantization": {"mode": "4bit"}}})
+            self.assertEqual(public["experimental"]["kvCacheQuantization"]["mode"], "4bit")
+            public = store.update({"experimental": {"kvCacheQuantization": {"mode": "bf16"}}})
+            self.assertEqual(public["experimental"]["kvCacheQuantization"]["mode"], "bf16")
+            for bad in ("fp16", "BF16", "8BIT", "", None, 8):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    store.update({"experimental": {"kvCacheQuantization": {"mode": bad}}})
+
+    def test_default_is_bf16(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(root=Path(directory))
+            self.assertEqual(store.public()["experimental"]["kvCacheQuantization"]["mode"], "bf16")
+
+
 class AdaptiveFallbackTests(unittest.TestCase):
     def test_fallback_flag_sent(self):
         client = Mock()

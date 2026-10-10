@@ -422,3 +422,14 @@
 "無効（将来用）" = "Off (reserved for future use)";
 "RAMホット層とKV量子化は実機計測後の別phaseのため、この版ではSSD層のみです。" = "The RAM hot tier and KV quantization wait for on-device measurements in a later phase; this version offers the SSD tier only.";
 "ログレベルの変更は次回サービス起動時に反映されます。" = "Log level changes take effect at the next service start.";
+"KVキャッシュ量子化（実験）" = "KV Cache Quantization (Experimental)";
+"KVキャッシュの精度" = "KV cache precision";
+"bf16（無効・最高品質）" = "bf16 (off, best quality)";
+"8bit（省メモリ・ほぼ無劣化）" = "8bit (less memory, near-lossless)";
+"4bit（最大省メモリ・品質低下あり）" = "4bit (least memory, quality loss possible)";
+"KV量子化設定を適用" = "Apply KV Quantization Settings";
+"bf16（無効）" = "bf16 (off)";
+"KV量子化が有効のためPaged KVは休止します。" = "Paged KV is paused while KV quantization is active.";
+"mlx-lmのライブKVのみが対象です。8bitはほぼ無劣化、4bitは長い推論・コード生成で劣化する場合があります。非対応モデル・回転キャッシュ・複合キャッシュ・失敗時は通常のbf16生成へ戻ります。設定変更は次のモデルWorker起動時に反映されます。" = "Applies to live mlx-lm KV only. 8bit is near-lossless; 4bit may degrade long reasoning or code generation. Unsupported models, rotating or composite caches, and failures fall back to normal bf16 generation. Changes apply when the model worker next starts.";
+"KV量子化が有効のためPagedは休止中です" = "Paused while KV quantization is active";
+"RAMホット層は実機計測後の別phaseのため、この版ではSSD層のみです。KV量子化は下の専用セクションで設定します。" = "The RAM hot tier waits for on-device measurements in a later phase; this version offers the SSD tier only. Configure KV quantization in the dedicated section below.";
