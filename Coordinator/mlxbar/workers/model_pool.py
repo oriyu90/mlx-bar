@@ -794,6 +794,95 @@ class ModelPoolSupervisor:
                      slot.model.get("id"), source)
         return True
 
+    def _recover_slot_state(self, slot: PoolSlot, source: str) -> bool:
+        """Self-heal a slot whose generation bookkeeping went stale.
+
+        ``generate_for_model`` releases its lane and lease in a ``finally``
+        block, but that block only runs when the async generator is closed
+        (``aclose``). A client that disconnects without the API layer closing
+        the generator leaves ``gen_owner`` and/or ``leases`` behind, and the
+        menu bar then reports "generating" forever. The pool previously only
+        recovered such lanes when the *next* request for that slot arrived;
+        an idle model never got another request, so the stale state was
+        permanent. Calling this from ``status()`` (which the menu bar polls
+        every second) bounds the staleness to one poll interval.
+
+        Only recovers when no live request could own the state: no worker
+        active request, no queued waiter, no lane owner, lane lock free. The
+        entry path from ``leases += 1`` to lane acquisition contains no
+        ``await`` while all four markers are clear, so a live request can
+        never be observed in this state by the event loop.
+        """
+        recovered = False
+        if self._recover_lane(slot, source):
+            recovered = True
+        if (slot.leases > 0 and not slot.worker.active_requests
+                and not slot.gen_queued and slot.gen_owner is None
+                and not slot.gen_lock.locked()):
+            slot.leases = 0
+            slot.last_released_at = time.monotonic()
+            slot.gen_recoveries += 1
+            LOGGER.error("Recovered orphaned pool leases model=%s source=%s",
+                         slot.model.get("id"), source)
+            recovered = True
+        return recovered
+
+    async def _maybe_expand_replica(self, busy_slot: PoolSlot, model_id: str) -> PoolSlot:
+        """Best-effort on-demand replica so a 2nd parallel generation can run.
+
+        Before v2.7.0, same-model parallelism required a pinned profile with
+        ``replicas >= 2``: API autoload (``pin=False``) only ever brought one
+        copy up, so ``generationConcurrency >= 2`` alone left the 2nd request
+        queued behind the 1st on the single lane. Users experienced this as
+        "the 2nd parallel generation never runs, blocked by the resident
+        limit" -- while ``maxResidentModels`` itself never blocks generation
+        (it caps *distinct* model ids at load time and already absorbs
+        same-model replicas since v2.0.1).
+
+        When every ready replica is busy and the pool allows more concurrent
+        lanes, try to load one more copy (``pin=False``, so the reaper's TTL
+        and replica scale-down reclaim it when idle). Admission
+        (``_load_replica`` -> ``_admit``) still enforces the per-model cap,
+        global budget, OS pressure and free-memory headroom; any refusal
+        falls back to queueing on the busy slot, exactly the pre-v2.7.0
+        behaviour. Never raises: all failures return ``busy_slot``.
+        """
+        try:
+            settings = self._pool_settings()
+            ceiling = max(1, min(8, int(settings.get("maxReplicasPerModel", 2)),
+                                 self._gen_concurrency))
+        except (TypeError, ValueError):
+            return busy_slot
+        if ceiling <= 1 or self._gen_concurrency <= 1:
+            return busy_slot
+        present = {slot.replica_index for slot in self._replica_slots(model_id)}
+        if len(present) >= ceiling:
+            return busy_slot
+        index = next((i for i in range(ceiling) if i not in present), len(present))
+        engine = ((busy_slot.worker.loaded or {}).get("engine")
+                  or busy_slot.model.get("engine"))
+        try:
+            await self._load_replica(dict(busy_slot.model), engine, model_id,
+                                     index, pin=False)
+        except MLXBarError as exc:
+            ready = len([slot for slot in self._replica_slots(model_id)
+                         if slot.state == "ready"])
+            self._replica_admission_failures[model_id] = {
+                "desired": len(present) + 1, "ready": ready,
+                "code": exc.code, "message": str(exc), "at": time.time(),
+            }
+            LOGGER.warning(
+                "Could not expand replica for parallel generation of %s "
+                "(%s: %s); queueing behind the busy replica",
+                model_id, exc.code, exc)
+            return busy_slot
+        except Exception:  # noqa: BLE001 - expansion is best effort only
+            LOGGER.exception("On-demand replica expansion failed for %s; queueing",
+                             model_id)
+            return busy_slot
+        fresh = self._pick_replica(model_id)
+        return fresh or busy_slot
+
     async def generate_for_model(self, model_id: str, prompt, images: list[str], options: dict,
                                  request_id: str | None = None, image_root: Path | None = None):
         if not self.enabled:
@@ -810,6 +899,12 @@ class ModelPoolSupervisor:
         slot = self._pick_replica(model_id)
         if slot is None:
             raise MLXBarError("MODEL_NOT_LOADED", "要求されたモデルがロードされていません", 409, True)
+        if slot.gen_lock.locked() or slot.gen_queued:
+            # Every ready replica is busy (idle replicas are preferred by
+            # _pick_replica). Grow one best-effort on-demand copy so the 2nd
+            # parallel generation has a lane instead of queueing behind the
+            # 1st. Falls back to the busy slot when memory/pressure refuses.
+            slot = await self._maybe_expand_replica(slot, model_id)
         request_id = request_id or hashlib.sha256(os.urandom(16)).hexdigest()
         self._recover_lane(slot, "new_request")
         slot.leases += 1
@@ -865,21 +960,31 @@ class ModelPoolSupervisor:
                                                     image_root=image_root):
                 yield event
         finally:
+            # Release synchronous state FIRST, before any await: status() (and
+            # the menu bar behind it) must never observe a finished generation
+            # as still holding its lane/lease while this finalizer awaits
+            # helper-task cancellation below. Unconditional: _release_lane is
+            # a no-op unless gen_owner matches this request, so it also covers
+            # the race where `acquire_task` finished acquiring the lane but
+            # the awaiting frame was cancelled before continuing.
+            slot.gen_queued.pop(request_id, None)
+            self._request_workers.pop(request_id, None)
+            self._release_lane(slot, request_id)
+            slot.leases = max(0, slot.leases - 1)
+            slot.last_released_at = time.monotonic()
             if cancel_task:
                 cancel_task.cancel()
             if acquire_task and not acquire_task.done():
                 acquire_task.cancel()
-            await asyncio.gather(*(task for task in (cancel_task, acquire_task) if task),
-                                 return_exceptions=True)
-            slot.gen_queued.pop(request_id, None)
-            self._request_workers.pop(request_id, None)
-            # Unconditional: _release_lane is a no-op unless gen_owner matches
-            # this request, so it also covers the race where `acquire_task`
-            # finished acquiring the lane but the awaiting frame was cancelled
-            # before `lane = True` ran.
-            self._release_lane(slot, request_id)
-            slot.leases = max(0, slot.leases - 1)
-            slot.last_released_at = time.monotonic()
+            # Shielded: this finalizer also runs while unwinding a client
+            # disconnect (GeneratorExit/CancelledError). An unshielded await
+            # here would itself be cancelled, stranding the lane/lease above
+            # -- but those are already released, so a failure here is only a
+            # missed task join, never a stuck "generating" row.
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(asyncio.gather(
+                    *(task for task in (cancel_task, acquire_task) if task),
+                    return_exceptions=True))
 
     async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None,
                        image_root: Path | None = None):
@@ -1047,6 +1152,11 @@ class ModelPoolSupervisor:
         loading = None
         active_generations = 0
         for slot in list(self._slots.values()):
+            # Opportunistic self-heal: a disconnected client can leave a lane
+            # or lease behind (see _recover_slot_state). Recovering here bounds
+            # the menu bar's stale "generating" display to one poll interval
+            # instead of requiring the next request for that model.
+            self._recover_slot_state(slot, "status")
             child = slot.worker.status()
             slot.keep_loaded = bool(self._profile(str(slot.model.get("id", ""))).get(
                 "keepLoaded", False))
@@ -1154,6 +1264,10 @@ class ModelPoolSupervisor:
             "residentModelCount": len({item.get("id") for item in loaded_models}),
             "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
             "maxReplicasPerModel": self._pool_settings().get("maxReplicasPerModel", 2),
+            # Non-resident unload timing (v2.7.0): live without a restart.
+            # Surfaced here so `model resident` and the GUI can show it without
+            # an extra settings round trip.
+            "idleTTLSeconds": self._pool_settings().get("idleTTLSeconds", 900),
             "generationConcurrency": self._gen_concurrency,
             "effectiveGenerationConcurrency": self._gen_concurrency,
             "configuredGenerationConcurrency": configured_concurrency,

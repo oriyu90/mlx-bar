@@ -53,6 +53,11 @@ struct ResidentModel: Identifiable, Hashable {
     /// bar tell "generating" apart from "queued behind another request" per
     /// row (v1.10.0), without any backend change.
     let laneQueueDepth: Int
+    /// Wall-clock time when this non-resident slot becomes eligible for
+    /// idle eviction (pool `idleExpiresAt`, v1.6.2 field). Nil for pinned /
+    /// externally managed models, which never expire. Used only for the
+    /// "unloads in N" countdown in the row detail.
+    let idleExpiresAt: Date?
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -67,6 +72,11 @@ struct ResidentModel: Identifiable, Hashable {
         replicaCount = (value["replicaCount"] as? NSNumber)?.intValue ?? 1
         replicaIndex = (value["replicaIndex"] as? NSNumber)?.intValue ?? 0
         laneQueueDepth = (value["laneQueueDepth"] as? NSNumber)?.intValue ?? 0
+        if let expires = (value["idleExpiresAt"] as? NSNumber)?.doubleValue, expires > 0 {
+            idleExpiresAt = Date(timeIntervalSince1970: expires)
+        } else {
+            idleExpiresAt = nil
+        }
         let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
     }
@@ -111,6 +121,23 @@ struct ResidentModel: Identifiable, Hashable {
         guard let rate = generationTokensPerSecond, rate > 0 else { return nil }
         let value = rate >= 10 ? String(Int(rate.rounded())) : String(format: "%.1f", rate)
         return japanese ? "\(value) tok/秒" : "\(value) tok/s"
+    }
+
+    /// Countdown until this non-resident model is unloaded for idleness, or
+    /// nil when it does not apply (busy, pinned, externally managed, or no
+    /// expiry reported). The global "idle time for unpinned models" setting
+    /// (30-86400s, live without restart) drives `idleExpiresAt`.
+    func idleCountdownText(japanese: Bool) -> String? {
+        guard activityState == "idle", !keepLoaded, !managedExternally,
+              let expires = idleExpiresAt else { return nil }
+        let remaining = expires.timeIntervalSinceNow
+        guard remaining > 1 else { return nil }
+        if remaining < 90 {
+            return japanese ? "あと\(Int(remaining))秒で解放"
+                : "Unloads in \(Int(remaining)) sec"
+        }
+        return japanese ? "あと\(Int(remaining / 60))分で解放"
+            : "Unloads in \(Int(remaining / 60)) min"
     }
 }
 
@@ -466,10 +493,80 @@ final class MenuBarViewModel: ObservableObject {
             let residentRaw = (json["loadedModels"] as? [[String: Any]])
                 ?? [json["loadedModel"]].compactMap { $0 as? [String: Any] }
             // One row per distinct model; same-model replicas collapse into a
-            // single row that shows the replica count (see ×N badge).
-            var seenModelIDs = Set<String>()
-            let distinctResidents = residentRaw.compactMap(ResidentModel.init)
-                .filter { seenModelIDs.insert($0.id).inserted }
+            // single row. v2.7.0: aggregate liveness across the replicas, not
+            // just the rate -- previously the first replica's `activeLeases`
+            // / `laneQueueDepth` decided the row, so a busy second replica
+            // was hidden while idle, and a stale first replica pinned the row
+            // on "generating" after its work finished.
+            var mergedByID: [String: [String: Any]] = [:]
+            var modelOrder: [String] = []
+            for value in residentRaw {
+                guard let id = value["id"] as? String else { continue }
+                guard var existing = mergedByID[id] else {
+                    mergedByID[id] = value
+                    modelOrder.append(id)
+                    continue
+                }
+                let intValue: ([String: Any], String) -> Int = { dict, key in
+                    (dict[key] as? NSNumber)?.intValue ?? 0
+                }
+                existing["activeLeases"] = NSNumber(
+                    value: intValue(existing, "activeLeases") + intValue(value, "activeLeases"))
+                existing["laneQueueDepth"] = NSNumber(
+                    value: intValue(existing, "laneQueueDepth") + intValue(value, "laneQueueDepth"))
+                let rateOf: ([String: Any]) -> Double = { dict in
+                    (dict["generationTokensPerSecond"] as? NSNumber)?.doubleValue ?? 0
+                }
+                let bestRate = max(rateOf(existing), rateOf(value))
+                if bestRate > 0 {
+                    existing["generationTokensPerSecond"] = NSNumber(value: bestRate)
+                }
+                existing["replicaCount"] = NSNumber(
+                    value: max(intValue(existing, "replicaCount"), intValue(value, "replicaCount"), 1))
+                let bytesOf: ([String: Any]) -> Int64 = { dict in
+                    (dict["memoryReservationBytes"] as? NSNumber)?.int64Value ?? 0
+                }
+                let totalBytes = bytesOf(existing) + bytesOf(value)
+                if totalBytes > 0 {
+                    existing["memoryReservationBytes"] = NSNumber(value: totalBytes)
+                }
+                if (value["keepLoaded"] as? Bool) == true {
+                    existing["keepLoaded"] = true
+                }
+                if value["memoryManagedBy"] != nil {
+                    existing["memoryManagedBy"] = value["memoryManagedBy"]
+                }
+                // Busiest pool state wins so a loading / busy replica is never
+                // hidden behind an idle first replica.
+                let stateRank: ([String: Any]) -> Int = { dict in
+                    switch dict["poolState"] as? String {
+                    case "loading": return 3
+                    case "evicting": return 2
+                    case "external": return 1
+                    default: return 0
+                    }
+                }
+                if stateRank(value) > stateRank(existing) {
+                    existing["poolState"] = value["poolState"]
+                }
+                // Earliest expiry among unpinned replicas: the soonest unload
+                // the countdown can promise.
+                let expiryOf: ([String: Any]) -> Double? = { dict in
+                    guard let raw = (dict["idleExpiresAt"] as? NSNumber)?.doubleValue,
+                          raw > 0 else { return nil }
+                    return raw
+                }
+                switch (expiryOf(existing), expiryOf(value)) {
+                case let (old?, new?):
+                    existing["idleExpiresAt"] = NSNumber(value: min(old, new))
+                case (nil, let new?):
+                    existing["idleExpiresAt"] = NSNumber(value: new)
+                default:
+                    break
+                }
+                mergedByID[id] = existing
+            }
+            let distinctResidents = modelOrder.compactMap { ResidentModel(mergedByID[$0] ?? [:]) }
             setIfChanged(\.residentModels, distinctResidents)
             if json["modelPool"] == nil {
                 setIfChanged(\.residentModelCount, distinctResidents.count)

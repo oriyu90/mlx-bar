@@ -249,7 +249,12 @@ class ModelPoolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
-    """v1.7.0: distinct resident models generate concurrently; same model does not."""
+    """v1.7.0: distinct resident models generate concurrently.
+
+    Same-model requests queue behind the model lane; since v2.7.0 a busy
+    single-replica model instead grows one best-effort on-demand replica
+    (within the replica and concurrency caps) unless capped to one replica.
+    """
 
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -325,6 +330,10 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool._gen_active_lanes, 0)
 
     async def test_same_model_requests_stay_serialised(self):
+        # v2.7.0: with the default caps a busy single-replica model grows one
+        # best-effort on-demand replica, so this serial path is now pinned to
+        # the explicit single-replica configuration (maxReplicasPerModel=1).
+        self.settings.data["models"]["pool"]["maxReplicasPerModel"] = 1
         pool = self.make_pool()
         await pool.load(self.model(1))
         w1 = pool._slots["model-1"].worker
@@ -403,6 +412,9 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slot.gen_recoveries, 1)
 
     async def test_queued_request_can_be_cancelled_per_model(self):
+        # v2.7.0: see test_same_model_requests_stay_serialised -- queueing a
+        # same-model 2nd request needs the explicit single-replica cap now.
+        self.settings.data["models"]["pool"]["maxReplicasPerModel"] = 1
         pool = self.make_pool()
         await pool.load(self.model(1))
         w1 = pool._slots["model-1"].worker

@@ -575,15 +575,21 @@ class WorkerSupervisor:
                 await acquire_task
                 generation_acquired = True
             finally:
-                if cancel_task:
-                    cancel_task.cancel()
-                    await asyncio.gather(cancel_task, return_exceptions=True)
-                if acquire_task and not acquire_task.done():
-                    acquire_task.cancel()
-                    await asyncio.gather(acquire_task, return_exceptions=True)
+                # Release synchronous queue state before awaiting helper-task
+                # cancellation (same reason as the pool lane finalizer: an
+                # unshielded await here can itself be cancelled on disconnect,
+                # which must never strand queue/lock state).
                 if not generation_acquired:
                     self._release_generation_slot(request_id)
                 self.queued_requests.pop(request_id, None)
+                if cancel_task:
+                    cancel_task.cancel()
+                if acquire_task and not acquire_task.done():
+                    acquire_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(asyncio.gather(
+                        *(task for task in (cancel_task, acquire_task) if task),
+                        return_exceptions=True))
         else:
             await self._acquire_generation_slot(request_id)
             generation_acquired = True

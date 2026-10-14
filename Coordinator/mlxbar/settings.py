@@ -43,9 +43,13 @@ DEFAULTS: dict[str, Any] = {
             "maxReplicasPerModel": 2,
             # Cross-model concurrent generation cap (v1.7.0).  1 keeps the
             # pre-v1.7.0 behaviour: one generation at a time across the pool.
-            # Requests to the *same* model always stay serialised; this only
-            # lets distinct resident models generate at the same time, and only
-            # when the memory head-room guard says the combined peak still fits.
+            # Distinct resident models generate in parallel up to this cap.
+            # Same-model requests use an idle replica when one is ready; since
+            # v2.7.0 a busy single-replica model grows one best-effort
+            # on-demand replica (within maxReplicasPerModel and this cap, still
+            # gated by the memory head-room guard) instead of queueing, and
+            # falls back to arrival-order queueing when memory refuses.
+            # 1 restores the pre-v1.7.0 single lane.
             "generationConcurrency": 2,
             # Per-concurrent-generation memory head-room charged on top of the
             # resident reservation before a second lane is allowed to start.

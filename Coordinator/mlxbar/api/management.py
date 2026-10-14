@@ -237,7 +237,14 @@ async def generate(request: Request, body: dict):
             yield "data: " + json.dumps({"type": "error", "code": "INTERNAL_ERROR",
                                           "message": str(exc), "retryable": False}, ensure_ascii=False) + "\n\n"
         finally:
-            await generation.aclose()
+            # Shielded close so a disconnecting client cannot strand the
+            # pool lane/lease (see openai_compat._aclose_generation).
+            try:
+                await asyncio.shield(generation.aclose())
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
+            except Exception:  # noqa: BLE001 - cleanup must not fail the stream
+                pass
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 

@@ -637,6 +637,12 @@ struct ModelSourceSettingsView: View {
                 Text(LS("モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                Text(LS("同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを1つ増やして並行し、余裕がなければ順番待ちになります。最大常駐モデル数は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(LS("非固定モデルの待機時間は再起動不要で、次の見回りから反映されます。一覧の待機中の行には解放までの残り時間を表示します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("コンテキスト自動圧縮")) {
                 Toggle(LS("長い会話の古い部分を要約して短縮"), isOn: $contextCompressionEnabled)

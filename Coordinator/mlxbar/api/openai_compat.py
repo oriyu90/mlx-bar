@@ -19,6 +19,25 @@ from . import response_format as response_format_lib
 MAX_N = 8
 
 
+async def _aclose_generation(generation) -> None:
+    """Close a worker generation stream without stranding pool state.
+
+    The pool releases its lane/lease in the generator's own ``finally``, so a
+    skipped ``aclose`` leaves ``activeLeases > 0`` and the menu bar stuck on
+    "generating". The plain ``await generation.aclose()`` this replaces could
+    itself be cancelled when unwinding a client disconnect, stranding exactly
+    that state -- shield it and never propagate cleanup failures.
+    """
+    if generation is None:
+        return
+    try:
+        await asyncio.shield(generation.aclose())
+    except (asyncio.CancelledError, GeneratorExit):
+        pass
+    except Exception:  # noqa: BLE001 - cleanup must not fail the request
+        pass
+
+
 def _last_user_text(messages: list[dict]) -> str:
     """The text of the most recent user message, for use as a retrieval query."""
     for message in reversed(messages):
@@ -286,8 +305,7 @@ async def legacy_completions(request: Request, body: dict):
                 yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
                                                          "retryable": False}}, ensure_ascii=False) + "\n\n"
             finally:
-                if generation is not None:
-                    await generation.aclose()
+                await _aclose_generation(generation)
             if not failed and not completed:
                 chunk = {"id": request_id, "object": "text_completion", "created": created,
                          "model": response_model, "choices": [{"index": 0, "text": "",
@@ -345,7 +363,7 @@ async def _run_one_text_completion(request: Request, loaded: dict, prompt: str, 
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     finally:
-        await generation.aclose()
+        await _aclose_generation(generation)
     return text, finish_reason, usage or _usage([{"role": "user", "content": prompt}], text)
 
 
@@ -658,8 +676,7 @@ async def chat(request: Request, body: dict):
                 yield "data: " + json.dumps({"error": {"code": "INTERNAL_ERROR", "message": str(exc),
                                                          "retryable": False}}, ensure_ascii=False) + "\n\n"
             finally:
-                if generation is not None:
-                    await generation.aclose()
+                await _aclose_generation(generation)
                 if image_workspace:
                     image_workspace.cleanup()
             if not failed and not completed:
@@ -793,7 +810,7 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     finally:
-        await generation.aclose()
+        await _aclose_generation(generation)
     message = {"role": "assistant", "content": text or None if tool_calls else text}
     if reasoning_text:
         message["reasoning_content"] = reasoning_text

@@ -25,6 +25,7 @@ running extended thinking outside Anthropic's own infrastructure, not a bug.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import time
@@ -52,6 +53,18 @@ MAX_TOOLS = 128
 
 def _request_id() -> str:
     return "req_" + secrets.token_hex(16)
+
+
+async def _aclose_generation(generation) -> None:
+    """Shielded generator close (see openai_compat._aclose_generation)."""
+    if generation is None:
+        return
+    try:
+        await asyncio.shield(generation.aclose())
+    except (asyncio.CancelledError, GeneratorExit):
+        pass
+    except Exception:  # noqa: BLE001 - cleanup must not fail the request
+        pass
 
 
 def _error(status: int, kind: str, message: str) -> HTTPException:
@@ -393,8 +406,7 @@ async def _messages(request: Request):
                 yield sse({"__error__": True, "type": "error",
                            "error": {"type": "api_error", "message": str(exc)}})
             finally:
-                if generation is not None:
-                    await generation.aclose()
+                await _aclose_generation(generation)
                 if workspace:
                     workspace.cleanup()
         return StreamingResponse(event_stream(), media_type="text/event-stream",
@@ -414,7 +426,7 @@ async def _messages(request: Request):
         raise HTTPException(exc.status if exc.status >= 400 else 502, detail={
             "type": _anthropic_error_type(exc.code), "message": exc.message})
     finally:
-        await generation.aclose()
+        await _aclose_generation(generation)
         if workspace:
             workspace.cleanup()
     return JSONResponse(builder.final_message(), headers={"request-id": _request_id()})

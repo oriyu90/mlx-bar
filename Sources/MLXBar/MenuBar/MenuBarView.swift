@@ -238,6 +238,14 @@ struct MenuBarView: View {
                         .monospacedDigit()
                         .accessibilityLabel(LS("生成速度") + " \(rate)")
                 }
+                // Non-resident idle countdown (v2.7.0): proves the
+                // configurable idle TTL is in effect for this row.
+                if let countdown = resident.idleCountdownText(japanese: model.guiLanguage == "ja") {
+                    Text(countdown)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
             .padding(.leading, isVirtualLoadingRow ? 0 : 18)
             if isVirtualLoadingRow, let phase = model.loadingPhase {

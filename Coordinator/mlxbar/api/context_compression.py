@@ -27,6 +27,7 @@ an explicit, visible trade a user opts into, not a default behaviour change.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -115,7 +116,14 @@ async def _summarize(workers, model_id: str | None, middle: list[dict],
             elif event.get("type") == "error":
                 raise RuntimeError(event.get("message") or event.get("code") or "summary generation failed")
     finally:
-        await generation.aclose()
+        # Shielded close so a cancelled summary cannot strand the pool
+        # lane/lease (see openai_compat._aclose_generation).
+        try:
+            await asyncio.shield(generation.aclose())
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        except Exception:  # noqa: BLE001 - cleanup must not fail the request
+            pass
     return text
 
 

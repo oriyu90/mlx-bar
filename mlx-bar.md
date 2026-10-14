@@ -3,6 +3,32 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.7.0の待機表示・オンデマンド並列・待機時間可視化で守ること（2026-10-14リリース）
+
+- `status()` からの `_recover_slot_state(slot, "status")` は同期のみ。
+  lease 回復の4条件（worker active なし・queue なし・owner なし・lane lock 解放）が
+  揃ったときのみ `leases = 0` へ戻す。入口経路（`leases += 1`→lane 確保）にその状態での
+  `await` がないことが誤回復なしの根拠。条件を緩めたら
+  `test_status_leaves_a_live_generation_alone` で検出できる。
+- `generate_for_model` の `finally` は同期解放（queue 除去・lane 解放・lease 減算・
+  `last_released_at`）を先、helper-task の cancel＋join を後（shield＋suppress）。
+  順序を戻すと切断時に「応答生成中」が残留する。API 層7箇所の `aclose` は
+  `_aclose_generation` 経由の shield 付き以外を使わないこと。
+- オンデマンド拡張 `_maybe_expand_replica` は `pin=False` の一時容量。
+  admission（`_admit`）と lane 開始（`_admit_concurrent`）の両ゲートを通すことが契約。
+  拒否は queue フォールバック＋`replicaShortfalls` 記録。`generationConcurrency = 1`・
+  `maxReplicasPerModel = 1` では発火しない。reaper の TTL・縮退で回収されるため
+  常駐設定の書換えは不要。拡張の同時二重起動は `_load_replica` の singleflight が吸収する。
+- Swift の同一IDマージは `activeLeases`・`laneQueueDepth` 合計、rate は max、
+  `poolState` は loading > evicting > external > ready。単一レプリカでは合計＝単一値で
+  v2.6.0 と同一表示。行の残り時間はインライン日英（`.strings` 追加なし）。
+  設定画面の加筆2行のみ `.strings` へ日英2キー追加（重複検査は既存 `モデル未ロード` のみ残置）。
+- `modelPool` status の `idleTTLSeconds` と `model resident` の `idleExpiresAt` は増分。
+  旧 Coordinator でも Swift は `??` フォールバックで読む。TTL 自体の既定・範囲は不変。
+- 未実施：実画面目視の日英確認と実機2並列のメモリトレースは次版で実機作業として残る
+  （`TEST_PLAN_v2.7.0.md §2–3`）。v2.6.0 からの引き継ぎ（wizard 実画面・`runtime_update` 既定off・
+  `config set` 旧値の422可能性・実機 slot は mlx-vlm 0.7.3 のまま）は継続。
+
 ## v2.6.0の一括設定・初回セットアップで守ること（2026-10-11リリース）
 
 - preset footprintは6キー固定（`presets.py:MANAGED_KEYS`）。同時使用数・
@@ -127,7 +153,7 @@
 
 ## v1.7.0のモデル間同時生成で守ること
 
-- **同時生成はモデル間だけ。** `PoolSlot.gen_lock`が同一モデルを直列化し、プール全体の`asyncio.Semaphore(generationConcurrency)`がモデル間の並行数を束ねる。同一Workerプロセスは単一スレッドなので、同一モデル内の並行はやらない。`generationConcurrency=1`でv1.6.2と等価（生成順序・キュー・キャンセル・`/api/v1/status`）であることが不変条件。唯一の差は`queue`イベントの`position`がプール通し番号→モデルレーン単位（単一常駐モデルなら同一）。`enabled=false`はv1.6.1へ完全委譲でバイト等価。回帰は`test_concurrency_one_serialises_across_models`と既存プールテストで担保。
+- **同時生成はモデル間だけ。** `PoolSlot.gen_lock`が同一モデルを直列化し、プール全体の`asyncio.Semaphore(generationConcurrency)`がモデル間の並行数を束ねる（v1.7.0時点。v2.7.0で同一モデルは空きレプリカ優先＋busy時のオンデマンド1拡張へ変更したため、現行契約はv2.7.0節を参照）。`generationConcurrency=1`でv1.6.2と等価（生成順序・キュー・キャンセル・`/api/v1/status`）であることが不変条件。唯一の差は`queue`イベントの`position`がプール通し番号→モデルレーン単位（単一常駐モデルなら同一）。`enabled=false`はv1.6.1へ完全委譲でバイト等価。回帰は`test_concurrency_one_serialises_across_models`と既存プールテストで担保。
 - **1件目の生成は常に許可。** メモリ・ヘッドルームガード（`_admit_concurrent` / `_concurrent_start_ok`）は2レーン目以降にのみ効く。v1.6.x はメモリ圧を生成に対して見ていなかったので、`_gen_active_lanes == 0`のときは無条件で通す。ここを「常に判定」に変えると単一生成の挙動が退行する。
 - **ガードは失敗ではなくキュー降格。** 直列なら成功する要求を絶対に落とさない。permitが空いても`_acquire_lane`内で`_concurrent_start_ok`を再チェックし、通らなければpermitを返して50ms間隔で待つ（キューtimeoutで上限）。この二段構え（entry判定＋permit取得後の再判定）を片方だけにするとガードが素通りになる（`test_memory_guard_downgrades_second_lane_to_queue_without_failing`が実際に最初の実装のバグを捕まえた）。
 - **孤児レーン回復は`WorkerSupervisor._recover_orphaned_generation_slot`と同じ論理積をper modelで。** 「レーンlock保持中」「ownerがactiveにもqueuedにも不在」「unowned active request不在」の全一致でのみ解放する。v1.6.2のプール即席キューにはこの機構が無く、handshake中に切断したclientがレーンを恒久的に塞げた。`new_request` / `queue_wait` / `capacity_check`の各所で評価する。

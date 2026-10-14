@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.6.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.7.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -41,6 +41,9 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 一括設定モード（v2.6.0）：「Settings…」→「General」で軽量（KV 8bit・メモリ上限はPCの80%・ディスク控えめ）／フル（KV bf16・ディスク少し多め）／カスタム（記録のみ、設定変更なし）を切替。ハードウェアから自動計算し、`config apply-preset`でも適用可
 - 設定の書き出し・読み込み（v2.6.0）：全設定と版数情報をJSONで書出し（APIキー類は除外）、読込時はこのPCで適用できない項目だけ理由付きで除外。`config export`／`config import`
 - 初回セットアップ（v2.6.0、新規インストールのみ）：モデルフォルダ（既定はLM Studio標準）・同時使用数・一括設定モードを質問。スキップ可。`setup run`でも実行可
+- 生成後の待機表示の自己回復（v2.7.0）：切断などで取り残された生成状態を状態取得時に自動回復し、メニューバーが1ポーリング周期で待機中に戻ります。レプリカ集約も修正し、2つ目以降のレプリカの生成中・順番待ちが隠れなくなりました
+- 同一モデルのオンデマンド並列生成（v2.7.0）：同時要求で空きレプリカがなくメモリに余裕があれば、レプリカを1つ自動追加して並行します（上限はモデルごとの並列数と同時生成の上限の小さい方）。余裕がなければ従来どおり順番待ちです。`maxResidentModels`は異なるモデルの種類数の上限のままです
+- 非固定モデルの待機時間の可視化（v2.7.0）：設定は従来どおり「Settings…」→モデル→「非固定モデルの待機時間」（30〜86,400秒、再起動不要）で変更でき、待機中の行に解放までの残り時間、`model resident`に待機時間と解放予定時刻を表示します
 
 ## 動作要件
 
@@ -51,7 +54,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.6.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.7.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -114,7 +117,7 @@ ZCodeのシステム指示、会話履歴、ツール結果が従来の100,000�
 
 ### 複数モデル常駐とメモリ上限
 
-選択済みフォルダの別モデルをOpenAI互換APIが指定したとき、先のMLXモデルを即座に解放せず独立Workerで保持します。既定は最大2モデル、15分間、物理メモリの75%以下かつOS用に4 GB以上を残す設定です。モデルごとの既定上限は32 GBです。
+選択済みフォルダの別モデルをOpenAI互換APIが指定したとき、先のMLXモデルを即座に解放せず独立Workerで保持します。既定は最大2モデル、15分間、物理メモリの75%以下かつOS用に4 GB以上を残す設定です。モデルごとの既定上限は32 GBです。非固定モデルの待機時間（`models.pool.idleTTLSeconds`、既定900秒、範囲30〜86,400秒）は「Settings…」→モデル→「非固定モデルの待機時間」または`config set-model-pool --idle-ttl-seconds`で変更でき、再起動不要で次の見回りから反映されます。
 
 ロード前に実ファイル量から保守的に予約し、個別上限、合計予算、常駐数、現在の空きメモリ、macOSのメモリ圧のどれか一つでも安全条件を満たさなければロードしません。承認したbyte値は重みを読む前にそのWorkerのMLX allocatorへ適用し、応答で同じ値を証明できないランタイムはpoolで利用しません。
 
@@ -132,11 +135,11 @@ APIが自動ロードした非固定モデルは、最後の要求が終了し�
 
 `DELETE /api/v1/models/loaded`は常駐モデルをすべて解放します。1モデルだけ解放するには`POST /api/v1/models/{id}/unload`（`?force=`、`mlxbarctl model unload MODEL_ID`）を使います。そのモデルに生成中の要求があるときだけ`ENGINE_BUSY`になり、他の常駐モデルには影響しません。
 
-v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタン、生成中はそのモデルのトークン毎秒があります。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。v1.9.0以降、この一覧は常駐が1つのときにも表示し、どの構成でもモデルを1つずつアンロードできます。
+v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタン、生成中はそのモデルのトークン毎秒があります。v2.7.0以降、同一モデルの複数レプリカは状態を集約して1行に表示し（生成中・順番待ちが隠れません）、非固定モデルの待機中は解放までの残り時間も表示します。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。v1.9.0以降、この一覧は常駐が1つのときにも表示し、どの構成でもモデルを1つずつアンロードできます。
 
 ### モデル間の同時生成（v1.7.0）
 
-v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。1つのMLXプロセスは単一スレッドのため、**同一モデルへの複数要求は従来どおり到着順に直列**です。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
+v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。**同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば、v2.7.0以降は自動でレプリカを1つ増やして並行します**（上限は`models.pool.maxReplicasPerModel`と`generationConcurrency`の小さい方、メモリのヘッドルームガード付き。余裕がなければ従来どおり到着順に待機）。**`models.pool.maxResidentModels`は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません**（v2.0.1以降）。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
 
 1件目の生成は常に許可します。2件目以降の並行生成は、常駐予約に生成1件ぶんのヘッドルーム見積を足しても全体メモリ予算に収まり、かつmacOSがメモリ圧を報告していないときだけ開始します。条件を満たさない要求は失敗させず、レーンが空くまでキューで待ちます。macOSがwarning以上のメモリ圧を報告した場合は自動的に直列生成へ降格します。ヘッドルーム見積は`models.pool.perGenerationHeadroomGB`（既定0＝`min(モデル上限×0.15, 2 GiB)`を算出、範囲0.25–32）で上書きできます。
 
@@ -144,7 +147,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)、v2.2.0の変更点（実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」。古い会話をEXACT／LATENT／COLDへ動的振り分け。既定で無効、`experimental.adaptiveMemory.enabled`未設定なら新コードパスに到達せず、あらゆる失敗は通常EXACT推論へフォールバック）は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)、v2.2.0の変更点（実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」。古い会話をEXACT／LATENT／COLDへ動的振り分け。既定で無効、`experimental.adaptiveMemory.enabled`未設定なら新コードパスに到達せず、あらゆる失敗は通常EXACT推論へフォールバック）は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)、v2.7.0の変更点（生成後の待機表示の自己回復・レプリカ集約表示・同一モデルのオンデマンド並列レプリカ・非固定モデル待機時間の可視化）は[`DESIGN_v2.7.0.md`](DESIGN_v2.7.0.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -158,7 +161,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 - 各レプリカは独立Workerプロセス・独立メモリ予約・独立のmanifest/ログ/ソケットです。`replicas`は`models.pool.maxReplicasPerModel`（既定2、範囲1–8）で頭打ちになります。
 - admissionはレプリカごとに予算をchargeします。2つ合わせて予算に収まらなければ2つ目は`MEMORY_BUDGET_EXCEEDED`で拒否され、ロードできたレプリカだけでモデルは利用可能です。
-- 同一モデルへの並行要求は空きレプリカへ振り分けます。プール全体の同時生成数は従来どおり`generationConcurrency`セマフォが束ね、2レーン目以降のメモリ・ヘッドルームガードも効きます。
+- 同一モデルへの並行要求は空きレプリカへ振り分けます。空きがなくメモリに余裕があれば、v2.7.0以降は自動でレプリカを1つ増やして並行します（上限は`maxReplicasPerModel`と`generationConcurrency`の小さい方）。プール全体の同時生成数は従来どおり`generationConcurrency`セマフォが束ね、2レーン目以降のメモリ・ヘッドルームガードも効きます。
 - 明示ロード（GUI・CLI・プリロード）は設定数すべてを今ロードします。API自動ロードは1コピーだけ立ち上げ、reaperがpin済みモデルを背景で`replicas`まで補充します（要求は追加admissionのコストを払いません）。`replicas`を下げると高インデックス側のidleレプリカから解放します。
 - `mlxbarctl model pin <id> --replicas N`、メニューバーの`×N`バッジ、設定画面の「並列数（replicas）」Stepperで指定できます。
 - `replicas > 1`は`models.pool.enabled: true`が必須です。**合算メモリピークの実機計測は未実施です**（`TEST_PLAN_v1.8.0.md §2`）。メモリガードが「直列なら成功する要求」を落とさないよう安全側に倒しています。`replicas`既定1のとき挙動はv1.7.1と完全に同一です。
@@ -196,7 +199,7 @@ GGUFはMLXワーカーへ渡されず、LM Studio Providerだけが選択され�
 
 ### 生成の安全機能
 
-- 同一モデルへの生成は同時に1件だけ実行します。別々の常駐モデルは`models.pool.generationConcurrency`（既定2）まで並行して生成し、メモリ圧のときは自動的に直列へ降格します。上限を超えた並列要求は最大16件までFIFOキューで待機します。
+- 同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを増やして並行し、余裕がなければ同時に1件だけ実行して残りは待ちます。別々の常駐モデルは`models.pool.generationConcurrency`（既定2）まで並行して生成し、メモリ圧のときは自動的に直列へ降格します。上限を超えた並列要求は最大16件までFIFOキューで待機します。
 - 待機中は10秒間隔で接続を維持し、既定の最大待ち時間は3,600秒です。満杯時だけ再試行可能なHTTP 429を返します。
 - GUIの「停止」は協調停止を要求し、5秒以内に終わらない場合はMLX WorkerまたはLM Studio接続を強制終了します。「すべての生成を停止」では待機中の要求も取り消します。
 - モデルロードは最大10分、生成は最大60分で停止します。長い入力処理中は10秒間隔で生存通知を送ります。生成が上限を超えても、その要求だけを停止してモデルはロードしたまま維持します。Workerが60秒間まったく無応答になった場合だけプロセスを再起動します。
@@ -530,7 +533,7 @@ OpenClaw（`openai-completions`）から使う場合は、カスタムプロバ�
 
 応答の`usage.prompt_tokens_details.cached_tokens`に再利用できたprompt token数を入れるため、OpenClaw側の`cacheRead`にキャッシュの実績がそのまま出ます。
 
-同一モデルへの要求は到着順に直列処理します。subagentを並列に開始しても拒否せずキューに入れ、待機中もheartbeatを送ります。別々の常駐モデルへの要求は`models.pool.generationConcurrency`（既定2）まで並行して処理します。まだ常駐していないモデルを指定した要求は、他の要求が実行中・待機中のあいだ`ENGINE_BUSY`（HTTP 429）になります（生成中のモデル切り替えを避けるため）。同時に使いたいモデルは`keepLoaded`プロファイルか事前ロードで常駐させてください。
+同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを増やして並行し、余裕がなければ拒否せずキューに入れ、待機中もheartbeatを送ります。別々の常駐モデルへの要求は`models.pool.generationConcurrency`（既定2）まで並行して処理します。まだ常駐していないモデルを指定した要求は、他の要求が実行中・待機中のあいだ`ENGINE_BUSY`（HTTP 429）になります（生成中のモデル切り替えを避けるため）。同時に使いたいモデルは`keepLoaded`プロファイルか事前ロードで常駐させてください。
 
 ### プロンプトの再利用と中断からの再開
 
@@ -578,7 +581,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.6.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.7.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

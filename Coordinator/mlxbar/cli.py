@@ -340,6 +340,10 @@ def execute(args, client: Client):
                     "restartRequired": pool.get("restartRequired"),
                     "activeGenerations": pool.get("activeGenerations"),
                     "replicaShortfalls": pool.get("replicaShortfalls", []),
+                    # Non-resident unload timing (v2.7.0): the global idle TTL
+                    # applies live without a restart; per-model expiry rides on
+                    # status idleExpiresAt below.
+                    "idleTTLSeconds": pool.get("idleTTLSeconds"),
                     "models": [{"id": item.get("id"), "engine": item.get("engine"),
                                 "poolState": item.get("poolState"),
                                 "replicaIndex": item.get("replicaIndex"),
@@ -349,7 +353,8 @@ def execute(args, client: Client):
                                 "replicaShortfall": item.get("replicaShortfall"),
                                 "keepLoaded": item.get("keepLoaded"),
                                 "activeLeases": item.get("activeLeases"),
-                                "laneQueueDepth": item.get("laneQueueDepth")}
+                                "laneQueueDepth": item.get("laneQueueDepth"),
+                                "idleExpiresAt": item.get("idleExpiresAt")}
                                for item in status.get("loadedModels", [])]}
         if args.action in {"pin", "unpin"}:
             settings = client.request("GET", "/api/v1/settings").json()
