@@ -54,8 +54,16 @@
 - DMG `MLXBar-2.7.1.dmg`（SHA-256 `94df3360d06f4b0c0bb2c30e9aa8ad74493831c0b96f636a5580760935add4ca`）。
   ad-hoc署名、`hdiutil verify` VALID、app 2.7.1/build 48。
 - GitHub Release `v2.7.1` は正式版。DMG＋`.sha256`添付。
-- `/Applications/MLXBar.app` を2.7.1へ入れ替え済み（旧2.7.0はバックアップ）。
-  `diagnostics`で2.7.1確認。
+- `/Applications/MLXBar.app` を2.7.1へ入れ替え済み（旧1.3.0は
+  `/Applications/MLXBar.app.v130-backup`。このMacの常駐は旧版のまま取り残されていた
+  ため、サービス起動ではなく分離ホームで出荷バイナリを検証）。
+  分離ホーム（`MLXBAR_HOME=/tmp/mlxbar-home271*`）で出荷 `MLXBarCoordinator` が起動し、
+  `/api/v1/health` → `{"status":"ok","version":"2.7.1"}`、
+  `/api/v1/status` の `modelPool`（`idleTTLSeconds: 900` 含む）と
+  `/api/v1/setup/status`（`required:true/freshInstall:true`）を確認。
+  `PUT /settings` の profiles 追加・削除（unpin 経路、slot なし）と
+  未知モデル `POST .../load` の 404 応答を確認後、正常停止。
+  常駐モデル・サービス無停止（このMacに常駐モデルなし）。
 - 紹介サイトはstudio-riziで公開（v2.7.0分を含む today's update）。プロジェクト8箇所を
   2.7.1へ、4言語UPDATE追加。validate＋count-files・npm test通過後にpush。
   プロジェクトHTTP 200＋`softwareVersion: 2.7.1`、4言語news各HTTP 200を確認。
