@@ -54,4 +54,17 @@
 - DMG `MLXBar-2.7.0.dmg`（SHA-256 `33f0669829612e5e3e842b1bf44e22b10e8d522c590de3202554b729e4dce7c7`）。
   ad-hoc署名、`hdiutil verify` VALID、app 2.7.0/build 47。
 - GitHub Release `v2.7.0` は正式版。DMG＋`.sha256`添付。
-- （実機GUI目視・実機API/CLI確認は §2–3 の手順で実施し、結果を追記する）
+- `/Applications/MLXBar.app` を2.7.0へ入れ替え済み（旧2.6.0は
+  `/Applications/MLXBar.app.v260-backup`）。`diagnostics`で2.7.0確認。
+- 本番実機確認（2026-10-14、2.7.0導入直後。常駐 `Qwen3.8-27B-Uncensored-OptiQ-4bit`、
+  `maxResidentModels=1`・`generationConcurrency=3`・`maxReplicasPerModel=3`・TTL 900）:
+  - `/api/v1/health` → `{"status":"ok","version":"2.7.0"}`。
+  - 単発生成（`/v1/chat/completions`、`max_tokens:16`）→ `content:"PONG"`・`stop`。
+    直後の `/api/v1/status` は `active 0`・`lock idle`・行 `ready/leases 0/queue 0/rateなし`
+    ＝待機中に復帰（本版の主修正の実機確認）。
+  - TTL往復: `idleTTLSeconds` 900→901→900。`modelPool.idleTTLSeconds` が再起動なしで
+    即時反映されることを確認。本番値は900へ復元済み。
+- 実機GUI目視（日英の行表示・残り時間・設定画面の加筆2行）と実機2並列のメモリトレースは
+  次版で実機作業として残る（§2–3）。本番の同時2並列テストは27B級の2重常駐を伴うため
+  単体テスト（`test_second_parallel_generation_expands_despite_max_resident_one`）で担保し、
+  本番では実施していない。
