@@ -57,6 +57,8 @@ def parser() -> argparse.ArgumentParser:
     scan = model.add_parser("scan"); scan.add_argument("--wait", action="store_true")
     probe = model.add_parser("probe"); probe.add_argument("model_id")
     load = model.add_parser("load"); load.add_argument("model_id"); load.add_argument("--engine", default="auto")
+    load.add_argument("--no-pin", action="store_true",
+                      help="セッション固定せず一時ロードする（未使用時間後に解放。既定は固定）")
     unload = model.add_parser("unload")
     unload.add_argument("model_id", nargs="?", help="省略すると常駐モデルをすべて解放（従来動作）")
     unload.add_argument("--force", action="store_true")
@@ -315,7 +317,7 @@ def execute(args, client: Client):
             job = client.request("POST", "/api/v1/models/scan").json()
             return wait_job(client, job, args.global_json) if args.wait else job
         if args.action == "probe": return client.request("POST", f"/api/v1/models/{args.model_id}/probe").json()
-        if args.action == "load": return client.request("POST", f"/api/v1/models/{args.model_id}/load", {"engine": args.engine}).json()
+        if args.action == "load": return client.request("POST", f"/api/v1/models/{args.model_id}/load", {"engine": args.engine, "pin": not getattr(args, "no_pin", False)}).json()
         if args.action == "unload":
             if getattr(args, "model_id", None):
                 path = f"/api/v1/models/{args.model_id}/unload"

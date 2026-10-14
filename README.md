@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.7.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.7.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -44,6 +44,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 生成後の待機表示の自己回復（v2.7.0）：切断などで取り残された生成状態を状態取得時に自動回復し、メニューバーが1ポーリング周期で待機中に戻ります。レプリカ集約も修正し、2つ目以降のレプリカの生成中・順番待ちが隠れなくなりました
 - 同一モデルのオンデマンド並列生成（v2.7.0）：同時要求で空きレプリカがなくメモリに余裕があれば、レプリカを1つ自動追加して並行します（上限はモデルごとの並列数と同時生成の上限の小さい方）。余裕がなければ従来どおり順番待ちです。`maxResidentModels`は異なるモデルの種類数の上限のままです
 - 非固定モデルの待機時間の可視化（v2.7.0）：設定は従来どおり「Settings…」→モデル→「非固定モデルの待機時間」（30〜86,400秒、再起動不要）で変更でき、待機中の行に解放までの残り時間、`model resident`に待機時間と解放予定時刻を表示します
+- 常駐固定のライフサイクル修正（v2.7.1）：再起動後は固定プロファイルだけが固定復帰し、最後に使った非固定は一時扱いのまま戻ります。ランタイム切替後は固定を優先復元し、入りきらない非固定は更新失敗にせず見送ります。固定解除はその場で一時扱いへ戻ります（通常の手動ロードは従来どおり停止まで保持）。`mlxbarctl model load --no-pin`で一時ロードも選べます
 
 ## 動作要件
 
@@ -54,7 +55,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.7.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.7.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -147,7 +148,7 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 
 > **既定値について**: `generationConcurrency`の既定2はオーナーの明示指示によるものです。複数モデルの同時計算による合算メモリピークの実機計測は未実施です（`TEST_PLAN_v1.7.0.md §2`に手順）。実測で問題が出る環境では1へ戻してください。
 
-設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)、v2.2.0の変更点（実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」。古い会話をEXACT／LATENT／COLDへ動的振り分け。既定で無効、`experimental.adaptiveMemory.enabled`未設定なら新コードパスに到達せず、あらゆる失敗は通常EXACT推論へフォールバック）は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)、v2.7.0の変更点（生成後の待機表示の自己回復・レプリカ集約表示・同一モデルのオンデマンド並列レプリカ・非固定モデル待機時間の可視化）は[`DESIGN_v2.7.0.md`](DESIGN_v2.7.0.md)にあります。
+設計根拠、不変条件、ランタイム更新時のrollbackは[`DESIGN_v1.6.2.md`](DESIGN_v1.6.2.md)と[`DESIGN_v1.7.0.md`](DESIGN_v1.7.0.md)を参照してください。v1.7.1の変更点（複数モデル表示・エラー日本語化・OpenAI互換クライアント対応）は[`DESIGN_v1.7.1.md`](DESIGN_v1.7.1.md)、v1.8.0の変更点（同一モデルの並列常駐・Anthropic互換API）は[`DESIGN_v1.8.0.md`](DESIGN_v1.8.0.md)、v1.8.1の変更点（GUI操作のCLI完全対応）は[`DESIGN_v1.8.1.md`](DESIGN_v1.8.1.md)、v1.8.2の変更点（異なるモデルへのAPI経由の切り替えが1体常駐時に固まる不具合の修正）は[`DESIGN_v1.8.2.md`](DESIGN_v1.8.2.md)、v1.8.3の変更点（Ornith 1.5系がtool呼び出しでクラッシュする不具合の修正）は[`DESIGN_v1.8.3.md`](DESIGN_v1.8.3.md)、v1.8.4の変更点（tool無しリクエストで推論ブロックが本文へ漏れる不具合の修正）は[`DESIGN_v1.8.4.md`](DESIGN_v1.8.4.md)、v1.9.0の変更点（モデルごとの個別アンロード・生成中のモデル別トークン速度表示・API互換性精査）は[`DESIGN_v1.9.0.md`](DESIGN_v1.9.0.md)、v1.9.1の変更点（OpenAI互換ストリームのマルチtool call時の`role`重複修正・非ストリームの推論内容欠落修正・`index: null`耐性・可読性）は[`DESIGN_v1.9.1.md`](DESIGN_v1.9.1.md)、v1.9.2の変更点（既定で無効なコンテキスト自動圧縮・メニューバーのモデル一覧を対等なリスト表示へ刷新）は[`DESIGN_v1.9.2.md`](DESIGN_v1.9.2.md)、v2.0.0の変更点（`/v1/completions`の実装・`response_format`のjson_object/json_schema対応・`n`>1・Anthropic Extended Thinking・外部クライアント互換性の静的デバッグ・GUI操作のCLI完全対応の欠落1件の修正）は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)、v2.0.1の変更点（`maxResidentModels`が同一モデルの追加レプリカも数えてしまい`replicas`が1体常駐時に効かない不具合の修正・レプリカ不足／再起動待ちの診断表示追加）は[`DESIGN_v2.0.1.md`](DESIGN_v2.0.1.md)、v2.1.0の変更点（ローカル知識ベース＝RAG。文書分割・埋め込み生成・ベクトル検索・コンテキスト生成。既定で無効、`rag`未指定のリクエストは従来どおり）は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)、v2.2.0の変更点（実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」。古い会話をEXACT／LATENT／COLDへ動的振り分け。既定で無効、`experimental.adaptiveMemory.enabled`未設定なら新コードパスに到達せず、あらゆる失敗は通常EXACT推論へフォールバック）は[`DESIGN_v2.2.0.md`](DESIGN_v2.2.0.md)、v2.7.0の変更点（生成後の待機表示の自己回復・レプリカ集約表示・同一モデルのオンデマンド並列レプリカ・非固定モデル待機時間の可視化）は[`DESIGN_v2.7.0.md`](DESIGN_v2.7.0.md)、v2.7.1の変更点（常駐固定のライフサイクル修正・ロードAPIの`pin`選択・mlx-vlm tool検出の新配置対応・ランタイム導入検査のdeep化）は[`DESIGN_v2.7.1.md`](DESIGN_v2.7.1.md)にあります。
 
 ### 同一モデルの並列常駐（v1.8.0）
 
@@ -217,7 +218,7 @@ GGUFはMLXワーカーへ渡されず、LM Studio Providerだけが選択され�
 mlxbarctl status --json
 mlxbarctl model list --json
 mlxbarctl model scan --wait
-mlxbarctl model load MODEL_ID --engine auto
+mlxbarctl model load MODEL_ID --engine auto [--no-pin: 一時ロード]
 mlxbarctl model add-folder /path/to/models
 mlxbarctl model remove-folder /path/to/models
 mlxbarctl generate --prompt "こんにちは"
@@ -581,7 +582,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.7.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.7.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

@@ -179,8 +179,15 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
     if not model:
         raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND", "message": "指定されたモデルが見つかりません。モデル一覧を再スキャンしてください"})
     _raise_if_generations_in_flight(app, bool(body.get("force", False)), "モデルを切り替え")
+    # `pin: false` keeps an explicit load transient (idle-TTL managed) instead
+    # of session-pinning it. Omitted for compatibility: every existing GUI/CLI
+    # caller pins, matching the documented "manual loads are kept until stop".
+    pin = body.get("pin", True)
+    if not isinstance(pin, bool):
+        raise HTTPException(422, detail={"code": "INVALID_PIN", "message": "pinはtrue/falseで指定してください"})
     try:
-        loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None)
+        loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None,
+                                        pin=pin)
         app.database.set_metadata_value("last_loaded_model_id", model["id"])
         app.database.set_metadata_value("api_autoload_suspended", "0")
         _record_cache_capability(app, loaded)
@@ -451,11 +458,38 @@ async def put_lm_studio_token(request: Request, body: dict):
     return {"token": token or "", "configured": bool(token)}
 
 
+def _profile_pin_map(data: dict) -> dict[str, bool]:
+    return {str(item.get("modelId")): bool(item.get("keepLoaded", False))
+            for item in data.get("models", {}).get("pool", {}).get("profiles", [])
+            if isinstance(item, dict) and item.get("modelId")}
+
+
+def _release_unpinned_sessions(app, old_profiles: dict[str, bool]) -> None:
+    """Clear session pins whose fixed profile just went away (v2.7.1).
+
+    Unpinning a fixed profile (keepLoaded true -> false/missing) releases
+    its session pin as well, so the model becomes idle-TTL managed instead
+    of staying pinned forever with a stale "fixed" row. Models that were
+    never in profiles (plain manual loads) keep their session pin.
+    """
+    new_profiles = _profile_pin_map(app.settings.data)
+    unpinned = [model_id for model_id, was in old_profiles.items()
+                if was and not new_profiles.get(model_id, False)]
+    if not unpinned:
+        return
+    slots = getattr(app.workers, "_slots", None)
+    if isinstance(slots, dict):
+        for slot in slots.values():
+            if str(slot.model.get("id", "")) in unpinned and slot.session_pinned:
+                slot.session_pinned = False
+
+
 @router.put("/settings")
 async def put_settings(request: Request, body: dict):
     app = state(request)
     old_api = deepcopy(app.settings.data["api"])
     old_security = deepcopy(app.settings.data["security"])
+    old_profiles = _profile_pin_map(app.settings.data)
     try:
         pending = app.settings.update(body)
     except ValueError as exc:
@@ -469,6 +503,8 @@ async def put_settings(request: Request, body: dict):
         except Exception as exc:
             app.settings.update({"api": old_api, "security": old_security})
             raise HTTPException(409, detail={"code": "LISTENER_SWITCH_FAILED", "message": str(exc)})
+    if "models" in body:
+        _release_unpinned_sessions(app, old_profiles)
     return app.settings.public()
 
 
@@ -670,12 +706,15 @@ async def import_settings(request: Request, body: dict):
     if not isinstance(export, dict):
         raise HTTPException(400, detail={"code": "INVALID_IMPORT",
                                          "message": "exportを指定してください"})
+    old_profiles = _profile_pin_map(app.settings.data)
     try:
-        return apply_import(
+        result = apply_import(
             app.settings, export,
             port_available=lambda port: _port_available(app, port))
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "INVALID_IMPORT", "message": str(exc)})
+    _release_unpinned_sessions(app, old_profiles)
+    return result
 
 
 def _port_available(app, port: int) -> bool:

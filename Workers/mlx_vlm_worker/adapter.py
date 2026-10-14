@@ -1018,7 +1018,12 @@ class MLXVLMAdapter(BaseAdapter):
     def finalize(self, text: str, params: dict) -> dict:
         tools = params.get("tools") or []
         try:
-            from mlx_vlm.tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+            try:
+                # mlx-vlm >= 0.7.x keeps the registry in `mlx_vlm.tools`;
+                # older slots exposed it as `mlx_vlm.tool_parsers`.
+                from mlx_vlm.tools import _infer_tool_parser_from_processor, load_tool_module
+            except ImportError:
+                from mlx_vlm.tool_parsers import _infer_tool_parser_from_processor, load_tool_module
             from mlx_vlm.server.responses_state import process_tool_calls
             parser_type = _infer_tool_parser_from_processor(self.processor)
             if parser_type:

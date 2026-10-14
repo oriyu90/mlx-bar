@@ -670,11 +670,30 @@ class ModelPoolSupervisor:
                       key=lambda slot: (str(slot.model.get("id", "")), slot.replica_index))
 
     async def reload_resident(self, snapshots: list[dict], engine: str) -> list[dict]:
+        # Pinned residents first so a fixed profile never loses its slot to a
+        # transient model that happens to sort earlier by id. Pinned loads
+        # raise on failure (the fixed set must come back); transient reloads
+        # are best effort -- a transient that no longer fits is skipped with
+        # a warning instead of aborting the whole runtime switch and leaving
+        # the pool half empty.
+        def _is_pinned(snapshot: dict) -> bool:
+            return bool(snapshot.get("sessionPinned", False))
+
+        ordered = sorted(snapshots, key=lambda item: (not _is_pinned(item),))
         results = []
-        for snapshot in snapshots:
+        for snapshot in ordered:
             model = snapshot.get("model", snapshot)
-            results.append(await self.load(model, engine,
-                                           pin=bool(snapshot.get("sessionPinned", False))))
+            if _is_pinned(snapshot):
+                results.append(await self.load(model, engine, pin=True))
+                continue
+            try:
+                results.append(await self.load(model, engine, pin=False))
+            except MLXBarError as exc:
+                LOGGER.warning(
+                    "Skipping transient reload of %s after runtime switch "
+                    "(%s: %s); pinned residents are unaffected",
+                    (model.get("id") if isinstance(model, dict) else model),
+                    exc.code, exc)
         return results
 
     def _per_generation_headroom(self, slot: PoolSlot) -> int:

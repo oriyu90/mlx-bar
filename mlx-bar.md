@@ -3,6 +3,29 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.7.1の常駐固定ライフサイクル・最新ランタイム互換で守ること（2026-10-14リリース）
+
+- 固定（`profiles[].keepLoaded`＋セッション固定）と非固定（API自動ロードのtransient）の
+  区別は3経路で守る：再起動プリロードは二系統（固定`pin=True`／最終使用`pin=False`）、
+  リロードは固定優先＋非固定ベストエフォート（固定失敗だけraise）、固定解除は
+  `_release_unpinned_sessions` でtrue→false/削除遷移のみ解放（PUT /settingsの`models`含む場合と
+  importの両対応。preset/setupはprofiles不変のため対象外）。
+  profilesに属さない手動ロードのセッション固定は保持する（設定画面の説明文どおり）。
+- `POST /load` の `pin` 省略時は従来どおり固定。GUIは送らないため挙動不変。
+  CLI `model load --no-pin` は `pin:false` を送る。`model pin` は従来どおりprofiles＋固定ロード。
+- リロード順序は安定ソート（固定先・元順維持）。非固定skipは警告ログのみ。
+  `service.py` のlegacy捏造 `sessionPinned: True` は `False` へ（pool無効時は無作用）。
+- probe は hard（vlm `apply_chat_template`）＋soft（`warnings[]`）の二段。
+  `contractVersion` 2維持。旧slot（0.6.15/0.7.1系）のmodule群で後方互換を確認済み。
+  hard追加時は旧slotの有無を必ず確認すること（安易なhard化は旧導入を壊す）。
+- vlm `finalize()` は `mlx_vlm.tools`→旧`tool_parsers`→markupの三段。
+  新規要求時import（`mlx_vlm.*` のtop-level import化）はしないこと（旧slotの起動を壊す）。
+- 実機smokeは最新slot直結のtinyモデル4経路（lm bf16/8bit・vlm bf16/8bit＋vlm再利用）を
+  固定手順とする。小規模モデルの指示追従の弱さは能力の問題で回帰にしない（bf16対照で確認）。
+- 未実施：実画面目視の日英確認（本版Swift差分なしのため再確認のみ。次版で実機作業として残る）。
+  v2.7.0からの引き継ぎ（実機2並列のメモリトレース・wizard実画面・`runtime_update`既定off・
+  `config set`旧値の422可能性）は継続。実機active slotの更新はオーナーの明示操作に任せること。
+
 ## v2.7.0の待機表示・オンデマンド並列・待機時間可視化で守ること（2026-10-14リリース）
 
 - `status()` からの `_recover_slot_state(slot, "status")` は同期のみ。

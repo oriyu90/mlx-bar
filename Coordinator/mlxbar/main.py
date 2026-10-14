@@ -487,26 +487,31 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     """
     if state.database.metadata_value("api_autoload_suspended") == "1":
         return None
-    ids = [str(profile.get("modelId"))
-           for profile in state.settings.data.get("models", {}).get("pool", {}).get("profiles", [])
-           if profile.get("keepLoaded") and profile.get("modelId")]
+    pinned_ids = [str(profile.get("modelId"))
+                  for profile in state.settings.data.get("models", {}).get("pool", {}).get("profiles", [])
+                  if profile.get("keepLoaded") and profile.get("modelId")]
+    transient_ids: list[str] = []
     if state.settings.data.get("general", {}).get("preloadLastModel", True):
         model_id = state.database.metadata_value("last_loaded_model_id")
-        if model_id and model_id not in ids:
-            ids.append(model_id)
-    if not ids:
+        if model_id and model_id not in pinned_ids:
+            transient_ids.append(model_id)
+    if not pinned_ids and not transient_ids:
         return None
 
     async def work() -> None:
         try:
             async with state.model_autoload_lock:
                 catalog = {item.get("id"): item for item in state.database.list_models()}
-                for model_id in ids:
+                # Fixed profiles first with a session pin; the last-used model
+                # is only transient (pin=False) so an API-autoloaded model
+                # never comes back from a restart as a pinned resident that
+                # blocks the fixed set or dodges the idle TTL.
+                for model_id in pinned_ids:
                     model = catalog.get(model_id)
                     if model is None:
                         continue
                     try:
-                        await state.workers.load(model)
+                        await state.workers.load(model, pin=True)
                         logging.getLogger(__name__).info(
                             "Preloaded %s", model.get("name") or model_id)
                     except asyncio.CancelledError:
@@ -514,6 +519,19 @@ def _preload_last_model(state) -> "asyncio.Task | None":
                     except Exception as exc:
                         # One incompatible retained model must not block all
                         # remaining safe preloads.
+                        logging.getLogger(__name__).warning(
+                            "Could not preload %s: %s", model_id, exc)
+                for model_id in transient_ids:
+                    model = catalog.get(model_id)
+                    if model is None:
+                        continue
+                    try:
+                        await state.workers.load(model, pin=False)
+                        logging.getLogger(__name__).info(
+                            "Preloaded %s", model.get("name") or model_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
                         logging.getLogger(__name__).warning(
                             "Could not preload %s: %s", model_id, exc)
         except asyncio.CancelledError:

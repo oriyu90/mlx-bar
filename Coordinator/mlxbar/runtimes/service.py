@@ -34,7 +34,11 @@ class RuntimeUpdateService:
             resident = snapshot(engine) if snapshot else []
             loaded = self.workers.loaded.copy() if self.workers.loaded and self.workers.loaded.get("engine") == engine else None
             if loaded and not resident:
-                resident = [{"model": loaded, "engine": engine, "sessionPinned": True}]
+                # Pool-disabled (or pre-snapshot) single model: reload it as
+                # transient so a runtime switch never promotes an
+                # API-autoloaded model into a pinned resident. The pool
+                # facade ignores pin when disabled, so this is a no-op there.
+                resident = [{"model": loaded, "engine": engine, "sessionPinned": False}]
             if resident:
                 await progress(0.91, "実行中の生成が終わるのを待っています")
                 if not await self.workers.wait_until_idle(timeout=30):
