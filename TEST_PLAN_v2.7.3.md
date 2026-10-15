@@ -43,11 +43,14 @@
 - Python回帰: 596 passed＋1 failed（既知fluke、上記のとおり）。
   新規 `Tests/test_v2_7_3_resident_limit.py` 4件は緑。
 - `swift build` 成功（差分なし）。
-- `.strings` 新規重複なし（追加なし）。
+- `.strings` 新規重複なし（既存`モデル未ロード`重複1件のみ残置）。
+  新規`.fixedSize`なし。
 - DMG `MLXBar-2.7.3.dmg`（SHA-256 `0c210d8ef20563f817f8544a0da7afca9412bb895a25a6c4315caefd2972b413`）。
   ad-hoc署名、`hdiutil verify` VALID、app 2.7.3/build 50。
 - GitHub Release `v2.7.3` は正式版。DMG＋`.sha256`添付。
-- `/Applications/MLXBar.app` を2.7.3へ入れ替え（旧版はバックアップ）。
-- 紹介サイトはstudio-riziで公開。プロジェクト8箇所を2.7.3へ、4言語UPDATE追加。
-  validate＋count-files・npm test通過後にpush。
+- `/Applications/MLXBar.app` を2.7.3へ入れ替え済み（旧2.7.2は
+  `/Applications/MLXBar.app.v272-backup`）。`Info.plist` で 2.7.3/build 50、
+  `codesign --verify --deep --strict` 通過を確認。
+- 紹介サイトはstudio-rizi `bdf8643` で公開。プロジェクト8箇所を2.7.3へ、
+  4言語UPDATE追加。validate＋count-files・npm test通過後にpush。
   プロジェクトHTTP 200＋`softwareVersion: 2.7.3`、4言語news各HTTP 200を確認。
