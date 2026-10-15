@@ -1412,6 +1412,13 @@ class ModelPoolSupervisor:
         now = time.monotonic()
         victims = []
         _, pressure = await asyncio.to_thread(self._host_capacity)
+        # v2.7.4: queue-aware pressure shedding. Leased slots (in-flight and
+        # queued waiters, which hold a lease from admission) stay protected.
+        # Other idle transient slots are shed without waiting for the TTL
+        # when the machine reports pressure (>=4 alone, or >=2 with a pool
+        # queue backlog), instead of only on TTL expiry.
+        queued_backlog = any(len(slot.gen_queued) > 0 for slot in self._slots.values())
+        time_indifferent = (pressure >= 4) or (queued_backlog and pressure >= 2)
         async with self._pool_lock:
             for slot in self._slots.values():
                 child = slot.worker.status()
@@ -1419,7 +1426,7 @@ class ModelPoolSupervisor:
                 slot.keep_loaded = bool(self._profile(str(slot.model.get("id", ""))).get(
                     "keepLoaded", False))
                 expired = now - slot.last_released_at >= ttl
-                pressure_victim = pressure >= 4 and slot.leases == 0
+                pressure_victim = time_indifferent and slot.leases == 0
                 if dead and slot.state == "ready" and slot.leases == 0:
                     slot.state = "evicting"
                     victims.append(slot)

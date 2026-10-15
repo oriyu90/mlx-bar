@@ -170,3 +170,71 @@ def test_explicit_pin_load_is_also_strict_when_full():
                 finally:
                     await pool.shutdown()
     asyncio.run(scenario())
+
+
+def test_queue_plus_pressure_sheds_idle_transient_without_waiting_ttl():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.data["models"]["pool"].update({
+                "enabled": True, "maxResidentModels": 3, "minimumSystemReserveGB": 1,
+                "defaultPerModelMaxGB": 8, "generationConcurrency": 2,
+                "idleTTLSeconds": 900,
+            })
+            test_model_pool.FakeWorker.instances = []
+            test_model_pool.FakeWorker.load_gate = None
+            with patch("mlxbar.workers.model_pool.SingleWorkerSupervisor",
+                        test_model_pool.FakeWorker):
+                pool = ModelPoolSupervisor(root, store)
+                pool._physical_memory = lambda: 32 * GIB
+                pool._host_capacity = lambda: (24 * GIB, 0)
+                try:
+                    await pool.load_for_api({"id": "idle-a", "name": "idle-a",
+                                             "engine": "mlx-lm", "size_bytes": GIB})
+                    await pool.load_for_api({"id": "idle-b", "name": "idle-b",
+                                             "engine": "mlx-lm", "size_bytes": GIB})
+                    # Fresh (far from TTL) but a queue backlog exists elsewhere.
+                    pool._host_capacity = lambda: (24 * GIB, 2)
+                    busy = pool._slots["idle-a"]
+                    busy.gen_queued["waiter-1"] = object()
+                    try:
+                        # Leased/queued holders are protected; the other idle
+                        # transient is shed despite its fresh timestamp.
+                        busy.leases = 1
+                        assert await pool._reap_once() == 1
+                        assert set(pool._slots) == {"idle-a"}
+                    finally:
+                        busy.gen_queued.clear()
+                        busy.leases = 0
+                finally:
+                    await pool.shutdown()
+    asyncio.run(scenario())
+
+
+def test_warning_pressure_without_queue_keeps_fresh_transient():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.data["models"]["pool"].update({
+                "enabled": True, "maxResidentModels": 3, "minimumSystemReserveGB": 1,
+                "defaultPerModelMaxGB": 8, "generationConcurrency": 2,
+                "idleTTLSeconds": 900,
+            })
+            test_model_pool.FakeWorker.instances = []
+            test_model_pool.FakeWorker.load_gate = None
+            with patch("mlxbar.workers.model_pool.SingleWorkerSupervisor",
+                        test_model_pool.FakeWorker):
+                pool = ModelPoolSupervisor(root, store)
+                pool._physical_memory = lambda: 32 * GIB
+                pool._host_capacity = lambda: (24 * GIB, 0)
+                try:
+                    await pool.load_for_api({"id": "fresh", "name": "fresh",
+                                             "engine": "mlx-lm", "size_bytes": GIB})
+                    pool._host_capacity = lambda: (24 * GIB, 2)
+                    assert await pool._reap_once() == 0
+                    assert set(pool._slots) == {"fresh"}
+                finally:
+                    await pool.shutdown()
+    asyncio.run(scenario())

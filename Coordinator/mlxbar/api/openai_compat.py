@@ -830,15 +830,34 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
     return message, finish_reason, usage or _usage(normalized_messages, text)
 
 
+def _honor_resident_alias(state, resident: dict, requested: str) -> bool:
+    # Exact hits are always honored. Generic-alias hits are honored unless the
+    # request exactly names a different catalog-known model (a real model that
+    # happens to share its name with a generic alias, e.g. id "x"). Unknown
+    # non-generic names are never honored here -- they fall through to
+    # MODEL_NOT_FOUND instead of answering with the wrong resident.
+    if _is_exact_match(resident, requested):
+        return True
+    if requested.strip().casefold() not in _GENERIC_MODEL_ALIASES:
+        return False
+    try:
+        exact = _find_exact_model(state, requested)
+    except Exception:
+        return True
+    if exact is None:
+        return True
+    return str(exact.get("id", "")) == str(resident.get("id", ""))
+
+
 async def _ensure_requested_model(request: Request, requested: str) -> dict:
     state = app_state(request)
     find_loaded = getattr(state.workers, "find_loaded_model", None)
     if find_loaded:
         resident = find_loaded(requested)
-        if resident:
+        if resident and _honor_resident_alias(state, resident, requested):
             return resident
     loaded = state.workers.loaded
-    if loaded and _model_matches(loaded, requested, state):
+    if loaded and _honor_resident_alias(state, loaded, requested):
         return loaded
     settings_models = state.settings.data.get("models", {})
     if not settings_models.get("autoLoadOnAPIRequest", True):
@@ -850,9 +869,9 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
     # (maxResidentModels == 1 included). Generic aliases (loaded, local,
     # x, ...) still resolve via find_loaded_model above; every other name
     # now falls through to the catalog resolve below: a known distinct
-    # model autoloads (evicting under _admit when idle, ENGINE_BUSY when
-    # busy), an unknown name fails loudly with MODEL_NOT_FOUND instead of
-    # answering with the wrong model.
+    # model autoloads when room remains (v2.7.3: RESIDENT_LIMIT_REACHED when
+    # full, ENGINE_BUSY when busy), an unknown name fails loudly with
+    # MODEL_NOT_FOUND instead of answering with the wrong model.
     if state.database.metadata_value("api_autoload_suspended") == "1":
         raise MLXBarError("MODEL_NOT_LOADED", "モデルは手動で停止されています。MLXBarでモデルをロードしてください", 409)
     lock = getattr(state, "model_autoload_lock", None)
@@ -865,10 +884,10 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
         # just the primary, so a non-primary resident is reused, not reloaded).
         if find_loaded:
             resident = find_loaded(requested)
-            if resident:
+            if resident and _honor_resident_alias(state, resident, requested):
                 return resident
         loaded = state.workers.loaded
-        if loaded and _model_matches(loaded, requested, state):
+        if loaded and _honor_resident_alias(state, loaded, requested):
             return loaded
         # Resolved before the busy check, because the two answers mean opposite
         # things to a caller: ENGINE_BUSY is retryable and a missing model never
@@ -921,6 +940,24 @@ def _model_matches(model: dict, requested: str, state) -> bool:
     if stripped in candidates:
         return True
     return value in _GENERIC_MODEL_ALIASES
+
+
+def _is_exact_match(model: dict, requested: str) -> bool:
+    value = requested.strip().casefold()
+    stripped = value[7:] if value.startswith("openai/") else value
+    return stripped in _candidate_values(model)
+
+
+def _find_exact_model(state, requested: str) -> dict | None:
+    # Catalog exact match only, no generic-alias fallback. Used to decide
+    # whether an alias-only resident hit must yield to a real distinct model.
+    models = state.database.list_models()
+    value = requested.strip().casefold()
+    stripped = value[7:] if value.startswith("openai/") else value
+    for model in models:
+        if stripped in _candidate_values(model):
+            return model
+    return None
 
 
 def _find_model(state, requested: str) -> dict | None:

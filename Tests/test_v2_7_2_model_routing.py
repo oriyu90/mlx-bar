@@ -26,7 +26,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "Coordinator"))
 import test_model_pool  # noqa: E402
 from mlxbar.api.openai_compat import (  # noqa: E402
     _candidate_values,
+    _find_exact_model,
     _find_model,
+    _honor_resident_alias,
     _model_matches,
 )
 from mlxbar.database import Database  # noqa: E402
@@ -247,6 +249,52 @@ def test_per_model_default_max_tokens_prefers_requested_over_primary():
                     pool._primary_model_id = "model-a"
                     assert pool.effective_max_tokens_for("model-b") == 222
                     assert pool.effective_max_tokens() == 111
+                finally:
+                    await pool.shutdown()
+    asyncio.run(scenario())
+
+
+def test_alias_shaped_real_model_is_autoloaded_not_aliased():
+    # A real catalog model whose id looks like a generic alias ("x") must
+    # autoload when it is not resident, not answer with the current resident.
+    # Pure generic aliases with no exact catalog match still alias.
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SettingsStore(root)
+            store.data["api"]["requireToken"] = False
+            store.data["models"]["pool"].update({
+                "enabled": True, "maxResidentModels": 3, "minimumSystemReserveGB": 1,
+                "defaultPerModelMaxGB": 8, "generationConcurrency": 2,
+            })
+            test_model_pool.FakeWorker.instances = []
+            test_model_pool.FakeWorker.load_gate = None
+            database = Database(root / "state.sqlite3")
+            database.replace_models([_catalog("model-a", "model-a"), _catalog("x", "x")])
+            with patch("mlxbar.workers.model_pool.SingleWorkerSupervisor",
+                        test_model_pool.FakeWorker):
+                pool = await _pool_with(root, store, database)
+                try:
+                    await pool.load({"id": "model-a", "name": "model-a",
+                                     "engine": "mlx-lm", "size_bytes": GIB}, pin=True)
+                    state = SimpleNamespace(settings=store, workers=pool, database=database,
+                                            model_autoload_lock=asyncio.Lock())
+                    assert _find_exact_model(state, "x")["id"] == "x"
+                    assert not _honor_resident_alias(
+                        state, {"id": "model-a", "name": "model-a"}, "x")
+                    assert _honor_resident_alias(
+                        state, {"id": "model-a", "name": "model-a"}, "loaded")
+                    assert not _honor_resident_alias(
+                        state, {"id": "model-a", "name": "model-a"}, "no-such-model")
+                    transport = httpx.ASGITransport(app=make_public_app(state))
+                    async with httpx.AsyncClient(transport=transport,
+                                                 base_url="http://t") as client:
+                        response = await client.post("/v1/chat/completions", json={
+                            "model": "x",
+                            "messages": [{"role": "user", "content": "hi"}]})
+                        assert response.status_code == 200
+                        assert response.json()["model"] == "x"
+                        assert set(pool._slots) == {"model-a", "x"}
                 finally:
                     await pool.shutdown()
     asyncio.run(scenario())
