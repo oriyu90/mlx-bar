@@ -42,7 +42,9 @@
 - DMG `MLXBar-2.7.4.dmg`（SHA-256 `b34ec31d8f0dba544b6c750e276b5e400d4dd2d8a727c490c30cd20f0e0d57c1`）。
   ad-hoc署名、`hdiutil verify` VALID、app 2.7.4/build 51。
 - GitHub Release `v2.7.4` は正式版。DMG＋`.sha256`添付。
-- `/Applications/MLXBar.app` を2.7.4へ入れ替え（旧版はバックアップ）。
-- 紹介サイトはstudio-riziで公開。プロジェクト8箇所を2.7.4へ、4言語UPDATE追加。
+- `/Applications/MLXBar.app` を2.7.4へ入れ替え済み（旧2.7.3は
+  `/Applications/MLXBar.app.v273-backup`）。`Info.plist` で 2.7.4/build 51、
+  `codesign --verify --deep --strict` 通過を確認。
+- 紹介サイトはstudio-rizi `4fefda0` で公開。プロジェクト8箇所を2.7.4へ、4言語UPDATE追加。
   validate＋count-files・npm test通過後にpush。
   プロジェクトHTTP 200＋`softwareVersion: 2.7.4`、4言語news各HTTP 200を確認。
