@@ -1345,6 +1345,11 @@ class _SingleResidentPool:
 
 
 def test_a_made_up_model_name_routes_to_the_sole_resident_instead_of_erroring():
+    # v2.7.2: strict model resolution. A made-up name that matches no
+    # catalog model and no generic alias must fail loudly with
+    # MODEL_NOT_FOUND instead of silently answering with the wrong
+    # (sole resident) model. Generic aliases (loaded/local/x/...) still
+    # route to the resident via find_loaded_model.
     with tempfile.TemporaryDirectory() as directory:
         state = SimpleNamespace(
             settings=SimpleNamespace(data={"api": {"requireToken": False},
@@ -1355,8 +1360,8 @@ def test_a_made_up_model_name_routes_to_the_sole_resident_instead_of_erroring():
         response = client.post("/v1/chat/completions", json={
             "model": "whatever-the-client-configured",
             "messages": [{"role": "user", "content": "hi"}]})
-        assert response.status_code == 200
-        assert state.workers.routed == "resident-1"
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "MODEL_NOT_FOUND"
 
 
 def test_management_errors_carry_a_japanese_message_not_a_bare_code():

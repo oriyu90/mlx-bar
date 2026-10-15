@@ -244,6 +244,11 @@ async def legacy_completions(request: Request, body: dict):
         loaded = await _ensure_requested_model(request, requested_model)
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    if requested_max_tokens is None:
+        # v2.7.2: recompute from the resolved model, not the pool primary.
+        max_tokens = _default_max_tokens_for(app_state(request).workers, loaded)
+        options["max_tokens"] = max_tokens
+        request.state.api_log["max_tokens"] = max_tokens
     response_model = loaded.get("name") or loaded.get("id") or requested_model
     try:
         capacity_check = getattr(app_state(request).workers, "raise_if_queue_full", None)
@@ -521,6 +526,11 @@ async def chat(request: Request, body: dict):
         if image_workspace:
             image_workspace.cleanup()
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    if requested_max_tokens is None:
+        # v2.7.2: recompute from the resolved model, not the pool primary.
+        max_tokens = _default_max_tokens_for(app_state(request).workers, loaded)
+        options["max_tokens"] = max_tokens
+        request.state.api_log["max_tokens"] = max_tokens
     response_model = loaded.get("name") or loaded.get("id") or requested_model
     try:
         capacity_check = getattr(app_state(request).workers, "raise_if_queue_full", None)
@@ -833,31 +843,16 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
     settings_models = state.settings.data.get("models", {})
     if not settings_models.get("autoLoadOnAPIRequest", True):
         raise MLXBarError("MODEL_NOT_LOADED", "モデルがロードされていません。MLXBarでモデルをロードしてください", 409)
-    # Exactly one model resident, and `requested` matched none of the residents
-    # by id / name / alias: treat the name as an alias for that sole resident
-    # rather than autoloading a different model -- which would fail the caller
-    # with ENGINE_BUSY whenever another model is mid-generation. Only the
-    # single-resident case is unambiguous; with two or more, fall through to the
-    # normal resolve/autoload path below.
-    #
-    # This shortcut only makes sense when the pool cannot usefully hold a
-    # second resident model (maxResidentModels <= 1), or when `requested`
-    # doesn't actually name a distinct known model. Otherwise it silently caps
-    # the pool at exactly one resident forever: every subsequent API-driven
-    # request for a different (real, catalog-known) model would be swallowed
-    # here as an "alias" before ever reaching the autoload path below that
-    # could add a second slot -- so maxResidentModels > 1 would never be
-    # reachable through ordinary sequential API calls.
-    list_loaded = getattr(state.workers, "loaded_models", None)
-    if callable(list_loaded):
-        residents = [item for item in list_loaded() if item]
-        if len(residents) == 1:
-            pool_settings_fn = getattr(state.workers, "_pool_settings", None)
-            max_resident = 1
-            if callable(pool_settings_fn):
-                max_resident = int(pool_settings_fn().get("maxResidentModels", 2))
-            if max_resident <= 1 or not _find_model(state, requested):
-                return residents[0]
+    # v2.7.2: strict model resolution. The pre-v2.7.2 single-resident
+    # shortcut returned the sole resident for *any* non-matching name --
+    # including a real, catalog-known distinct model -- so a request for
+    # model B while model A was resident silently answered with A
+    # (maxResidentModels == 1 included). Generic aliases (loaded, local,
+    # x, ...) still resolve via find_loaded_model above; every other name
+    # now falls through to the catalog resolve below: a known distinct
+    # model autoloads (evicting under _admit when idle, ENGINE_BUSY when
+    # busy), an unknown name fails loudly with MODEL_NOT_FOUND instead of
+    # answering with the wrong model.
     if state.database.metadata_value("api_autoload_suspended") == "1":
         raise MLXBarError("MODEL_NOT_LOADED", "モデルは手動で停止されています。MLXBarでモデルをロードしてください", 409)
     lock = getattr(state, "model_autoload_lock", None)
@@ -865,6 +860,13 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
         lock = asyncio.Lock()
         state.model_autoload_lock = lock
     async with lock:
+        # Re-check under the lock: another request may have made `requested`
+        # resident while this one waited (v2.7.2: check every resident, not
+        # just the primary, so a non-primary resident is reused, not reloaded).
+        if find_loaded:
+            resident = find_loaded(requested)
+            if resident:
+                return resident
         loaded = state.workers.loaded
         if loaded and _model_matches(loaded, requested, state):
             return loaded
@@ -895,22 +897,42 @@ def _record_cache_capability(state, loaded: dict) -> None:
     record(state, loaded)
 
 
+def _candidate_values(model: dict) -> set[str]:
+    # `provider_key` is None for pure local models; str(None) == "none"
+    # must never become a matchable name (v2.7.2).
+    values: set[str] = set()
+    for key in ("id", "name", "provider_key"):
+        raw = model.get(key, "")
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if text:
+            values.add(text.casefold())
+    return values
+
+
+_GENERIC_MODEL_ALIASES = frozenset({"loaded", "current_model", "local", "x", "openai/x"})
+
+
 def _model_matches(model: dict, requested: str, state) -> bool:
     value = requested.strip().casefold()
-    candidates = {str(model.get(key, "")).casefold() for key in ("id", "name", "provider_key")}
-    if value in candidates:
+    candidates = _candidate_values(model)
+    stripped = value[7:] if value.startswith("openai/") else value
+    if stripped in candidates:
         return True
-    if value in {"loaded", "current_model", "local", "x", "openai/x"}:
-        return True
-    if value.startswith("openai/") and value[7:] in candidates:
-        return True
-    return False
+    return value in _GENERIC_MODEL_ALIASES
 
 
 def _find_model(state, requested: str) -> dict | None:
     models = state.database.list_models()
     value = requested.strip().casefold()
-    aliases = {"loaded", "current_model", "local", "x", "openai/x"}
+    stripped = value[7:] if value.startswith("openai/") else value
+    # v2.7.2: exact id/name/provider_key first, so a real model named
+    # like a generic alias ("x", "local", ...) is never shadowed by it.
+    for model in models:
+        if stripped in _candidate_values(model):
+            return model
+    aliases = _GENERIC_MODEL_ALIASES
     if value in aliases:
         last_id = state.database.metadata_value("last_loaded_model_id")
         if last_id:
@@ -918,20 +940,45 @@ def _find_model(state, requested: str) -> dict | None:
                 if model.get("id") == last_id:
                     return model
         return models[0] if len(models) == 1 else None
-    if value.startswith("openai/"):
-        value = value[7:]
-    for model in models:
-        if value in {str(model.get(key, "")).casefold() for key in ("id", "name", "provider_key")}:
-            return model
     return None
+
+
+def _default_max_tokens_for(workers, loaded: dict | None) -> int:
+    # v2.7.2: the server default when the client omits max_tokens must come
+    # from *this request's* model, not the pool primary. Falls back to the
+    # primary/last-resort 512 exactly like the pre-v2.7.2 path.
+    if loaded:
+        per_model = getattr(workers, "effective_max_tokens_for", None)
+        if callable(per_model):
+            try:
+                value = int(per_model(str(loaded.get("id", ""))))
+                if value >= 1:
+                    return value
+            except Exception:
+                pass
+    resolver = getattr(workers, "effective_max_tokens", None)
+    try:
+        value = int(resolver()) if callable(resolver) else 512
+    except Exception:
+        value = 512
+    return value if value >= 1 else 512
 
 
 def _model_descriptor(state, model: dict, loaded: dict | None) -> dict:
     is_loaded = bool(loaded and model.get("id") == loaded.get("id"))
     capabilities = (loaded.get("capabilities") if is_loaded and loaded else {}) or {}
     maximum = None
-    if is_loaded and hasattr(state.workers, "effective_max_tokens"):
-        maximum = state.workers.effective_max_tokens()
+    if is_loaded:
+        # v2.7.2: use *this* model's limit, not the pool primary's. With
+        # several residents the primary and this row are different models.
+        per_model = getattr(state.workers, "effective_max_tokens_for", None)
+        if callable(per_model):
+            try:
+                maximum = per_model(str(model.get("id", "")))
+            except Exception:
+                maximum = None
+        if maximum is None and hasattr(state.workers, "effective_max_tokens"):
+            maximum = state.workers.effective_max_tokens()
     descriptor = {"id": model.get("name") or model.get("id"), "object": "model", "created": 0,
                   "owned_by": "mlxbar", "loaded": is_loaded, "max_tokens": maximum,
                   "context_window": capabilities.get("modelMaxTokens"),

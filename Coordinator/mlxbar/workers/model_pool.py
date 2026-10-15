@@ -519,16 +519,32 @@ class ModelPoolSupervisor:
         return await self.load(model, engine, pin=False)
 
     def find_loaded_model(self, requested: str) -> dict | None:
+        # v2.7.2: two-pass resolution so a real model that happens to be
+        # named like a generic alias ("x", "local", ...) is never shadowed
+        # by that alias, and a generic alias never flips the primary.
+        # Exact matches update the primary (most-recently-used); generic
+        # aliases return the primary when it is still resident (stable
+        # headline) without mutating it.
         if not self.enabled:
             loaded = self._legacy.loaded
             return loaded if loaded and self._matches(loaded, requested) else None
-        if self._legacy.loaded and self._matches(self._legacy.loaded, requested):
+        if self._legacy.loaded and self._matches_exact(self._legacy.loaded, requested):
             return self._legacy.loaded
         for slot in self._slots.values():
             loaded = slot.worker.loaded
-            if slot.state == "ready" and loaded and self._matches(loaded, requested):
+            if slot.state == "ready" and loaded and self._matches_exact(loaded, requested):
                 self._primary_model_id = str(loaded.get("id", ""))
                 return loaded
+        if self._is_generic_alias(requested):
+            if self._legacy.loaded and self._matches(self._legacy.loaded, requested):
+                return self._legacy.loaded
+            primary = self._primary_slot()
+            if primary and primary.state == "ready" and primary.worker.loaded:
+                return primary.worker.loaded
+            for slot in self._slots.values():
+                loaded = slot.worker.loaded
+                if slot.state == "ready" and loaded:
+                    return loaded
         return None
 
     def loaded_models(self) -> list[dict]:
@@ -540,16 +556,49 @@ class ModelPoolSupervisor:
             result.append(self._legacy.loaded)
         return result
 
+    GENERIC_MODEL_ALIASES = frozenset({"loaded", "current_model", "local", "x", "openai/x"})
+
     @staticmethod
-    def _matches(model: dict, requested: str) -> bool:
+    def _candidate_values(model: dict) -> set[str]:
+        # `provider_key` is None for pure local models; str(None) == "none"
+        # must never become a matchable name.
+        values: set[str] = set()
+        for key in ("id", "name", "provider_key"):
+            raw = model.get(key, "")
+            if not isinstance(raw, str):
+                continue
+            text = raw.strip()
+            if text:
+                values.add(text.casefold())
+        return values
+
+    @staticmethod
+    def _normalized_requested(requested: str) -> str:
         value = requested.strip().casefold()
         if value.startswith("openai/"):
             value = value[7:]
-        candidates = {str(model.get(key, "")).casefold()
-                      for key in ("id", "name", "provider_key")}
-        return value in candidates or requested.strip().casefold() in {
-            "loaded", "current_model", "local", "x", "openai/x"
-        }
+        return value
+
+    @classmethod
+    def _matches_exact(cls, model: dict, requested: str) -> bool:
+        return cls._normalized_requested(requested) in cls._candidate_values(model)
+
+    @classmethod
+    def _is_generic_alias(cls, requested: str) -> bool:
+        return requested.strip().casefold() in cls.GENERIC_MODEL_ALIASES
+
+    @staticmethod
+    def _matches(model: dict, requested: str) -> bool:
+        # Exact match first; generic aliases match any resident model.
+        # Kept for legacy single-model callers; pool lookups use the
+        # two-pass `find_loaded_model` above so an exact id/name is never
+        # shadowed by a generic alias.
+        value = requested.strip().casefold()
+        candidates = ModelPoolSupervisor._candidate_values(model)
+        stripped = value[7:] if value.startswith("openai/") else value
+        if stripped in candidates:
+            return True
+        return value in ModelPoolSupervisor.GENERIC_MODEL_ALIASES
 
     async def _evict_slot(self, slot: PoolSlot) -> None:
         model_id = str(slot.model.get("id", ""))
@@ -1105,9 +1154,30 @@ class ModelPoolSupervisor:
         slot = self._primary_slot()
         return (slot.worker if slot else self._legacy).effective_max_tokens()
 
+    def effective_max_tokens_for(self, model_id: str) -> int:
+        # v2.7.2: the OpenAI default (client omits max_tokens) and the
+        # `/v1/models` descriptor must use *this request's* model, not the
+        # pool primary. Falls back to the primary for unknown ids.
+        if self.enabled and model_id:
+            slot = self._pick_replica(str(model_id)) or next(
+                (item for item in self._replica_slots(str(model_id))
+                 if item.worker.loaded), None)
+            if slot is not None:
+                return slot.worker.effective_max_tokens()
+        return self.effective_max_tokens()
+
     def effective_max_prompt_characters(self) -> int:
         slot = self._primary_slot()
         return (slot.worker if slot else self._legacy).effective_max_prompt_characters()
+
+    def effective_max_prompt_characters_for(self, model_id: str) -> int:
+        if self.enabled and model_id:
+            slot = self._pick_replica(str(model_id)) or next(
+                (item for item in self._replica_slots(str(model_id))
+                 if item.worker.loaded), None)
+            if slot is not None:
+                return slot.worker.effective_max_prompt_characters()
+        return self.effective_max_prompt_characters()
 
     async def shutdown(self) -> None:
         if self._reaper_task:

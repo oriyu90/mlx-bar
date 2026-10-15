@@ -444,7 +444,7 @@ ZCodeが複数のsubagentを同時に開始した場合、MLXBarは要求を拒�
 |---|---|
 | Base URL | `http://127.0.0.1:11435/v1`（別PCからはLAN用URLの末尾に`/v1`） |
 | API Key | 「設定…」→「APIサーバー」のAPIキー（キー要求をOFFにしている場合は任意の文字列） |
-| Model | `GET /v1/models`が返す表示名または内部ID。MLXBarでモデルをロード（または常駐）しておくと、常駐が1つだけのときはクライアント側のモデル名が一致しなくてもその常駐モデルへ振り分けます。 |
+| Model | `GET /v1/models`が返す表示名または内部ID。汎用別名（`loaded`/`local`/`x`/`openai/x`/`current_model`、`openai/<表示名>`形）は常駐モデルへ解決します。カタログにない任意のモデル名は `MODEL_NOT_FOUND` (404) で明示拒否します（v2.7.2〜。誤ったモデルでの黙示応答を防止）。 |
 
 - `max_tokens`を送らないクライアントには、512ではなくAPI有効上限（既定8,192、モデル上限で頭打ち）を適用します。上の「Max token上限」を参照してください。
 - `response_format`は`text` / `json_object` / `json_schema`に対応します（v2.0.0〜、プロンプト指示＋生成後バリデーションのベストエフォート。詳細は上を参照）。それ以外のtypeはHTTP 400で拒否します。
