@@ -46,11 +46,14 @@
 - Python回帰: 592 passed＋1 failed（既知fluke、上記のとおり）。
   新規 `Tests/test_v2_7_2_model_routing.py` 7件は緑。
 - `swift build` 成功（差分なし）。
-- `.strings` 新規重複なし（追加なし）。
+- `.strings` 新規重複なし（既存`モデル未ロード`重複1件のみ残置）。
+  新規`.fixedSize`なし（既存 `QuickChatView` の1件とコメント言及のみ）。
 - DMG `MLXBar-2.7.2.dmg`（SHA-256 `f74338d2f908a0bf92a130b5577b1180415f7d15541a5d2b0378495b11c312b2`）。
   ad-hoc署名、`hdiutil verify` VALID、app 2.7.2/build 49。
 - GitHub Release `v2.7.2` は正式版。DMG＋`.sha256`添付。
-- `/Applications/MLXBar.app` を2.7.2へ入れ替え（旧版はバックアップ）。
-- 紹介サイトはstudio-riziで公開。プロジェクト8箇所を2.7.2へ、4言語UPDATE追加。
-  validate＋count-files・npm test通過後にpush。
+- `/Applications/MLXBar.app` を2.7.2へ入れ替え済み（旧2.7.1は
+  `/Applications/MLXBar.app.v271-backup`）。`Info.plist` で 2.7.2/build 49、
+  `codesign --verify --deep --strict` 通過を確認。
+- 紹介サイトはstudio-rizi `044a69d` で公開。プロジェクト8箇所を2.7.2へ、
+  4言語UPDATE追加。validate＋count-files・npm test通過後にpush。
   プロジェクトHTTP 200＋`softwareVersion: 2.7.2`、4言語news各HTTP 200を確認。
