@@ -183,7 +183,7 @@ class ReplicaTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.load(self.model(1), pin=True)
         with self.assertRaises(MLXBarError) as raised:
             await self.pool.load_for_api(self.model(2))
-        self.assertEqual(raised.exception.code, "MEMORY_BUDGET_EXCEEDED")
+        self.assertEqual(raised.exception.code, "RESIDENT_LIMIT_REACHED")
         self.assertEqual(set(self.pool._slots), {"model-1"})
 
     async def test_second_replica_still_gated_by_memory_budget_when_models_cap_is_one(self):

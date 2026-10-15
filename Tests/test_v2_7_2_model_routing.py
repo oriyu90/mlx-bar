@@ -49,6 +49,11 @@ async def _pool_with(root: Path, store: SettingsStore, database: Database):
 
 
 def test_max1_switches_to_a_known_distinct_model():
+    # v2.7.3: strict resident-count limit supersedes the v2.7.2 switch-by-
+    # eviction. With maxResidentModels == 1 and one distinct resident, a
+    # request for another distinct catalog model is refused loudly
+    # (RESIDENT_LIMIT_REACHED) instead of silently evicting. The caller
+    # unloads the current resident explicitly, then the request loads.
     async def scenario():
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -77,8 +82,14 @@ def test_max1_switches_to_a_known_distinct_model():
                         assert first.json()["model"] == "model-a"
                         second = await client.post("/v1/chat/completions", json={
                             "model": "model-b", "messages": [{"role": "user", "content": "hi"}]})
-                        assert second.status_code == 200
-                        assert second.json()["model"] == "model-b"
+                        assert second.status_code == 409
+                        assert second.json()["error"]["code"] == "RESIDENT_LIMIT_REACHED"
+                        assert set(pool._slots) == {"model-a"}
+                        await pool.unload_model("model-a")
+                        third = await client.post("/v1/chat/completions", json={
+                            "model": "model-b", "messages": [{"role": "user", "content": "hi"}]})
+                        assert third.status_code == 200
+                        assert third.json()["model"] == "model-b"
                         assert set(pool._slots) == {"model-b"}
                 finally:
                     await pool.shutdown()

@@ -332,6 +332,20 @@ class ModelPoolSupervisor:
         resident = self._resident_charge()
         maximum = int(self._pool_settings().get("maxResidentModels", 2))
         incoming_id = str(model.get("id", ""))
+        # v2.7.3: strict resident-count limit. While the pool has room for
+        # another distinct model, the request is added (loaded) as a new
+        # resident. Once distinct residents reach the limit, a new distinct
+        # model is refused loudly instead of silently evicting the oldest
+        # idle transient. Same-model reloads/replicas never count as new.
+        existing_ids = {str(slot.model.get("id", "")) for slot in self._slots.values()
+                        if str(slot.model.get("id", ""))}
+        if incoming_id not in existing_ids and len(existing_ids) >= maximum:
+            raise MLXBarError(
+                "RESIDENT_LIMIT_REACHED",
+                f"常駐モデル数が上限（{maximum}）に達しているため、新しいモデルをロードできません。"
+                "不要な常駐モデルをアンロードしてから再実行してください",
+                409, False,
+            )
 
         def _distinct_models(pending_evict: list[PoolSlot]) -> int:
             # `maxResidentModels` caps distinct model ids, not worker slots:
@@ -345,12 +359,22 @@ class ModelPoolSupervisor:
             ids.add(incoming_id)
             return len(ids)
 
-        while candidates and (resident + estimate > budget
-                              or _distinct_models(evict) > maximum):
+        # Budget eviction only: the distinct-count limit above is strict and
+        # never satisfied by evicting another model. The remaining
+        # distinct check below is a safety net for a concurrent config
+        # reduction (max lowered while this admission was in flight).
+        while candidates and resident + estimate > budget:
             victim = candidates.pop(0)
             evict.append(victim)
             resident -= victim.reservation_bytes
-        if resident + estimate > budget or _distinct_models(evict) > maximum:
+        if _distinct_models(evict) > maximum:
+            raise MLXBarError(
+                "RESIDENT_LIMIT_REACHED",
+                f"常駐モデル数が上限（{maximum}）に達しているため、新しいモデルをロードできません。"
+                "不要な常駐モデルをアンロードしてから再実行してください",
+                409, False,
+            )
+        if resident + estimate > budget:
             raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
                               "使用中または固定中のモデルを残したまま安全にロードできません", 503, True)
         return min(per_model, max(estimate, 1 << 30)), evict
