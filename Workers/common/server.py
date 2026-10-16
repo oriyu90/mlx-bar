@@ -420,6 +420,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
 
         async def lines():
             iterator = None
+            pending = None
             try:
                 try:
                     heartbeat_interval = min(30.0, max(0.01, float(
@@ -629,6 +630,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 # matters -- on the GeneratorExit/CancelledError raised when the
                 # client disconnects mid-generation.
                 adapter.cancelled.discard(request_id)
+                if pending is not None and not pending.done():
+                    # A disconnect while `await pending` (or `asyncio.wait`)
+                    # orphans one `on_mlx_thread` occupying the single MLX
+                    # thread for one extra `next_event`. Cancel it so the next
+                    # request does not serialize behind abandoned work.
+                    pending.cancel()
                 if iterator is not None:
                     # Deliberately not awaited (see close_on_mlx_thread), so the
                     # adapter's own cleanup runs *after* this block returns. The

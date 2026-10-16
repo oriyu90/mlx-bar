@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -67,10 +68,31 @@ class Database:
         self.path = path
         self.lock = threading.RLock()
         self._api_log_writes = 0
-        self.connection = sqlite3.connect(path, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.executescript(SCHEMA)
+        try:
+            self.connection = sqlite3.connect(path, check_same_thread=False)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.executescript(SCHEMA)
+        except (sqlite3.Error, OSError):
+            # A corrupt WAL/SHM sidecar (crash during a checkpoint, disk-full)
+            # can make an otherwise healthy DB file fail to open. Remove only
+            # the sidecars and retry once before giving up; never delete the
+            # main file here. The caller logs the path and exits non-zero so
+            # launchd restarts the service instead of running half-open.
+            for suffix in ("-wal", "-shm"):
+                with contextlib.suppress(OSError):
+                    Path(str(path) + suffix).unlink()
+            self.connection = sqlite3.connect(path, check_same_thread=False)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.executescript(SCHEMA)
         self._migrate_api_logs()
+        with contextlib.suppress(Exception):
+            # Keep a long-lived coordinator's file bounded and reclaim WAL
+            # pages on clean starts. Failures are non-fatal (steady-state
+            # paths prune on their own cadence below).
+            self.prune_old_jobs()
+            self.prune_runtime_history()
+            with self.lock, self.connection:
+                self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _migrate_api_logs(self) -> None:
         """Add privacy-safe performance columns to databases from older apps."""
@@ -189,6 +211,15 @@ class Database:
                 {**job, "result": json.dumps(job.get("result")) if job.get("result") is not None else None,
                  "error": json.dumps(job.get("error")) if job.get("error") is not None else None},
             )
+            if str(job.get("state", "")) in {"completed", "failed", "cancelled"}:
+                with contextlib.suppress(Exception):
+                    self.connection.execute(
+                        """DELETE FROM jobs WHERE state IN
+                           ('completed','failed','cancelled') AND id NOT IN
+                           (SELECT id FROM jobs WHERE state IN
+                            ('completed','failed','cancelled')
+                            ORDER BY updated_at DESC LIMIT 200)"""
+                    )
 
     def get_job(self, job_id: str) -> dict | None:
         with self.lock:
@@ -234,6 +265,58 @@ class Database:
                     """UPDATE jobs SET state=:state,message=:message,error=:error,
                        updated_at=CURRENT_TIMESTAMP WHERE id=:id""", item
                 )
+            with contextlib.suppress(Exception):
+                # Startup is the one place a full sweep is cheap: jobs are
+                # otherwise only marked, never deleted, so a months-long
+                # coordinator would grow state.sqlite3 without bound.
+                self.connection.execute(
+                    """DELETE FROM jobs WHERE state IN
+                       ('completed','failed','cancelled') AND id NOT IN
+                       (SELECT id FROM jobs WHERE state IN
+                        ('completed','failed','cancelled')
+                        ORDER BY updated_at DESC LIMIT 200)"""
+                )
+
+    def prune_old_jobs(self, keep_terminal: int = 200) -> None:
+        """Drop old terminal job rows, keeping the newest `keep_terminal`.
+
+        Active (`queued`/`running`) rows are never touched. Failures are
+        swallowed so pruning can never break the request that triggered it.
+        """
+        try:
+            keep = max(50, min(int(keep_terminal), 1000))
+        except (TypeError, ValueError):
+            keep = 200
+        with contextlib.suppress(Exception):
+            with self.lock, self.connection:
+                self.connection.execute(
+                    """DELETE FROM jobs WHERE state IN
+                       ('completed','failed','cancelled') AND id NOT IN
+                       (SELECT id FROM jobs WHERE state IN
+                        ('completed','failed','cancelled')
+                        ORDER BY updated_at DESC LIMIT ?)""",
+                    (keep,),
+                )
+
+    def prune_runtime_history(self, keep_per_engine: int = 100) -> None:
+        """Keep only the newest `keep_per_engine` history rows per engine.
+
+        Writers (`stage`/`activate`/`delete`/probe) only INSERT; readers only
+        LIMIT reads, so without this the table grows for the life of the app.
+        """
+        try:
+            keep = max(20, min(int(keep_per_engine), 500))
+        except (TypeError, ValueError):
+            keep = 100
+        with contextlib.suppress(Exception):
+            with self.lock, self.connection:
+                self.connection.execute(
+                    """DELETE FROM runtime_history WHERE id NOT IN
+                       (SELECT id FROM runtime_history AS keep
+                        WHERE keep.engine = runtime_history.engine
+                        ORDER BY id DESC LIMIT ?)""",
+                    (keep,),
+                )
 
     def add_runtime_history(self, engine: str, slot_id: str, action: str, result: dict) -> None:
         with self.lock, self.connection:
@@ -241,6 +324,13 @@ class Database:
                 "INSERT INTO runtime_history(engine,slot_id,action,result) VALUES(?,?,?,?)",
                 (engine, slot_id, action, json.dumps(result, ensure_ascii=False)),
             )
+            with contextlib.suppress(Exception):
+                self.connection.execute(
+                    """DELETE FROM runtime_history WHERE engine = ? AND id NOT IN
+                       (SELECT id FROM runtime_history WHERE engine = ?
+                        ORDER BY id DESC LIMIT 100)""",
+                    (engine, engine),
+                )
 
     def list_runtime_history(self, engine: str | None = None, limit: int = 50) -> list[dict]:
         with self.lock:

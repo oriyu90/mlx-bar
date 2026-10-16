@@ -330,6 +330,11 @@ final class MenuBarViewModel: ObservableObject {
     @Published var busy = false
     @Published var errorMessage: String?
     @Published var chatOutput = ""
+    /// Upper bound for `chatOutput`: a long agent reply would otherwise live
+    /// for the whole app session as an ever-copied Swift String (plus a full
+    /// re-layout per delta). The tail is kept so the visible reply stays
+    /// intact; no settings key, no UI string change.
+    static let maxChatOutputCharacters = 200_000
     @Published var generationTPS: Double?
     /// Tokens per second of the generation currently running, from the status
     /// poll rather than from a stream this GUI owns -- so it also reflects work
@@ -721,6 +726,10 @@ final class MenuBarViewModel: ObservableObject {
                 Task { @MainActor in
                     if event.type == "delta", let text = event.text {
                         self.chatOutput += text
+                        if self.chatOutput.count > Self.maxChatOutputCharacters {
+                            self.chatOutput.removeFirst(
+                                self.chatOutput.count - Self.maxChatOutputCharacters)
+                        }
                     } else if event.type == "metrics" {
                         self.generationTPS = event.generationTPS
                     } else if event.type == "error" {
@@ -1813,7 +1822,7 @@ final class MenuBarViewModel: ObservableObject {
     func refreshRecentLogs() async {
         errorMessage = nil
         do {
-            guard let result = try await json("GET", "/api/v1/logs?limit=500") as? [String: Any] else { return }
+            guard let result = try await json("GET", "/api/v1/logs?limit=200") as? [String: Any] else { return }
             recentLogs = result["data"] as? [[String: Any]] ?? []
             logStatus = recentLogs.isEmpty
                 ? ui("No API access has been recorded", "記録されたAPIアクセスはありません")

@@ -629,6 +629,11 @@ def _emergency_log(root: Path | None, exc: BaseException) -> None:
         directory = (root or app_support_dir()) / "logs"
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "coordinator-crash.log"
+        with contextlib.suppress(OSError):
+            # The only unbounded log file in the tree: rotate like the worker
+            # logs instead of appending for the life of the install.
+            if path.exists() and path.stat().st_size > 1_000_000:
+                path.replace(directory / "coordinator-crash.log.1")
         timestamp = datetime.now(timezone.utc).isoformat()
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(f"--- {timestamp} ---\n")

@@ -772,7 +772,7 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
                     if origin is not None:
                         request.state.api_log["first_token_ms"] = round(
                             (time.monotonic() - origin) * 1000)
-                text += event["text"]
+                text += str(event.get("text", ""))
             elif event.get("type") == "reasoning_delta":
                 # Since v1.8.4 the worker's splitter runs on tool-less requests
                 # too, so a reasoning model's `<think>` block arrives here as
@@ -799,8 +799,11 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
                 request.state.api_log["prompt_tokens"] = usage["prompt_tokens"]
             elif event.get("type") == "metrics":
                 if event.get("cached_tokens") is not None:
-                    cached_tokens = int(event["cached_tokens"])
-                    if usage is not None:
+                    try:
+                        cached_tokens = int(event["cached_tokens"])
+                    except (TypeError, ValueError):
+                        cached_tokens = None
+                    if usage is not None and cached_tokens is not None:
                         usage = _usage_from_event(usage, usage, cached_tokens)
                 for key in ("prompt_tokens", "cached_tokens", "prompt_tps", "generation_tps",
                             "cache_tier", "tool_support", "cold_reason",
@@ -1059,8 +1062,13 @@ def _usage(messages: list[dict], text: str) -> dict:
 
 def _usage_from_event(event: dict, fallback: dict | None = None,
                       cached_tokens: int | None = None) -> dict:
-    prompt = int(event.get("prompt_tokens", (fallback or {}).get("prompt_tokens", 0)))
-    completion = int(event.get("completion_tokens", (fallback or {}).get("completion_tokens", 0)))
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+    prompt = _safe_int(event.get("prompt_tokens", (fallback or {}).get("prompt_tokens", 0)))
+    completion = _safe_int(event.get("completion_tokens", (fallback or {}).get("completion_tokens", 0)))
     usage = {"prompt_tokens": prompt, "completion_tokens": completion,
              "total_tokens": prompt + completion}
     # Absent when the runtime did not report reuse at all. "No cache hit" and
@@ -1068,7 +1076,12 @@ def _usage_from_event(event: dict, fallback: dict | None = None,
     # context budget from this number, so the field is omitted rather than
     # reported as zero.
     if cached_tokens is not None:
-        usage["prompt_tokens_details"] = {"cached_tokens": max(0, min(int(cached_tokens), prompt))}
+        try:
+            cached = int(cached_tokens)
+        except (TypeError, ValueError):
+            cached = None
+        if cached is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": max(0, min(cached, prompt))}
     return usage
 
 

@@ -3,6 +3,22 @@
 > 公開物（README・紹介サイト等）には出さない、次回以降の開発向けメモ。
 > [common-rules-document](https://github.com/oriyu90/common-rules-document/blob/main/common%20rules.md) ルール6に基づき作成。
 
+## v2.7.5の省メモリ・リーク・クラッシュ安全性で守ること（2026-10-17リリース）
+
+- 上限は `chatOutput` 200,000文字（tail保持）・`StreamBuffer` pending 1MiB/diagnostic 64KiB・
+  `recentLogs` 取得 200件（保持2,000不変）・`status` cache（LAN 5秒・RAG/tiers 3秒・tiers 32key）・
+  `coordinator-crash.log` 1MB・`jobs` terminal 200件・`runtime_history` engine別100件。
+  上限を緩めたら `Tests/test_v2_7_5_memory_stability.py` で検出できる。
+- `Database.__init__` の WAL/SHM除去→1回retry、`PRAGMA wal_checkpoint(TRUNCATE)` は best-effort。
+  半開動作を作らず caller の emergency log＋非ゼロ exit に任せる。
+- `supervisor` の `effective_*` fallback（8192/100000）、`json.loads`/`response.json()` の
+  `WORKER_CRASHED`＋`_stop_worker`（poisoned worker残留防止）、`openai_compat` の str/int防御、
+  `clear_memory` の `MLXBarError` catch、Swift `stream()` の cancel→`terminate()` は対称性を崩さない。
+- 新規キー・既定値変更なし。`.strings` 追加なし。`QuickChatView:24` の `.fixedSize()` は
+  v1.2.0からの既存で本版の追加ではない（grepで1件残置）。
+- 未実施：実画面目視の日英確認（文言不変のため再確認のみ）・実機2並列のメモリトレース（v2.7.0から継続）・
+  長期稼働での sqlite/WAL 追跡。実機active slotの更新はオーナーの明示操作に任せること。
+
 ## v2.7.1の常駐固定ライフサイクル・最新ランタイム互換で守ること（2026-10-14リリース）
 
 - 固定（`profiles[].keepLoaded`＋セッション固定）と非固定（API自動ロードのtransient）の

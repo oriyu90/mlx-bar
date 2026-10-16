@@ -129,11 +129,18 @@ final class CoordinatorClient: @unchecked Sendable {
             error.fileHandleForReading.readabilityHandler = nil
         }
 
-        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { process in
-                continuation.resume(returning: process.terminationStatus)
+        let status: Int32 = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in
+                    continuation.resume(returning: process.terminationStatus)
+                }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
             }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+        } onCancel: {
+            // An abandoned QuickChat Task must not leave curl running until
+            // `--max-time 7210`: terminate so `busy` clears promptly.
+            // `terminate()` is safe to call on an already-exited process.
+            process.terminate()
         }
         // Drain whatever the handlers had not yet been scheduled for.
         buffer.append(output.fileHandleForReading.readDataToEndOfFile())
@@ -154,6 +161,11 @@ final class CoordinatorClient: @unchecked Sendable {
         private let lock = NSLock()
         private var pending = Data()
         private var diagnostic = Data()
+        /// A wedged SSE stream must not inflate Swift RSS without bound:
+        /// 1 MiB of unprocessed line data and 64 KiB of curl diagnostics.
+        /// Oldest bytes are dropped; complete `data:` lines still parse.
+        private static let maxPendingBytes = 1_048_576
+        private static let maxDiagnosticBytes = 65_536
         private let onEvent: @Sendable (StreamEvent) -> Void
 
         init(onEvent: @escaping @Sendable (StreamEvent) -> Void) { self.onEvent = onEvent }
@@ -168,6 +180,9 @@ final class CoordinatorClient: @unchecked Sendable {
             guard !chunk.isEmpty else { return }
             lock.lock(); defer { lock.unlock() }
             diagnostic.append(chunk)
+            if diagnostic.count > Self.maxDiagnosticBytes {
+                diagnostic.removeFirst(diagnostic.count - Self.maxDiagnosticBytes)
+            }
         }
 
         func append(_ chunk: Data) {
@@ -175,6 +190,9 @@ final class CoordinatorClient: @unchecked Sendable {
             var events: [StreamEvent] = []
             lock.lock()
             pending.append(chunk)
+            if pending.count > Self.maxPendingBytes {
+                pending.removeFirst(pending.count - Self.maxPendingBytes)
+            }
             while let newline = pending.firstIndex(of: 0x0A) {
                 let lineData = pending[..<newline]
                 pending.removeSubrange(...newline)

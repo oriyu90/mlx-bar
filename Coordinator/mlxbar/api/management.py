@@ -24,6 +24,63 @@ from ..system_info import lm_studio_default_folder
 router = APIRouter(prefix="/api/v1")
 
 
+# The menu bar polls `/status` every second while open (plus a background
+# poller), so the three sub-queries below must not each pay for DNS/SQL on
+# every tick. Small TTL caches keep the JSON shape identical while cutting
+# per-second `getaddrinfo` + SQLite fan-out. TTLs are short on purpose: a
+# stale LAN list or tier streak for ~3s is invisible, a storm of DB reads is
+# not. Failures fall back to fresh reads, never to stale errors.
+_STATUS_CACHE_TTL_SECONDS = 3.0
+_LAN_CACHE_TTL_SECONDS = 5.0
+_status_cache: dict = {"at": 0.0, "lan_at": 0.0, "lan": None,
+                       "rag_at": 0.0, "rag": None, "tiers": {}}
+
+
+def _cached_lan_addresses(app) -> list:
+    now = time.monotonic()
+    cached_at = float(_status_cache.get("lan_at") or 0.0)
+    if _status_cache.get("lan") is not None and (now - cached_at) < _LAN_CACHE_TTL_SECONDS:
+        return list(_status_cache["lan"])
+    try:
+        fresh = app.lan_ipv4_addresses()
+    except Exception:
+        return list(_status_cache.get("lan") or [])
+    _status_cache["lan"] = list(fresh)
+    _status_cache["lan_at"] = now
+    return list(fresh)
+
+
+def _cached_rag_summary(app) -> dict:
+    now = time.monotonic()
+    cached_at = float(_status_cache.get("rag_at") or 0.0)
+    if _status_cache.get("rag") is not None and (now - cached_at) < _STATUS_CACHE_TTL_SECONDS:
+        return dict(_status_cache["rag"])
+    fresh = _rag_summary(app)
+    _status_cache["rag"] = dict(fresh)
+    _status_cache["rag_at"] = now
+    return fresh
+
+
+def _cached_recent_tiers(app, model: str | None) -> list[dict]:
+    now = time.monotonic()
+    key = str(model or "")
+    entry = (_status_cache.get("tiers") or {}).get(key)
+    if entry and (now - float(entry.get("at") or 0.0)) < _STATUS_CACHE_TTL_SECONDS:
+        return [dict(row) for row in entry.get("rows") or []]
+    try:
+        fresh = app.database.recent_cache_tiers(model=model)
+    except Exception:
+        if entry:
+            return [dict(row) for row in entry.get("rows") or []]
+        return []
+    _status_cache.setdefault("tiers", {})[key] = {"at": now, "rows": [dict(row) for row in fresh]}
+    # Bound the key space: one entry per model name; evict oldest beyond 32.
+    if len(_status_cache["tiers"]) > 32:
+        oldest = min(_status_cache["tiers"], key=lambda k: _status_cache["tiers"][k].get("at", 0.0))
+        _status_cache["tiers"].pop(oldest, None)
+    return fresh
+
+
 def state(request: Request):
     return request.app.state.mlxbar
 
@@ -39,7 +96,7 @@ async def status(request: Request):
     api = app.settings.data["api"]
     lan_enabled = app.settings.data["security"].get("allowLan", False)
     local_url = f"http://127.0.0.1:{api['port']}"
-    lan_urls = [f"http://{address}:{api['port']}" for address in app.lan_ipv4_addresses()]
+    lan_urls = [f"http://{address}:{api['port']}" for address in _cached_lan_addresses(app)]
     worker_status = app.workers.status()
     anthropic_enabled = bool(api.get("anthropic", {}).get("enabled", True))
     base_url = lan_urls[0] if lan_enabled and lan_urls else local_url
@@ -54,7 +111,7 @@ async def status(request: Request):
             "promptCacheHealth": _prompt_cache_health(app, worker_status),
             "contextCompression": getattr(app, "last_context_compression", None),
             "adaptiveMemory": getattr(app, "last_adaptive_memory", None),
-            "rag": _rag_summary(app),
+            "rag": _cached_rag_summary(app),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
 
 
@@ -87,10 +144,7 @@ def _prompt_cache_health(app, worker_status: dict) -> dict:
     capabilities = loaded.get("capabilities") or {}
     cache = capabilities.get("promptCache") or {}
     budget = capabilities.get("cacheBudget") or {}
-    try:
-        recent = app.database.recent_cache_tiers(model=loaded.get("name") or loaded.get("id"))
-    except Exception:
-        recent = []
+    recent = _cached_recent_tiers(app, loaded.get("name") or loaded.get("id"))
     streak = 0
     for row in recent:
         if row.get("cache_tier") != "cold":
@@ -403,7 +457,10 @@ async def prompt_cache(request: Request):
 
 @router.post("/prompt-cache/memory/clear")
 async def clear_memory_prompt_cache(request: Request):
-    return await state(request).workers.clear_memory_prompt_cache()
+    try:
+        return await state(request).workers.clear_memory_prompt_cache()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
 
 
 @router.post("/prompt-cache/disk/clear")

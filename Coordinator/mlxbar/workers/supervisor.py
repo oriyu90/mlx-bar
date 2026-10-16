@@ -383,7 +383,10 @@ class WorkerSupervisor:
         async with httpx.AsyncClient(transport=transport, base_url="http://worker", timeout=timeout) as client:
             response = await client.post("/rpc", json={"protocol_version": 1, "request_id": str(uuid.uuid4()),
                                                         "method": method, "params": params})
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                raise MLXBarError("WORKER_CRASHED", "モデルWorkerの応答を解析できませんでした", 503, True)
             if response.status_code >= 400 or data.get("type") == "error":
                 raise MLXBarError(data.get("code", "WORKER_ERROR"), data.get("message", "worker error"), 400,
                                   data.get("retryable", False))
@@ -637,7 +640,18 @@ class WorkerSupervisor:
                         response.raise_for_status()
                         async for line in self._lines_with_idle_timeout(response.aiter_lines(), idle_timeout):
                             if line:
-                                event = json.loads(line)
+                                try:
+                                    event = json.loads(line)
+                                except ValueError:
+                                    # A poisoned worker line must not leave a
+                                    # half-parsed worker in the pool: kill it
+                                    # like a transport break so the next request
+                                    # starts cold instead of reading garbage.
+                                    if engine != "lm-studio":
+                                        await self._stop_worker()
+                                        self.loaded = None
+                                    raise MLXBarError("WORKER_CRASHED",
+                                                      "モデルWorkerの応答を解析できませんでした", 503, True)
                                 if event.get("type") == "progress":
                                     self._record_progress(control, event)
                                 yield event
@@ -991,7 +1005,10 @@ class WorkerSupervisor:
                                 "frequency_penalty": frequency_penalty}
 
     def effective_max_tokens(self) -> int:
-        configured = int(self.settings.data["generation"]["maxTokens"])
+        try:
+            configured = int(self.settings.data["generation"]["maxTokens"])
+        except (KeyError, TypeError, ValueError):
+            configured = 8192
         capabilities = (self.loaded or {}).get("capabilities") or {}
         model_limit = capabilities.get("modelMaxTokens")
         if isinstance(model_limit, int) and model_limit > 0:
@@ -999,7 +1016,10 @@ class WorkerSupervisor:
         return configured
 
     def effective_max_prompt_characters(self) -> int:
-        configured = int(self.settings.data["generation"]["maxPromptCharacters"])
+        try:
+            configured = int(self.settings.data["generation"]["maxPromptCharacters"])
+        except (KeyError, TypeError, ValueError):
+            configured = 100000
         capabilities = (self.loaded or {}).get("capabilities") or {}
         model_limit = capabilities.get("modelMaxTokens")
         if isinstance(model_limit, int) and model_limit > 0:
