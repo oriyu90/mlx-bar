@@ -30,8 +30,16 @@
 - `model unload` → resident 0。coordinator 正常停止。実ホームの jobs 5・history 7・logs 46（有界）。
 
 ## 3. 残作業（次版への引き継ぎ）
-
 1. 実画面目視の日英確認（本版 Swift は文言不変のため再確認のみ。`chatOutput` cap・`recentLogs` 200 件の表示崩れなしを確認）。
 2. 実機 2 並列のメモリトレース（v2.7.0 から継続。27B 級 2 重常駐を伴うため単体テストで担保し本番では未実施）。
 3. 長期稼働（30日）での `state.sqlite3` サイズ・WAL 回収の追跡（本版の prune＋checkpoint の効果測定）。
 4. 実機 active slot の更新はオーナーの明示操作に任せること（autoCheck 既定 off 維持）。
+
+## 4. 公開検証（実施済み、2026-10-17）
+
+- `sh scripts/build-release.sh` → `dist/MLXBar-2.7.5.dmg`（47MB、SHA-256 `881a4088…5151a59`）、`hdiutil verify` VALID、app 2.7.5/build 52。
+- `VERSION=2.7.5 sh scripts/verify-release.sh` → 署名・plist・DMG すべて通過（ad-hoc）。
+- `gh release create v2.7.5` → 正式版（draft ではない）。DMG＋`.sha256` 添付。
+- `/Applications/MLXBar.app` を 2.7.5 へ入れ替え（旧 2.7.4 は `/Applications/MLXBar.app.v274-backup`）。`codesign --verify` 通過。
+- 紹介サイト studio-rizi `b1d5494`（EveryTMP 同時更新の競合は merge＋再生成で解消）。`npm run build`（validate＋count-files 260/16000・重複 0）・`npm test`（34 passed）通過後に push。
+- 公開確認：プロジェクト HTTP 200＋`softwareVersion: 2.7.5`、4言語トップ（`/`,`/en/`,`/zh/`,`/pt/`）各 HTTP 200＋v2.7.5 news。
