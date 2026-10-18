@@ -208,7 +208,7 @@ def parser() -> argparse.ArgumentParser:
     set_login = config.add_parser("set-launch-at-login")
     set_login.add_argument("value", choices=["true", "false"])
     apply_preset = config.add_parser(
-        "apply-preset", help="一括設定モードを適用（軽量=KV 8bit・メモリ80% / フル=KV bf16・少し多め / custom=記録のみ）")
+        "apply-preset", help="一括設定モードを適用（軽量=KV 8bit・メモリ80%% / フル=KV bf16・少し多め / custom=記録のみ）")
     apply_preset.add_argument("mode", choices=["light", "full", "custom"])
     apply_preset.add_argument("--wait", action="store_true", help="適用後のモデル再スキャンを待つ")
     apply_preset.add_argument("--no-scan", action="store_true", help="モデル再スキャンを行わない")
@@ -249,6 +249,8 @@ def parser() -> argparse.ArgumentParser:
     secrets_group.add_parser("get-rag-embedding-token")
     set_rag_token = secrets_group.add_parser("set-rag-embedding-token")
     set_rag_token.add_argument("token", nargs="?", default="")
+    secrets_group.add_parser("get-omlx-token")
+    set_omlx_token = secrets_group.add_parser("set-omlx-token"); set_omlx_token.add_argument("token", nargs="?", default="")
     rag = sub.add_parser("rag").add_subparsers(dest="action", required=True)
     rag.add_parser("status")
     rag_collection = rag.add_parser("collection").add_subparsers(dest="sub", required=True)
@@ -300,6 +302,15 @@ def parser() -> argparse.ArgumentParser:
     lm_auto = lmstudio.add_parser("set-auto-load"); lm_auto.add_argument("value", choices=["true", "false"])
     lm_enabled = lmstudio.add_parser("set-enabled"); lm_enabled.add_argument("value", choices=["true", "false"])
     lm_folder = lmstudio.add_parser("set-folder"); lm_folder.add_argument("path", nargs="?", default="")
+    omlx = sub.add_parser("omlx").add_subparsers(dest="action", required=True)
+    omlx_connect = omlx.add_parser("connect", help="oMLXサーバーへの接続をテスト")
+    omlx_status = omlx.add_parser("status", help="oMLXの接続状態とモデル一覧を表示")
+    omlx_models = omlx.add_parser("models", help="oMLXで利用可能なモデル一覧を表示")
+    omlx_load = omlx.add_parser("load", help="oMLXでモデルをロード"); omlx_load.add_argument("model_id")
+    omlx_unload = omlx.add_parser("unload", help="oMLXからモデルをアンロード"); omlx_unload.add_argument("model_id"); omlx_unload.add_argument("--force", action="store_true")
+    omlx_set_enabled = omlx.add_parser("set-enabled", help="oMLX連携を有効/無効化"); omlx_set_enabled.add_argument("value", choices=["true", "false"])
+    omlx_set_url = omlx.add_parser("set-url", help="oMLXサーバーURLを設定"); omlx_set_url.add_argument("url")
+    omlx_set_routing = omlx.add_parser("set-routing", help="モデルのoMLXルーティングを設定"); omlx_set_routing.add_argument("model_id"); omlx_set_routing.add_argument("value", choices=["true", "false"])
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
@@ -494,6 +505,25 @@ def execute(args, client: Client):
         return client.request("POST", f"/api/v1/generate/{args.request_id}/cancel").json()
     if args.command == "cancel-all":
         return client.request("POST", "/api/v1/generate/cancel-all").json()
+    if args.command == "omlx":
+        if args.action == "connect": return client.request("POST", "/api/v1/omlx/connect").json()
+        if args.action == "status": return client.request("GET", "/api/v1/omlx/status").json()
+        if args.action == "models": return client.request("GET", "/api/v1/omlx/models").json()
+        if args.action == "load": return client.request("POST", f"/api/v1/omlx/models/{args.model_id}/load").json()
+        if args.action == "unload":
+            path = f"/api/v1/omlx/models/{args.model_id}/unload"
+            if args.force:
+                path += "?force=true"
+            return client.request("POST", path).json()
+        if args.action == "set-enabled":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"omlx": {"enabled": args.value == "true"}}}).json()
+        if args.action == "set-url":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"omlx": {"serverUrl": args.url}}}).json()
+        if args.action == "set-routing":
+            return client.request("PUT", "/api/v1/settings",
+                                  {"models": {"omlx": {"modelRouting": {args.model_id: args.value == "true"}}}}).json()
     if args.command == "runtime":
         if args.action == "list": return client.request("GET", "/api/v1/runtimes").json()
         if args.action == "check": return client.request("POST", f"/api/v1/runtimes/{args.engine}/check").json()
@@ -855,6 +885,8 @@ def execute(args, client: Client):
         if args.action == "set-lmstudio-token": return client.request("PUT", "/api/v1/settings/lm-studio-token", {"token": args.token}).json()
         if args.action == "get-rag-embedding-token": return client.request("GET", "/api/v1/settings/rag-embedding-token").json()
         if args.action == "set-rag-embedding-token": return client.request("PUT", "/api/v1/settings/rag-embedding-token", {"token": args.token}).json()
+        if args.action == "get-omlx-token": return client.request("GET", "/api/v1/settings/omlx-token").json()
+        if args.action == "set-omlx-token": return client.request("PUT", "/api/v1/settings/omlx-token", {"token": args.token}).json()
     if args.command == "logs":
         if args.action == "show": return client.request("GET", f"/api/v1/logs?limit={args.limit}").json()
         if args.action == "clear": return client.request("DELETE", "/api/v1/logs").json()

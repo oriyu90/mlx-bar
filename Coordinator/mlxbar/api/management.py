@@ -557,6 +557,101 @@ async def put_lm_studio_token(request: Request, body: dict):
     return {"token": token or "", "configured": bool(token)}
 
 
+@router.get("/settings/omlx-token")
+async def get_omlx_token(request: Request):
+    token = state(request).settings.omlx_token
+    return {"token": token or "", "configured": bool(token)}
+
+
+@router.put("/settings/omlx-token")
+async def put_omlx_token(request: Request, body: dict):
+    try:
+        token = state(request).settings.set_omlx_token(body.get("token"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, detail={"code": "INVALID_API_TOKEN", "message": str(exc)})
+    return {"token": token or "", "configured": bool(token)}
+
+
+# oMLX Management Endpoints
+@router.post("/omlx/connect")
+async def omlx_connect(request: Request):
+    """Test connection to oMLX server."""
+    app = state(request)
+    if not hasattr(app.workers, "_omlx_provider"):
+        raise HTTPException(409, detail={"code": "OMLX_NOT_AVAILABLE", "message": "oMLXプロバイダーが初期化されていません"})
+    try:
+        status = await app.workers._omlx_provider.connect()
+        return {
+            "connected": status.connected,
+            "version": status.version,
+            "error": status.error,
+            "serverUrl": status.server_url,
+        }
+    except Exception as exc:
+        raise HTTPException(503, detail={"code": "OMLX_CONNECTION_FAILED", "message": str(exc), "retryable": True})
+
+
+@router.get("/omlx/status")
+async def omlx_status(request: Request):
+    """Get oMLX server status and loaded models."""
+    app = state(request)
+    if not hasattr(app.workers, "_omlx_provider"):
+        return {"connected": False, "error": "oMLXプロバイダーが初期化されていません"}
+    try:
+        return await app.workers._omlx_provider.status()
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
+
+
+@router.get("/omlx/models")
+async def omlx_list_models(request: Request):
+    """List all models available in oMLX."""
+    app = state(request)
+    if not hasattr(app.workers, "_omlx_provider"):
+        raise HTTPException(409, detail={"code": "OMLX_NOT_AVAILABLE", "message": "oMLXプロバイダーが初期化されていません"})
+    try:
+        return {"data": await app.workers._omlx_provider.list_models()}
+    except Exception as exc:
+        raise HTTPException(503, detail={"code": "OMLX_LIST_FAILED", "message": str(exc), "retryable": True})
+
+
+@router.post("/omlx/models/{model_id:path}/load")
+async def omlx_load_model(model_id: str, request: Request):
+    """Load a model in oMLX."""
+    app = state(request)
+    if not hasattr(app.workers, "_omlx_provider"):
+        raise HTTPException(409, detail={"code": "OMLX_NOT_AVAILABLE", "message": "oMLXプロバイダーが初期化されていません"})
+    model = app.database.get_model(model_id)
+    if not model:
+        raise HTTPException(404, detail={"code": "MODEL_NOT_FOUND", "message": "指定されたモデルが見つかりません"})
+    if not app.workers._is_omlx_model(model_id):
+        raise HTTPException(409, detail={"code": "MODEL_NOT_ROUTED", "message": "このモデルはoMLXにルーティングされていません"})
+    try:
+        result = await app.workers._omlx_provider.load(model, "omlx")
+        return result
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    except Exception as exc:
+        raise HTTPException(503, detail={"code": "OMLX_LOAD_FAILED", "message": str(exc), "retryable": True})
+
+
+@router.post("/omlx/models/{model_id:path}/unload")
+async def omlx_unload_model(model_id: str, request: Request, force: bool = False):
+    """Unload a model from oMLX."""
+    app = state(request)
+    if not hasattr(app.workers, "_omlx_provider"):
+        raise HTTPException(409, detail={"code": "OMLX_NOT_AVAILABLE", "message": "oMLXプロバイダーが初期化されていません"})
+    if not app.workers._is_omlx_model(model_id):
+        raise HTTPException(409, detail={"code": "MODEL_NOT_ROUTED", "message": "このモデルはoMLXにルーティングされていません"})
+    try:
+        result = await app.workers._omlx_provider.unload(model_id)
+        return result
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    except Exception as exc:
+        raise HTTPException(503, detail={"code": "OMLX_UNLOAD_FAILED", "message": str(exc), "retryable": True})
+
+
 def _profile_pin_map(data: dict) -> dict[str, bool]:
     return {str(item.get("modelId")): bool(item.get("keepLoaded", False))
             for item in data.get("models", {}).get("pool", {}).get("profiles", [])

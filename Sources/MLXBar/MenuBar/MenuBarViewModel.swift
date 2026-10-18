@@ -170,6 +170,45 @@ struct ResidentModel: Identifiable, Hashable {
     }
 }
 
+/// Model entry from oMLX with routing state
+struct OMLXModel: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let engine: String?
+    let loaded: Bool
+    let memoryGB: Double?
+    let generationTPS: Double?
+    let mtpEnabled: Bool?
+    let pleOffloadEnabled: Bool?
+    var useOMLX: Bool
+
+    init?(_ value: [String: Any], useOMLX: Bool = false) {
+        guard let id = value["id"] as? String else { return nil }
+        self.id = id
+        self.name = value["name"] as? String ?? id
+        self.engine = value["engine"] as? String
+        self.loaded = value["loaded"] as? Bool ?? false
+        self.memoryGB = (value["memoryGB"] as? NSNumber)?.doubleValue
+        self.generationTPS = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
+        self.mtpEnabled = value["mtpEnabled"] as? Bool
+        self.pleOffloadEnabled = value["pleOffloadEnabled"] as? Bool
+        self.useOMLX = useOMLX
+    }
+
+    init(id: String, name: String, engine: String?, loaded: Bool, memoryGB: Double?,
+         generationTPS: Double?, mtpEnabled: Bool?, pleOffloadEnabled: Bool?, useOMLX: Bool) {
+        self.id = id
+        self.name = name
+        self.engine = engine
+        self.loaded = loaded
+        self.memoryGB = memoryGB
+        self.generationTPS = generationTPS
+        self.mtpEnabled = mtpEnabled
+        self.pleOffloadEnabled = pleOffloadEnabled
+        self.useOMLX = useOMLX
+    }
+}
+
 struct RuntimeInfo: Identifiable {
     let id: String
     let active: String?
@@ -390,6 +429,15 @@ final class MenuBarViewModel: ObservableObject {
         // language recorded here, so the two must move together.
         didSet { AppLanguage.current = guiLanguage }
     }
+    // MARK: - oMLX
+    @Published var omlxEnabled = false
+    @Published var omlxServerUrl = "http://127.0.0.1:8000"
+    @Published var omlxApiKey = ""
+    @Published var omlxStatus = "disconnected" // disconnected, connecting, connected, error
+    @Published var omlxVersion = ""
+    @Published var omlxError: String?
+    @Published var omlxModels: [OMLXModel] = []
+    @Published var omlxConnectionTestInProgress = false
     private let client = CoordinatorClient()
     private let cancellationClient = CoordinatorClient()
     private var polling: Task<Void, Never>?
@@ -725,6 +773,139 @@ final class MenuBarViewModel: ObservableObject {
             guard let json = try await json("GET", "/api/v1/models") as? [String: Any],
                   let data = json["data"] as? [[String: Any]] else { return }
             models = data.compactMap(CatalogModel.init)
+        } catch { errorMessage = presentError(error) }
+    }
+
+    // MARK: - oMLX
+
+    func refreshOMLXSettings() async {
+        do {
+            let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
+            if let omlx = settings["omlx"] as? [String: Any] {
+                omlxEnabled = omlx["enabled"] as? Bool ?? false
+                omlxServerUrl = omlx["serverUrl"] as? String ?? "http://127.0.0.1:8000"
+            }
+        } catch { errorMessage = presentError(error) }
+    }
+
+    func refreshOMLXStatus() async {
+        omlxStatus = "connecting"
+        do {
+            guard let json = try await self.json("GET", "/api/v1/omlx/status") as? [String: Any] else {
+                omlxStatus = "error"
+                omlxError = "No response from oMLX"
+                return
+            }
+            omlxVersion = json["version"] as? String ?? ""
+            omlxError = json["error"] as? String
+            let modelsData = (json["models"] as? [[String: Any]]) ?? []
+            // Get current routing config from settings
+            let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
+            let routing = (settings["omlx"] as? [String: Any])?["routing"] as? [String: Bool] ?? [:]
+
+            omlxModels = modelsData.compactMap { model in
+                guard var m = OMLXModel(model, useOMLX: routing[model["id"] as? String ?? ""] ?? false) else { return nil }
+                // Override useOMLX if model is not available on oMLX
+                if let available = model["available"] as? Bool, !available {
+                    m = OMLXModel(id: m.id, name: m.name, engine: m.engine, loaded: m.loaded,
+                                  memoryGB: m.memoryGB, generationTPS: m.generationTPS,
+                                  mtpEnabled: m.mtpEnabled, pleOffloadEnabled: m.pleOffloadEnabled,
+                                  useOMLX: false)
+                }
+                return m
+            }
+            if omlxError != nil {
+                omlxStatus = "error"
+            } else {
+                omlxStatus = "connected"
+            }
+        } catch {
+            omlxStatus = "error"
+            omlxError = presentError(error)
+        }
+    }
+
+    func setOMLXEnabled(_ enabled: Bool) async {
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": ["enabled": enabled]])
+            await self.refreshOMLXSettings()
+            if enabled { await self.refreshOMLXStatus() }
+        }
+    }
+
+    func setOMLXServerUrl(_ url: String) async {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") else {
+            errorMessage = ui("Server URL must start with http:// or https://",
+                              "サーバーURLは http:// または https:// で始めてください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": ["serverUrl": trimmed]])
+            await self.refreshOMLXSettings()
+            await self.refreshOMLXStatus()
+        }
+    }
+
+    func setOMLXApiKey(_ key: String) async {
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings/omlx-token", ["token": key])
+            self.omlxApiKey = key
+        }
+    }
+
+    func testOMLXConnection() async {
+        omlxConnectionTestInProgress = true
+        omlxError = nil
+        omlxStatus = "connecting"
+        defer { omlxConnectionTestInProgress = false }
+        do {
+            let result = try await json("POST", "/api/v1/omlx/connect") as? [String: Any] ?? [:]
+            if result["success"] as? Bool == true {
+                omlxStatus = "connected"
+                await refreshOMLXStatus()
+            } else {
+                omlxStatus = "error"
+                omlxError = result["error"] as? String ?? ui("Connection failed", "接続に失敗しました")
+            }
+        } catch {
+            omlxStatus = "error"
+            omlxError = presentError(error)
+        }
+    }
+
+    func setOMLXModelRouting(modelId: String, useOMLX: Bool) async {
+        await perform {
+            let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
+            var omlx = (settings["omlx"] as? [String: Any]) ?? [:]
+            var routing = (omlx["routing"] as? [String: Bool]) ?? [:]
+            routing[modelId] = useOMLX
+            omlx["routing"] = routing
+            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": omlx])
+            await self.refreshOMLXSettings()
+            await self.refreshOMLXStatus()
+        }
+    }
+
+    func loadOMLXModel(_ modelId: String) async {
+        await perform {
+            _ = try await self.json("POST", "/api/v1/omlx/models/\(self.pathComponent(modelId))/load")
+            await self.refreshOMLXStatus()
+        }
+    }
+
+    func unloadOMLXModel(_ modelId: String) async {
+        await perform {
+            _ = try await self.json("POST", "/api/v1/omlx/models/\(self.pathComponent(modelId))/unload")
+            await self.refreshOMLXStatus()
+        }
+    }
+
+    func refreshOMLXApiKey() async {
+        do {
+            if let token = try await json("GET", "/api/v1/settings/omlx-token") as? [String: Any] {
+                omlxApiKey = token["token"] as? String ?? ""
+            }
         } catch { errorMessage = presentError(error) }
     }
 

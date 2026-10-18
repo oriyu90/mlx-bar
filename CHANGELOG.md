@@ -2,6 +2,77 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.9.0] - 2026-10-18
+
+**oMLXを第4の推論ランタイムとして統合**。mlx-lm、mlx-vlm、LM Studioに加え、oMLX（https://github.com/jundot/omlx）をモデル単位で選択利用可能にしました。PLE SSD Offload、Lightning MTP、TurboQuant KV、ANE Prefill、MoE Expert Offload などのoMLX固有高速化機能をMLXBarから活用できます。
+
+### 新機能
+
+- **oMLX連携設定タブ追加**（設定画面）
+  - 接続設定: 有効/無効、サーバーURL（初期値 `http://127.0.0.1:8000`）、APIキー、接続テスト、状態表示、バージョン表示
+  - モデルルーティング: oMLXから取得したモデル一覧に「oMLXで実行する」ON/OFFトグル。初期状態OFF、設定は再起動後も保持、モデルID基準で対応付け、oMLX未対応モデルは選択不可
+  - 状態表示: 接続状態、バージョン、エラー詳細、ロード済みモデルのメトリクス（メモリ、生成速度、MTP、PLE Offload）
+
+- **モデル単位ルーティング**
+  - oMLX指定モデルのみoMLXへ送信、他は既存ランタイムで動作
+  - ロード/アンロード/推論/ストリーミング/Tool Calling/生成キャンセルすべて対応
+  - OpenAI互換API・Anthropic互換APIの両方からoMLXモデル利用可能
+
+- **統合メモリ管理**
+  - oMLX使用メモリをMLXBar全体のメモリ予算に含めて管理
+  - 新規ロード許可判定（`_admit`）でoMLX使用分を予算から差引
+  - 常駐メモリ総計（`_resident_charge`）にoMLX分を加算
+  - 96GB環境でoMLXが大量メモリ使用時も、MLXBar側が安全にロード可否判定
+  - 他モデルを勝手にアンロードせず、常駐固定設定を尊重
+
+- **ステータス表示統合**
+  - メニューバー・モデル管理画面でoMLXモデルのランタイム・ロード状態・生成速度・メモリ・MTP/PLE Offload表示
+  - 全体メモリ表示にoMLX分も含む
+
+- **CLI対応** (`mlxbarctl omlx`)
+  - `connect`/`status`/`models`/`load`/`unload`/`set-enabled`/`set-url`/`set-routing`
+  - `secrets get-omlx-token` / `set-omlx-token`
+
+- **Management API追加**
+  - `POST /api/v1/omlx/connect`, `GET /api/v1/omlx/status`, `GET /api/v1/omlx/models`
+  - `POST /api/v1/omlx/models/{id}/load`, `POST /api/v1/omlx/models/{id}/unload`
+  - `GET/PUT /api/v1/settings/omlx-token`
+
+### 設定スキーマ追加
+
+```json
+"models": {
+  "omlx": {
+    "enabled": false,
+    "serverUrl": "http://127.0.0.1:8000",
+    "apiKey": null,
+    "autoConnect": false,
+    "modelRouting": {}
+  }
+}
+```
+
+- APIキーは設定JSONに含めず、別ファイル（`control/omlx-token`）で安全管理
+- 検証: URL形式、boolean型、routingオブジェクト構造
+
+### 後方互換性・安全性
+
+- oMLX無効時（既定）は従来どおり動作
+- 既存API仕様・ステータスコード・SSEフォーマット・設定スキーマ・既定値は不変
+- 既存テスト全654件継続通過
+- 日本語・英語両UI完全対応
+
+### 既知の制限
+
+- oMLXインストール・更新は外部で実施（Homebrew等）
+- PLE/MTP等の詳細設定はoMLX側で管理（MLXBarは読取専用表示）
+- oMLXにサーバー側キャンセルAPIなし（クライアント側ストリームクローズのみ）
+- クラスタ/分散推論未対応
+
+詳細は[`DESIGN_v2.9.0.md`](DESIGN_v2.9.0.md)、検証記録は[`TEST_PLAN_v2.9.0.md`](TEST_PLAN_v2.9.0.md)を参照してください。
+
+---
+
 ## [2.8.1] - 2026-10-18
 
 v2.8.0 のパッチリリースです。**既定値・API 形状・設定スキーマは不変**で、

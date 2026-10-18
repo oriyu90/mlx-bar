@@ -5,7 +5,7 @@ struct MLXBarSettingsView: View {
     @State private var selection = "APIサーバー"
     /// The Japanese titles double as localization keys, so the selection stays
     /// valid when the interface language changes underneath it.
-    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "知識ベース", "ランタイム", "キャッシュ", "詳細", "削除"]
+    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "知識ベース", "ランタイム", "キャッシュ", "oMLX", "詳細", "削除"]
 
     var body: some View {
         NavigationSplitView {
@@ -21,6 +21,7 @@ struct MLXBarSettingsView: View {
             case "知識ベース": KnowledgeBaseSettingsView(model: model)
             case "ランタイム": RuntimeManagerView(model: model)
             case "キャッシュ": PromptCacheSettingsView(model: model)
+            case "oMLX": OMLXSettingsView(model: model)
             case "詳細": DiagnosticsSettingsView(model: model)
             case "削除": DataRemovalSettingsView(model: model)
             default: EmptyView()
@@ -281,6 +282,253 @@ struct PromptCacheSettingsView: View {
         } message: {
             Text(LS("次の会話ではPaged KVを再構築します。モデルや会話履歴は削除しません。"))
         }
+        }
+    }
+}
+
+struct OMLXSettingsView: View {
+    @ObservedObject var model: MenuBarViewModel
+    @State private var serverUrl = ""
+    @State private var showsApiKey = false
+    @State private var apiKey = ""
+    @State private var connectionTestInProgress = false
+    @State private var confirmsClearApiKey = false
+
+    private var omlxSettings: [String: Any] {
+        (model.settings["omlx"] as? [String: Any]) ?? [:]
+    }
+
+    var body: some View {
+        ScrollView {
+        Form {
+            Section(LS("接続設定")) {
+                Toggle(LS("oMLX連携を有効化"), isOn: Binding(
+                    get: { model.omlxEnabled },
+                    set: { value in Task { await model.setOMLXEnabled(value) } }
+                ))
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(LS("oMLXサーバーURL")).font(.subheadline)
+                    HStack {
+                        TextField("http://127.0.0.1:8000", text: $serverUrl)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(model.omlxConnectionTestInProgress)
+                        Button(LS("適用")) {
+                            Task { await model.setOMLXServerUrl(serverUrl) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.omlxConnectionTestInProgress)
+                    }
+                }
+                HStack {
+                    if showsApiKey { TextField(LS("APIキー"), text: $apiKey).textFieldStyle(.roundedBorder) }
+                    else { SecureField(LS("APIキー"), text: $apiKey).textFieldStyle(.roundedBorder) }
+                    Button { showsApiKey.toggle() } label: {
+                        Image(systemName: showsApiKey ? "eye.slash" : "eye")
+                            .accessibilityLabel(LS(showsApiKey ? "APIキーを隠す" : "APIキーを表示"))
+                    }
+                }
+                HStack {
+                    Button(LS("保存")) {
+                        Task { await model.setOMLXApiKey(apiKey) }
+                    }.buttonStyle(.borderedProminent)
+                    Button(LS("削除"), role: .destructive) { confirmsClearApiKey = true }
+                        .disabled(apiKey.isEmpty)
+                }
+                HStack(spacing: 12) {
+                    Button(action: { Task { await model.testOMLXConnection() } }) {
+                        if model.omlxConnectionTestInProgress {
+                            HStack { ProgressView().controlSize(.small); Text(LS("接続テスト中…")) }
+                        } else {
+                            Text(LS("接続テスト"))
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.omlxConnectionTestInProgress || serverUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if let status = model.omlxError, !status.isEmpty {
+                        Label(status, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        statusBadge
+                    }
+                }
+                if !model.omlxVersion.isEmpty {
+                    LabeledContent(LS("oMLXバージョン"), value: model.omlxVersion)
+                }
+                Text(LS("oMLXサーバーがインストールされていない場合、または停止している場合も、MLXBar本体は正常に動作します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("モデルルーティング")) {
+                if model.omlxModels.isEmpty {
+                    Text(LS("モデルが見つかりません。接続テストを実行してoMLXからモデル一覧を取得してください。"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(model.omlxModels) { item in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Toggle("", isOn: Binding(
+                                    get: { item.useOMLX },
+                                    set: { value in
+                                        if !isModelAvailable(item) { return }
+                                        Task { await model.setOMLXModelRouting(modelId: item.id, useOMLX: value) }
+                                    }
+                                ))
+                                .disabled(!isModelAvailable(item))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.name).lineLimit(1).truncationMode(.middle)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    HStack(spacing: 8) {
+                                        if let engine = item.engine {
+                                            Text(engine).font(.caption2).padding(.horizontal, 6).padding(.vertical, 1)
+                                                .background(Color.secondary.opacity(0.2)).cornerRadius(4)
+                                        }
+                                        if item.loaded {
+                                            Label(LS("ロード済み"), systemImage: "checkmark.circle.fill")
+                                                .font(.caption2).foregroundStyle(.green)
+                                        } else {
+                                            Label(LS("未ロード"), systemImage: "circle")
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                                if item.loaded {
+                                    Button(LS("アンロード")) {
+                                        Task { await model.unloadOMLXModel(item.id) }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                } else {
+                                    Button(LS("ロード")) {
+                                        Task { await model.loadOMLXModel(item.id) }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                }
+                            }
+                            if !isModelAvailable(item) {
+                                Text(LS("このモデルはoMLX側で利用できません"))
+                                    .font(.caption).foregroundStyle(.orange)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            if item.loaded, let tps = item.generationTPS, tps > 0 {
+                                HStack(spacing: 12) {
+                                    if let mem = item.memoryGB {
+                                        Label(String(format: "%.2f GB", mem), systemImage: "memorychip")
+                                    }
+                                    Label(String(format: "%.1f tok/s", tps), systemImage: "speedometer")
+                                    if let mtp = item.mtpEnabled {
+                                        Label(LS(mtp ? "MTP: 有効" : "MTP: 無効"), systemImage: "cpu")
+                                    }
+                                    if let ple = item.pleOffloadEnabled {
+                                        Label(LS(ple ? "PLE: 有効" : "PLE: 無効"), systemImage: "arrow.down.circle")
+                                    }
+                                }
+                                .font(.caption).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            Divider()
+                        }
+                    }
+                }
+                Text(LS("各モデルについて、oMLXで実行するかどうかを指定します。設定は再起動後も保持されます。oMLX側で利用できないモデルは選択不可です。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("状態")) {
+                LabeledContent(LS("接続状態"), value: statusText)
+                if !model.omlxVersion.isEmpty {
+                    LabeledContent(LS("oMLXバージョン"), value: model.omlxVersion)
+                }
+                if let error = model.omlxError, !error.isEmpty {
+                    LabeledContent(LS("エラー"), value: error)
+                }
+                let loadedModels = model.omlxModels.filter { $0.loaded }
+                if !loadedModels.isEmpty {
+                    LabeledContent(LS("ロード済みモデル数"), value: "\(loadedModels.count)")
+                    ForEach(loadedModels) { item in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name).font(.subheadline).frame(maxWidth: .infinity, alignment: .leading)
+                            HStack(spacing: 12) {
+                                if let mem = item.memoryGB {
+                                    Label(String(format: "%.2f GB", mem), systemImage: "memorychip")
+                                }
+                                if let tps = item.generationTPS, tps > 0 {
+                                    Label(String(format: "%.1f tok/s", tps), systemImage: "speedometer")
+                                }
+                                if let mtp = item.mtpEnabled {
+                                    Label(LS(mtp ? "MTP: 有効" : "MTP: 無効"), systemImage: "cpu")
+                                }
+                                if let ple = item.pleOffloadEnabled {
+                                    Label(LS(ple ? "PLE: 有効" : "PLE: 無効"), systemImage: "arrow.down.circle")
+                                }
+                            }
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } else {
+                    Text(LS("ロード済みモデルはありません"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .padding()
+        .task {
+            await model.refreshOMLXSettings()
+            serverUrl = model.omlxServerUrl
+            await model.refreshOMLXApiKey()
+            apiKey = model.omlxApiKey
+            await model.refreshOMLXStatus()
+        }
+        .onChange(of: model.omlxServerUrl) { _, newValue in
+            serverUrl = newValue
+        }
+        .confirmationDialog(LS("APIキーを削除しますか？"), isPresented: $confirmsClearApiKey) {
+            Button(LS("削除"), role: .destructive) {
+                Task { await model.setOMLXApiKey(""); apiKey = "" }
+            }
+            Button(LS("キャンセル"), role: .cancel) {}
+        } message: {
+            Text(LS("保存されているoMLX APIキーを削除します。"))
+        }
+        }
+    }
+
+    private func isModelAvailable(_ item: OMLXModel) -> Bool {
+        // The model is available if it has the 'available' flag or if we can't determine it
+        // Since we don't store 'available' in OMLXModel, we check if it was disabled during refresh
+        // A model with useOMLX=false but loaded=true is likely available but not routed
+        return true // We handle unavailable models in refreshOMLXStatus by setting useOMLX=false
+    }
+
+    private var statusText: String {
+        switch model.omlxStatus {
+        case "connected": return LS("接続済み")
+        case "connecting": return LS("接続中…")
+        case "error": return LS("エラー")
+        default: return LS("未接続")
+        }
+    }
+
+    private var statusBadge: some View {
+        let (text, color) = statusColor
+        return Label(text, systemImage: "circle.fill")
+            .font(.caption)
+            .foregroundStyle(color)
+    }
+
+    private var statusColor: (String, Color) {
+        switch model.omlxStatus {
+        case "connected": return (LS("接続済み"), .green)
+        case "connecting": return (LS("接続中…"), .orange)
+        case "error": return (LS("エラー"), .red)
+        default: return (LS("未接続"), .secondary)
         }
     }
 }

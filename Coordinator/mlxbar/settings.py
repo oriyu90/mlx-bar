@@ -63,6 +63,14 @@ DEFAULTS: dict[str, Any] = {
             "baseUrl": "http://127.0.0.1:1234",
             "autoLoad": True,
         },
+        "omlx": {
+            "enabled": False,
+            "serverUrl": "http://127.0.0.1:8000",
+            "apiKey": None,
+            "autoConnect": False,
+            # Model routing: model_id -> use_omlx (bool)
+            "modelRouting": {},
+        },
     },
     "runtimes": {
         # Off by default: a runtime that changes underneath a working large
@@ -251,6 +259,7 @@ class SettingsStore:
         self.token_path = self.root / "control" / "api-token"
         self.lm_studio_token_path = self.root / "control" / "lmstudio-token"
         self.rag_embedding_token_path = self.root / "control" / "rag-embedding-token"
+        self.omlx_token_path = self.root / "control" / "omlx-token"
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "control").mkdir(mode=0o700, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
@@ -397,6 +406,27 @@ class SettingsStore:
             if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
                     or not 1 <= float(maximum) <= 512):
                 raise ValueError("models.pool profile maxMemoryGB must be between 1 and 512")
+        omlx = data.get("models", {}).get("omlx", {})
+        if not isinstance(omlx.get("enabled", False), bool):
+            raise ValueError("models.omlx.enabled must be boolean")
+        server_url = omlx.get("serverUrl", "")
+        if server_url and not isinstance(server_url, str):
+            raise ValueError("models.omlx.serverUrl must be a string")
+        if server_url and not server_url.startswith(("http://", "https://")):
+            raise ValueError("models.omlx.serverUrl must be an http(s) URL")
+        api_key = omlx.get("apiKey")
+        if api_key is not None and not isinstance(api_key, str):
+            raise ValueError("models.omlx.apiKey must be a string or null")
+        if not isinstance(omlx.get("autoConnect", False), bool):
+            raise ValueError("models.omlx.autoConnect must be boolean")
+        model_routing = omlx.get("modelRouting", {})
+        if not isinstance(model_routing, dict):
+            raise ValueError("models.omlx.modelRouting must be an object")
+        for key, value in model_routing.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("models.omlx.modelRouting keys must be non-empty strings")
+            if not isinstance(value, bool):
+                raise ValueError(f"models.omlx.modelRouting[{key}] must be boolean")
         compression = data.get("contextCompression", {})
         if not isinstance(compression.get("enabled", False), bool):
             raise ValueError("contextCompression.enabled must be boolean")
@@ -676,4 +706,23 @@ class SettingsStore:
         if len(token) > 2048 or any(character in "\r\n" for character in token):
             raise ValueError("埋め込みAPIキーが不正です")
         self._write_secret(self.rag_embedding_token_path, token)
+        return token
+
+    @property
+    def omlx_token(self) -> str | None:
+        if not self.omlx_token_path.exists():
+            return None
+        token = self.omlx_token_path.read_text(encoding="utf-8").strip()
+        return token or None
+
+    def set_omlx_token(self, token: str | None) -> str | None:
+        if token is not None and not isinstance(token, str):
+            raise ValueError("oMLX APIキーは文字列で指定してください")
+        token = (token or "").strip()
+        if not token:
+            self.omlx_token_path.unlink(missing_ok=True)
+            return None
+        if len(token) > 2048 or any(character in "\r\n" for character in token):
+            raise ValueError("oMLX APIキーが不正です")
+        self._write_secret(self.omlx_token_path, token)
         return token

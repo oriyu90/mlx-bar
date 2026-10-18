@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..errors import MLXBarError
 from .supervisor import QueuedRequest, WorkerSupervisor as SingleWorkerSupervisor
+from .omlx_adapter import OMLXProvider
 
 
 GIB = 1 << 30
@@ -99,6 +100,8 @@ class ModelPoolSupervisor:
         self._primary_model_id: str | None = None
         self._pool_lock = asyncio.Lock()
         self._load_lock = asyncio.Lock()
+        # oMLX provider for models routed to oMLX
+        self._omlx_provider = OMLXProvider(settings, root)
         # Cross-model concurrent generation (v1.7.0).  concurrency == 1 keeps the
         # pre-v1.7.0 behaviour: a single permit means exactly one generation at a
         # time across the whole pool, identical to the old global lock.  The
@@ -137,6 +140,9 @@ class ModelPoolSupervisor:
             self.settings.data.get("models", {}).get("pool", {}).get("enabled", True)
         )
         self._reap_pool_orphans()
+        # Start oMLX status updates if enabled
+        if self._omlx_enabled():
+            self._omlx_provider.start_status_updates()
 
     @property
     def enabled(self) -> bool:
@@ -235,6 +241,33 @@ class ModelPoolSupervisor:
             if profile.get("modelId") == model_id:
                 return profile
         return {}
+
+    # --- oMLX provider integration -------------------------------------------
+
+    def _is_omlx_model(self, model_id: str) -> bool:
+        """Check if a model is routed to oMLX."""
+        routing = self.settings.data.get("models", {}).get("omlx", {}).get("modelRouting", {})
+        return bool(routing.get(model_id, False))
+
+    def _omlx_enabled(self) -> bool:
+        """Check if oMLX integration is enabled."""
+        return bool(self.settings.data.get("models", {}).get("omlx", {}).get("enabled", False))
+
+    def _get_omlx_memory_usage_cached(self) -> int:
+        """Get total memory used by oMLX models from cached status (synchronous)."""
+        try:
+            cached = self._omlx_provider.get_cached_status()
+            return int(cached.get("totalMemoryBytes", 0))
+        except Exception:
+            return 0
+
+    async def _get_omlx_memory_usage(self) -> int:
+        """Get total memory used by oMLX models (async, fresh data)."""
+        try:
+            memory_info = await self._omlx_provider.get_memory_usage()
+            return int(memory_info.get("total_bytes", 0))
+        except Exception:
+            return 0
 
     # --- same-model replicas (v1.8.0) ---------------------------------------
 
@@ -345,8 +378,12 @@ class ModelPoolSupervisor:
         return max(512 << 20, int(weight_bytes * 1.35) + (512 << 20))
 
     def _resident_charge(self) -> int:
-        return sum(slot.reservation_bytes for slot in self._slots.values()
-                   if slot.state in {"loading", "ready", "evicting"})
+        charge = sum(slot.reservation_bytes for slot in self._slots.values()
+                     if slot.state in {"loading", "ready", "evicting"})
+        # Add oMLX memory usage to the resident charge (from cached status)
+        if self._omlx_enabled():
+            charge += self._get_omlx_memory_usage_cached()
+        return charge
 
     # --- resident / non-resident bookkeeping (v2.8.0) -----------------------
 
@@ -477,6 +514,10 @@ class ModelPoolSupervisor:
                 409, False,
             )
         budget = self._global_budget()
+        # Account for oMLX memory usage in the global budget
+        if self._omlx_enabled():
+            omlx_memory = await self._get_omlx_memory_usage()
+            budget = max(0, budget - omlx_memory)
         if budget <= 0 or estimate > budget:
             raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
                               "モデルを安全にロードできる全体メモリ予算がありません", 503, True)
@@ -526,6 +567,23 @@ class ModelPoolSupervisor:
         chosen = engine or model.get("engine")
         if chosen in self.maintenance_engines:
             raise MLXBarError("ENGINE_BUSY", "ランタイム切替中です", 409, True)
+
+        # Handle oMLX models
+        if self._omlx_enabled() and (self._is_omlx_model(model_id) or chosen == "omlx"):
+            if chosen not in {"omlx", None, "auto"}:
+                raise MLXBarError("ENGINE_MISMATCH", f"モデル {model_id} はoMLXにルーティングされています", 409)
+            if not self._is_omlx_model(model_id):
+                raise MLXBarError("MODEL_INCOMPATIBLE", "このモデルはoMLXにルーティングされていません", 409)
+            async with self._load_lock:
+                if self.active_requests or self.queued_requests:
+                    raise MLXBarError("ENGINE_BUSY", "生成中はoMLXモデルをロードできません", 409, True)
+                # Check memory budget including oMLX usage
+                omlx_memory = await self._get_omlx_memory_usage()
+                # For oMLX, we don't manage the process directly, but we track memory
+                result = await self._omlx_provider.load(model, "omlx")
+                self._primary_model_id = model_id
+                return result
+
         if chosen == "lm-studio":
             # LM Studio owns a separate process and does not expose a stable
             # byte-accurate reservation API over REST. Never pretend its
@@ -833,6 +891,13 @@ class ModelPoolSupervisor:
             if self._legacy.loaded and str(self._legacy.loaded.get("id", "")) == model_id:
                 return await self._legacy.unload()
             return {"state": "unloaded", "count": 0}
+        # Handle oMLX models
+        if self._omlx_enabled() and self._is_omlx_model(model_id):
+            async with self._load_lock:
+                result = await self._omlx_provider.unload(model_id)
+                if self._primary_model_id == model_id:
+                    self._primary_model_id = None
+                return result
         async with self._load_lock:
             if self._legacy.loaded and str(self._legacy.loaded.get("id", "")) == model_id:
                 await self._legacy.unload()
@@ -1212,6 +1277,11 @@ class ModelPoolSupervisor:
             async for event in self._legacy.generate(prompt, images, options, request_id, image_root):
                 yield event
             return
+        # Handle oMLX models
+        if self._omlx_enabled() and self._is_omlx_model(model_id):
+            async for event in self._omlx_provider.generate(model_id, prompt, images, options, request_id or hashlib.sha256(os.urandom(16)).hexdigest()):
+                yield event
+            return
         slot = self._pick_replica(model_id)
         if slot is None:
             raise MLXBarError("MODEL_NOT_LOADED", "要求されたモデルがロードされていません", 409, True)
@@ -1465,6 +1535,7 @@ class ModelPoolSupervisor:
             await slot.worker.shutdown()
         self._slots.clear()
         await self._legacy.shutdown()
+        await self._omlx_provider.close()
 
     async def probe_runtime(self, engine: str) -> dict:
         if not self.enabled:
@@ -1594,6 +1665,44 @@ class ModelPoolSupervisor:
                                   "resident": True, "idleSecondsRemaining": None,
                                   "idleExtendSeconds": None, "idleExpiresAt": None})
         loading = loading or external_status.get("loadingModel")
+
+        # Add oMLX models to loaded_models
+        if self._omlx_enabled():
+            try:
+                omlx_status = self._omlx_provider.get_cached_status()
+                if omlx_status.get("connected"):
+                    for omx_model in omlx_status.get("models", []):
+                        if omx_model.get("loaded"):
+                            # Only include models that are routed to oMLX
+                            if self._is_omlx_model(omx_model.get("id", "")):
+                                loaded_models.append({
+                                    "id": omx_model.get("id"),
+                                    "name": omx_model.get("name"),
+                                    "engine": "omlx",
+                                    "state": "loaded",
+                                    "poolState": "ready",
+                                    "memoryReservationBytes": omx_model.get("memoryBytes", 0),
+                                    "activeLeases": 0,
+                                    "replicaIndex": 0,
+                                    "replicaCount": 1,
+                                    "readyReplicaCount": 1,
+                                    "desiredReplicaCount": 1,
+                                    "replicaShortfall": None,
+                                    "laneQueueDepth": 0,
+                                    "laneRecoveries": 0,
+                                    "keepLoaded": False,
+                                    "resident": True,
+                                    "idleSecondsRemaining": None,
+                                    "idleExtendSeconds": None,
+                                    "idleExpiresAt": None,
+                                    "mtpEnabled": omx_model.get("mtpEnabled", False),
+                                    "pleOffload": omx_model.get("pleOffload", False),
+                                    "contextLength": omx_model.get("contextLength", 0),
+                                })
+            except Exception:
+                # Don't fail status if oMLX is unreachable
+                pass
+
         primary = self.loaded
         primary_id = primary.get("id") if primary else None
         primary_descriptor = next((item for item in loaded_models if item.get("id") == primary_id), None)
