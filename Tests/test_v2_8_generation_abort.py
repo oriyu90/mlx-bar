@@ -466,3 +466,31 @@ def test_rayon_bound_is_applied_before_tokenizers_is_imported():
     # `import mlx_lm` only happens lazily inside stream(); what matters is that
     # the assignment is module level, which it is by construction here.
     assert mlx_import_at is None or bound_at < mlx_import_at, (bound_at, mlx_import_at)
+
+
+def test_rayon_thread_pool_is_bounded_for_mlx_vlm():
+    """v2.8.1: the mlx-vlm worker must inherit the same bound.
+
+    Before v2.8.1 the two `setdefault` calls lived only in the mlx-lm adapter,
+    so the first `transformers` tokenisation inside an mlx-vlm worker still
+    spawned one rayon thread per core.
+    """
+    import ast
+    from pathlib import Path
+
+    for relative in ("Workers/mlx_vlm_worker/adapter.py", "Workers/common/server.py"):
+        tree = ast.parse(
+            (Path(__file__).parents[1] / relative).read_text(encoding="utf-8"))
+        setdefaults = {
+            call.args[0].value
+            for node in ast.walk(tree) if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "setdefault"
+            and isinstance(node.value.func.value, ast.Attribute)
+            and node.value.func.value.attr == "environ"
+            and node.value.args and isinstance(node.value.args[0], ast.Constant)
+            for call in [node.value]
+        }
+        assert "RAYON_NUM_THREADS" in setdefaults, (relative, setdefaults)
+        assert "TOKENIZERS_PARALLELISM" in setdefaults, (relative, setdefaults)

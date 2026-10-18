@@ -12,6 +12,12 @@ import time
 import uuid
 from pathlib import Path
 
+# v2.8.1: the Rust tokeniser's thread pool is bounded in common.server (see
+# there for the rationale). `setdefault` here as well because this module is
+# what imports mlx_vlm first; the common.Server values are identical.
+os.environ.setdefault("RAYON_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from common import cache_state
 from common.server import BaseAdapter, memory_pressure_reason, run
 from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts

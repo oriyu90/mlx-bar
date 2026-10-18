@@ -544,6 +544,39 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     return asyncio.create_task(work())
 
 
+async def _runtime_auto_check_loop(state: AppState) -> None:
+    """Honour `runtimes.*.autoCheck` / `runtimes.checkIntervalHours` (v2.8.1).
+
+    Until now these settings were validated and editable everywhere (GUI,
+    CLI, export) but consumed by nothing. The contract is an automatic
+    *check* -- the same① `runtime_check:{engine}` metadata the manual check
+    writes, so the existing 紹介 UI, lastCheck display and `runtime update`
+    flows keep working unchanged -- never an install; installs stay explicit.
+    """
+    while True:
+        runtimes = state.settings.data.get("runtimes", {}) or {}
+        interval_hours = int(runtimes.get("checkIntervalHours", 168) or 168)
+        await asyncio.sleep(max(1, interval_hours) * 3600)
+        engines = [engine for engine in ("mlx-lm", "mlx-vlm")
+                   if bool((runtimes.get(engine) or {}).get("autoCheck", False))]
+        for engine in engines:
+            try:
+                result = await state.updater.check(engine)
+            except MLXBarError as exc:
+                LOGGER.warning("Runtime auto-check failed engine=%s code=%s",
+                               engine, exc.code)
+                continue
+            result["checkedAt"] = time.time()
+            with contextlib.suppress(Exception):  # a failed write must not stop the loop
+                state.database.set_metadata_value(
+                    f"runtime_check:{engine}", json.dumps(result))
+            if result.get("updateAvailable"):
+                LOGGER.warning(
+                    "Runtime update available engine=%s current=%s candidate=%s "
+                    "(run `mlxbarctl runtime update %s` to install)",
+                    engine, result.get("currentVersion"), result.get("candidateVersion"), engine)
+
+
 async def serve(root: Path | None = None) -> None:
     state = AppState(root)
     configure_logging(state.root)
@@ -575,6 +608,7 @@ async def serve(root: Path | None = None) -> None:
                                                 timeout_graceful_shutdown=10, lifespan="off"))
     state.management_server = management
     management_task = asyncio.create_task(management.serve())
+    auto_check_task = asyncio.create_task(_runtime_auto_check_loop(state))
     # Started only after the management API is serving, for the same reason the
     # runtime install is: a long synchronous step before the socket is live is a
     # window in which a client can reach half-built state. Loading a 27B model
@@ -598,6 +632,9 @@ async def serve(root: Path | None = None) -> None:
     finally:
         if preload_task is not None:
             preload_task.cancel()
+        auto_check_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(asyncio.shield(auto_check_task), timeout=5)
         # A runtime install (e.g. the automatic first-launch install above)
         # spawns `uv` in its own session so it can be killed by process
         # group; left alone, it survives this coordinator as an orphan still

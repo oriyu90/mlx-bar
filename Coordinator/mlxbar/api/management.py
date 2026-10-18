@@ -36,13 +36,16 @@ _status_cache: dict = {"at": 0.0, "lan_at": 0.0, "lan": None,
                        "rag_at": 0.0, "rag": None, "tiers": {}}
 
 
-def _cached_lan_addresses(app) -> list:
+async def _cached_lan_addresses(app) -> list:
     now = time.monotonic()
     cached_at = float(_status_cache.get("lan_at") or 0.0)
     if _status_cache.get("lan") is not None and (now - cached_at) < _LAN_CACHE_TTL_SECONDS:
         return list(_status_cache["lan"])
     try:
-        fresh = app.lan_ipv4_addresses()
+        # `getaddrinfo` inside `lan_ipv4_addresses()` is blocking; never let a
+        # slow resolver stall the single event loop every client polls.
+        fresh = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: list(app.lan_ipv4_addresses()))
     except Exception:
         return list(_status_cache.get("lan") or [])
     _status_cache["lan"] = list(fresh)
@@ -96,7 +99,7 @@ async def status(request: Request):
     api = app.settings.data["api"]
     lan_enabled = app.settings.data["security"].get("allowLan", False)
     local_url = f"http://127.0.0.1:{api['port']}"
-    lan_urls = [f"http://{address}:{api['port']}" for address in _cached_lan_addresses(app)]
+    lan_urls = [f"http://{address}:{api['port']}" for address in await _cached_lan_addresses(app)]
     worker_status = app.workers.status()
     anthropic_enabled = bool(api.get("anthropic", {}).get("enabled", True))
     base_url = lan_urls[0] if lan_enabled and lan_urls else local_url
@@ -282,7 +285,12 @@ async def extend_idle(model_id: str, request: Request, body: dict = Body(default
 async def unload(request: Request, force: bool = False):
     app = state(request)
     _raise_if_generations_in_flight(app, force, "モデルを解放")
-    result = await app.workers.unload()
+    try:
+        result = await app.workers.unload()
+    except MLXBarError as exc:
+        # A lease taken between the in-flight check and the unload (or any
+        # other worker-side refusal) is a supported condition, not a bug.
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     app.database.set_metadata_value("api_autoload_suspended", "1")
     return result
 
@@ -442,7 +450,10 @@ async def runtime_activate(engine: str, request: Request, body: dict):
     # in-flight generation as an explicit unload is, and has to ask the same
     # question first.
     _raise_if_generations_in_flight(app, bool(body.get("force")), "ランタイムを切り替え")
-    await app.workers.unload()
+    try:
+        await app.workers.unload()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     try:
         return app.slots.activate(engine, body["slotId"])
     except (ValueError, KeyError) as exc:
@@ -453,7 +464,10 @@ async def runtime_activate(engine: str, request: Request, body: dict):
 async def runtime_rollback(engine: str, request: Request, force: bool = False):
     app = state(request)
     _raise_if_generations_in_flight(app, force, "ランタイムを切り戻し")
-    await app.workers.unload()
+    try:
+        await app.workers.unload()
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     try:
         return app.slots.rollback(engine)
     except ValueError as exc:
@@ -472,7 +486,7 @@ async def export_settings(request: Request):
     Secrets are never included; they must be re-entered on the destination.
     """
     app = state(request)
-    return build_export(app.settings.public(), _hardware(app))
+    return build_export(app.settings.public(), await _hardware_async(app))
 
 
 @router.get("/prompt-cache")
@@ -744,17 +758,25 @@ def _hardware(app) -> dict:
     return collect_hardware(app.root)
 
 
+async def _hardware_async(app) -> dict:
+    # `collect_hardware` runs three sequential `subprocess.run` calls (up to
+    # their 5s timeouts each) plus `shutil.disk_usage`; on a busy or
+    # memory-pressured host that is seconds during which every coordinator
+    # listener would otherwise freeze. Always offload it.
+    return await asyncio.to_thread(collect_hardware, app.root)
+
+
 @router.get("/system/hardware")
 async def system_hardware(request: Request):
     """Live hardware inventory for presets, setup, and export (v2.6.0)."""
-    return _hardware(state(request))
+    return await _hardware_async(state(request))
 
 
 @router.get("/presets/status")
 async def presets_status(request: Request):
     """Stored mode, effective mode, and both hardware-derived profiles."""
     app = state(request)
-    return status_payload(app.settings.data, _hardware(app))
+    return status_payload(app.settings.data, await _hardware_async(app))
 
 
 @router.post("/presets/apply", status_code=202)
@@ -770,7 +792,7 @@ async def presets_apply(request: Request, body: dict = Body(default_factory=dict
         raise HTTPException(400, detail={"code": "INVALID_PRESET_MODE",
                                          "message": "modeはlight/fullで指定してください"})
     app = state(request)
-    patch, record, warnings = apply_payload(mode, _hardware(app))
+    patch, record, warnings = apply_payload(mode, await _hardware_async(app))
     try:
         values = app.settings.update(patch)
     except ValueError as exc:
@@ -817,7 +839,7 @@ async def setup_status(request: Request):
             "skipped": bool(setup.get("skipped", False)),
             "version": setup.get("version"),
             "freshInstall": bool(getattr(app.settings, "fresh_install", False)),
-            "hardware": _hardware(app)}
+            "hardware": await _hardware_async(app)}
 
 
 @router.post("/setup/complete")
@@ -866,7 +888,8 @@ async def setup_complete(request: Request, body: dict = Body(default_factory=dic
             if preset not in {"light", "full"}:
                 raise HTTPException(400, detail={"code": "INVALID_SETUP",
                                                  "message": "presetはlight/fullで指定してください"})
-            preset_patch, _, preset_warnings = apply_payload(preset, _hardware(app))
+            preset_patch, _, preset_warnings = apply_payload(
+                preset, await _hardware_async(app))
             patch = deep_merge(patch, preset_patch)
             warnings.extend(preset_warnings)
     patch.setdefault("setup", {}).update({

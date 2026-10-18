@@ -2,6 +2,59 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.8.1] - 2026-10-18
+
+v2.8.0 のパッチリリースです。**既定値・API 形状・設定スキーマは不変**で、
+安定性と GUI/CLI・設定整合の精査指摘を解消します。
+
+### 修正
+
+- **プール生成レーンが取り残される競合を修正。** 親に放棄された取得タスクが、
+  orphan 回復で解放されたレーンに対して owner/permit/カウンタを commit し、
+  `_gen_active_lanes` と `_gen_slots` が 1 本ずつ永久消費されることがありました
+  （v2.8.0 ストレステストで散発的に再現）。取得タスクは全 await の再開時に
+  放棄マーカを再確認して commit せずに戻ります。あわせて orphan 回復は同じ状態の
+  2 回連続観測（0.5 秒幅）を要求するようになり、レーン取得直後の生きた要求を
+  status poll が殺さなくなりました。レーンを別要求に奪われた生成は黙って
+  非直列化せず `ENGINE_BUSY` (503, 再試行可能) で失敗します。
+- **coordinator のイベントループ詰まりを撤去。** `status` ポーリング中の
+  `getaddrinfo`（LAN アドレス取得）と、hardware/preset/export/setup 経路の
+  `collect_hardware`（`subprocess.run` × 3 + ディスク使用量）をすべて
+  イベントループ外へ移しました。メモリ逼迫ホストでも全リスナーが固まりません。
+- `model unload` / `runtime activate` / `runtime rollback` が in-flight 生成に
+  阻まれたとき、従来の 500 ではなく 409 を返します（チェックと実行の間に
+  生成が始まる競合はサポートされた条件です）。
+- **mlx-vlm worker も tokenizers（rayon）スレッド総数を抑制。** v2.8.0 の抑制は
+  mlx-lm adapter だけにあり、mlx-vlm worker は最初の tokenise でコア数分の
+  thread を起動していました。既定値は同じ（min(4, コア数)）。`setdefault` のため
+  明示設定があればそちらが優先されます。
+- **GUI/CLI パリティの修正:**
+  - `mlxbarctl config set-kb --chunk-overlap` が GUI と同じ交差検証
+    （`0 <= overlap <= chunkSize/2`）を行い、失敗を先出しします。
+  - `mlxbarctl config set-lan false` が `requireToken` を黙って true に
+    書き戻さなくなります（強制は LAN を有効にするときだけ）。
+  - `mlxbarctl config apply-preset custom` が GUI と同じ契約
+    （`presets.mode: custom` の記録）で使えます。
+  - `mlxbarctl` のジョブ待ちに 30 分上限（`JOB_WAIT_TIMEOUT`）を追加。GUI と同一です。
+  - coordinator が JSON 以外のエラー本文を返したとき、生テキストをそのまま
+    見せます（parse エラーで失敗を隠さない）。
+- **設定 import で LAN 構成が転送できない退行を修正（v2.6.0〜）。**
+  `api.host` と `security.allowLan` は「必ずペアで変える」バリデーションのため、
+  leaf 単位の適用では片方ずつ失敗していました。両方を含む export は
+  ひとつの候補として検証・適用します。
+- `runtimes.*.autoCheck` / `checkIntervalHours` を消費する auto-check ループを
+  coordinator に追加。これまで検証されるだけで何も参照していなかった
+  （v2.7.1 導入のキー）ため、定期チェックが `runtime_check:{engine}` metadata を
+  手動チェックと同じ形式で書きます。**install は行いません**（明示操作のみ）。
+  既定は不変（autoCheck off / 168h）。
+- 設定検証の補強: `api.enabled` は bool、generation の数値は bool を拒否
+  （`true` を 1 として通さない）。いずれも既存値は影響なし。
+- GUI 英語表示: v2.8.0 の待機延長欄の補足文言（accessibility hint）キーの
+  句点不一致を修正。`INVALID_IDLE_EXTENSION` / `MODEL_NOT_IDLE_MANAGED` /
+  `JOB_WAIT_TIMEOUT` の日英文言を追加。
+
+詳細は[`DESIGN_v2.8.1.md`](DESIGN_v2.8.1.md)、検証記録は[`TEST_PLAN_v2.8.1.md`](TEST_PLAN_v2.8.1.md)を参照してください。
+
 ## [2.8.0] - 2026-10-18
 
 常駐上限を超えてのモデルロード（非常駐）と、待機時間の延長・秒表示、

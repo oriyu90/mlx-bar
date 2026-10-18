@@ -30,17 +30,34 @@ class Client:
         with httpx.Client(transport=transport, base_url="http://mlxbar", timeout=None) as client:
             response = client.request(method, path, json=body)
             if response.status_code >= 400:
-                detail = response.json().get("detail", {})
+                try:
+                    detail = response.json().get("detail", {})
+                except ValueError:
+                    # Error bodies are not guaranteed to be JSON (a proxy or a
+                    # crashed handler); show the raw text instead of masking
+                    # the real problem with a parse error.
+                    detail = {}
                 error = RuntimeError(detail.get("message") or detail.get("code") or response.text)
                 error.code = detail.get("code", "INTERNAL_ERROR")
                 raise error
             return response
 
 
+WAIT_JOB_DEADLINE_SECONDS = 30 * 60.0
+
+
 def wait_job(client: Client, job: dict, as_json: bool) -> dict:
+    deadline = time.monotonic() + WAIT_JOB_DEADLINE_SECONDS
     while job.get("state") not in {"completed", "failed", "cancelled"}:
         if not as_json:
             print(f"{job.get('state')}: {job.get('message', '')}", file=sys.stderr)
+        if time.monotonic() >= deadline:
+            # The GUI caps its own job wait at 30 minutes; a wedged job (or a
+            # coordinator that vanished mid-job) must not hang a CLI caller
+            # forever either.
+            error = RuntimeError("ジョブが30分以内に終了しませんでした")
+            error.code = "JOB_WAIT_TIMEOUT"
+            raise error
         time.sleep(0.5)
         job = client.request("GET", f"/api/v1/jobs/{job['id']}").json()
     return job
@@ -191,8 +208,8 @@ def parser() -> argparse.ArgumentParser:
     set_login = config.add_parser("set-launch-at-login")
     set_login.add_argument("value", choices=["true", "false"])
     apply_preset = config.add_parser(
-        "apply-preset", help="一括設定モードを適用（軽量=KV 8bit・メモリ80% / フル=KV bf16・少し多め）")
-    apply_preset.add_argument("mode", choices=["light", "full"])
+        "apply-preset", help="一括設定モードを適用（軽量=KV 8bit・メモリ80% / フル=KV bf16・少し多め / custom=記録のみ）")
+    apply_preset.add_argument("mode", choices=["light", "full", "custom"])
     apply_preset.add_argument("--wait", action="store_true", help="適用後のモデル再スキャンを待つ")
     apply_preset.add_argument("--no-scan", action="store_true", help="モデル再スキャンを行わない")
     config.add_parser("preset-status", help="一括設定モードの状態と両プロファイル値を表示")
@@ -712,6 +729,13 @@ def execute(args, client: Client):
             return client.request("PUT", "/api/v1/settings",
                                   {"general": {"launchAtLogin": args.value == "true"}}).json()
         if args.action == "apply-preset":
+            if args.mode == "custom":
+                # The GUI records `custom` as "the user changed values away
+                # from the applied preset" without touching settings. The
+                # server rejects `custom` in /presets/apply on purpose; a
+                # plain mode update is the same contract here.
+                return client.request("PUT", "/api/v1/settings",
+                                      {"presets": {"mode": "custom"}}).json()
             result = client.request("POST", "/api/v1/presets/apply",
                                     {"mode": args.mode}).json()
             if not args.no_scan:
@@ -793,8 +817,17 @@ def execute(args, client: Client):
                     raise ValueError("チャンクサイズは100〜8,000文字で指定してください")
                 patch["chunkSize"] = args.chunk_size
             if args.chunk_overlap is not None:
-                if args.chunk_overlap < 0:
-                    raise ValueError("チャンクの重なりは0以上で指定してください")
+                # Cross-field rule (server: 0 <= overlap <= chunkSize / 2):
+                # resolve against the value being set now, else the stored
+                # one -- matching the GUI's Knowledge base panel, so the CLI
+                # fails up front instead of with a server-side error later.
+                effective_chunk_size = args.chunk_size or patch.get("chunkSize") or 0
+                if not effective_chunk_size:
+                    current = client.request("GET", "/api/v1/settings").json()
+                    effective_chunk_size = int(current["rag"]["chunkSize"])
+                if not (0 <= args.chunk_overlap <= effective_chunk_size // 2):
+                    raise ValueError(
+                        "チャンクの重なりは0以上かつチャンクサイズの半分以下で指定してください")
                 patch["chunkOverlap"] = args.chunk_overlap
             if args.default_top_k is not None:
                 if not 1 <= args.default_top_k <= 20:
@@ -831,9 +864,17 @@ def execute(args, client: Client):
             # api.host and security.allowLan to change together (see
             # settings.py), so two separate `config set` calls can't express
             # this -- each one alone would fail validation.
+            # v2.8.1: `requireToken` is only forced on when *enabling* LAN --
+            # validation forbids a token-less LAN listener, which is what the
+            # unconditional overriding used to do when DISABLING LAN, silently
+            # re-enabling the API key for a user who had deliberately turned
+            # it off while localhost-only.
             enabled = args.enabled
+            api_patch: dict = {"host": "0.0.0.0" if enabled else "127.0.0.1"}
+            if enabled:
+                api_patch["requireToken"] = True
             return client.request("PUT", "/api/v1/settings", {
-                "api": {"host": "0.0.0.0" if enabled else "127.0.0.1", "requireToken": True},
+                "api": api_patch,
                 "security": {"allowLan": enabled},
             }).json()
         if args.action == "set-port":

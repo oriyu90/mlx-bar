@@ -23,6 +23,15 @@ LOGGER = logging.getLogger(__name__)
 MAX_IDLE_EXTENSION_SECONDS = 86_400
 
 
+class _LaneAbandoned(Exception):
+    """Internal: an in-flight lane acquisition was abandoned by its parent.
+
+    Never escapes ``_acquire_lane`` -- the parent generator that triggered the
+    abandon marker is either already closed or is unwinding, so there is no
+    caller left to observe this exception.
+    """
+
+
 @dataclass
 class PoolSlot:
     model: dict
@@ -61,6 +70,15 @@ class PoolSlot:
     gen_permit: bool = False
     gen_recoveries: int = 0
     gen_queued: dict[str, QueuedRequest] = field(default_factory=dict)
+    # Orphan recovery needs two observations before it frees a lane: a request
+    # that has already acquired the lane but not yet started its worker call
+    # looks exactly like a vanished owner for the fraction of a second between
+    # its commit and the worker's request registration. Requiring the same
+    # orphan state to persist (0.5s or one status poll cycle, whichever is
+    # longer in practice) keeps status-driven self-healing from killing a
+    # live request that merely has not resumed yet.
+    orphan_pending_owner: str | None = None
+    orphan_pending_since: float = 0.0
 
 
 class ModelPoolSupervisor:
@@ -90,6 +108,20 @@ class ModelPoolSupervisor:
                 "generationConcurrency", 2))))
         self._gen_slots = asyncio.Semaphore(self._gen_concurrency)
         self._gen_active_lanes = 0
+        # Lanes whose acquiring task must abort at its next await-resume.
+        # Cancellation alone cannot be trusted for in-flight acquisitions:
+        # cancelling a task that is suspended inside an ``asyncio`` primitive
+        # does not stop it when the same finalizer releases that primitive in
+        # the same instant, and a lane freed by orphan recovery can be
+        # re-claimed by a request nobody owns anymore (observed as stranded
+        # lanes plus a desynchronised ``_gen_slots``/``_gen_active_lanes``
+        # pair). Every await in ``_acquire_lane`` re-checks this marker and
+        # the task self-cleans. Markers are removed by the acquiring task
+        # itself in its ``finally``, and by the finalizer when no task ever
+        # registered for the request.
+        self._abandoned_lanes: set[str] = set()
+        # request_id -> acquire task currently running ``_acquire_lane``.
+        self._lane_tasks: dict[str, asyncio.Task] = {}
         self._request_workers: dict[str, SingleWorkerSupervisor] = {}
         # Per-model record of the last best-effort replica that could not be
         # admitted: {modelId: {desired, ready, code, message, at}}. Surfaced in
@@ -932,34 +964,86 @@ class ModelPoolSupervisor:
 
         Robust to cancellation while waiting for the permit: the model lane lock
         grabbed first is rolled back so a cancelled waiter never strands it.
+        Also robust to the *zombie wake-up* race: cancelling a task that is
+        suspended inside an ``asyncio`` primitive does not reliably stop it
+        when the same finalizer (or an orphan recovery) releases that
+        primitive in the same instant -- the woken task can then finish
+        acquiring and hand the lane to a request nobody owns anymore, with a
+        permit only one side of the bookkeeping can see. The abandon marker
+        set by the finalizer (and by orphan recovery when it frees someone
+        else's lane) is therefore re-checked after every await, before any
+        state is committed, so an aborted acquisition releases exactly what
+        it still holds and commits nothing.
         """
-        await slot.gen_lock.acquire()
-        slot.gen_owner = request_id
-        raw_permit = False
+        abandoned = self._abandoned_lanes
+        current = asyncio.current_task()
+        if current is not None:
+            # Registered before the entry check so a finalizer that races us
+            # right at spawn time can always find us in ``_lane_tasks``.
+            self._lane_tasks[request_id] = current
         try:
-            while True:
-                await self._gen_slots.acquire()
-                raw_permit = True
-                # Holding a raw permit is not enough: re-check that adding this
-                # lane keeps the combined memory peak and pressure safe.  If
-                # not, hand the permit back and wait for a lane to free.  Rare
-                # -- only under the head-room guard -- and bounded by the queue
-                # timeout, so a short poll is acceptable here.
-                if await self._concurrent_start_ok(slot):
-                    break
-                self._gen_slots.release()
-                raw_permit = False
-                await asyncio.sleep(0.05)
-        except BaseException:
-            if raw_permit:
-                self._gen_slots.release()
-            if slot.gen_owner == request_id:
-                slot.gen_owner = None
-                if slot.gen_lock.locked():
-                    slot.gen_lock.release()
-            raise
-        self._gen_active_lanes += 1
-        slot.gen_permit = True
+            if request_id in abandoned:
+                return
+            await slot.gen_lock.acquire()
+            if request_id in abandoned:
+                # Resumed holding the lock, but our parent (or an orphan
+                # recovery) already gave this lane away. Undo immediately.
+                slot.gen_lock.release()
+                return
+            slot.gen_owner = request_id
+            raw_permit = False
+            try:
+                while True:
+                    await self._gen_slots.acquire()
+                    raw_permit = True
+                    if request_id in abandoned:
+                        raise _LaneAbandoned()
+                    # Holding a raw permit is not enough: re-check that adding this
+                    # lane keeps the combined memory peak and pressure safe.  If
+                    # not, hand the permit back and wait for a lane to free.  Rare
+                    # -- only under the head-room guard -- and bounded by the queue
+                    # timeout, so a short poll is acceptable here.
+                    if await self._concurrent_start_ok(slot):
+                        if request_id in abandoned:
+                            # The marker may have appeared while we were inside
+                            # the head-room probe; no await remains between this
+                            # check and the commit below, so catching it here is
+                            # what keeps an aborted acquisition from committing
+                            # an owner-less lane.
+                            raise _LaneAbandoned()
+                        break
+                    self._gen_slots.release()
+                    raw_permit = False
+                    if request_id in abandoned:
+                        raise _LaneAbandoned()
+                    await asyncio.sleep(0.05)
+            except _LaneAbandoned:
+                # The parent finalizer abandoned this acquisition while it was
+                # still in flight. Release exactly what this code path holds:
+                # raw_permit tells us whether we are the one holding the permit
+                # (we must not release what another instance of ourselves
+                # obtained), and the owner check covers the lane lock.
+                if raw_permit:
+                    self._gen_slots.release()
+                if slot.gen_owner == request_id:
+                    slot.gen_owner = None
+                    if slot.gen_lock.locked():
+                        slot.gen_lock.release()
+                # The parent is gone; nothing may observe this outcome.
+                return
+            except BaseException:
+                if raw_permit:
+                    self._gen_slots.release()
+                if slot.gen_owner == request_id:
+                    slot.gen_owner = None
+                    if slot.gen_lock.locked():
+                        slot.gen_lock.release()
+                raise
+            self._gen_active_lanes += 1
+            slot.gen_permit = True
+        finally:
+            self._lane_tasks.pop(request_id, None)
+            abandoned.discard(request_id)
 
     def _release_lane(self, slot: PoolSlot, request_id: str) -> bool:
         if slot.gen_owner != request_id:
@@ -988,7 +1072,22 @@ class ModelPoolSupervisor:
             return False
         owner = slot.gen_owner
         if owner in slot.worker.active_requests or owner in slot.gen_queued:
+            # The observed owner is alive: clear any pending orphan verdict.
+            slot.orphan_pending_owner = None
             return False
+        # A request that already owns the lane but has not been handed to its
+        # worker yet (between `await acquire_task` and worker registration) is
+        # not visible in the owner checks above. Give it one grace horizon --
+        # a live request leaves this state within one event-loop step, so a
+        # stale observation half a second later cannot be it.
+        now = time.monotonic()
+        if slot.orphan_pending_owner != owner:
+            slot.orphan_pending_owner = owner
+            slot.orphan_pending_since = now
+            return False
+        if now - slot.orphan_pending_since < 0.5:
+            return False
+        slot.orphan_pending_owner = None
         # An unowned active request could still be mid-generation; keep this
         # lane serialised and let that request's own finalizer finish first.
         if slot.worker.active_requests:
@@ -1000,6 +1099,12 @@ class ModelPoolSupervisor:
             slot.gen_permit = False
             self._gen_slots.release()
             self._gen_active_lanes = max(0, self._gen_active_lanes - 1)
+        # The released lane may belong to an acquire task that is still in
+        # flight (observed replay: orphan recovery freed the lane, the task
+        # resumed, committed owner/permit/counter anyway). Marking the request
+        # abandoned makes that task abort at its next await-resume instead.
+        if owner in self._lane_tasks:
+            self._abandoned_lanes.add(owner)
         slot.gen_recoveries += 1
         LOGGER.error("Recovered orphaned pool generation lane model=%s source=%s",
                      slot.model.get("id"), source)
@@ -1158,9 +1263,23 @@ class ModelPoolSupervisor:
                                "position": list(slot.gen_queued).index(request_id) + 1,
                                "waited_seconds": round(time.monotonic() - queued.enqueued_at, 1)}
                 await acquire_task
+                if slot.gen_owner != request_id:
+                    # A live parent can only lose the lane it just acquired to
+                    # this generator's own finalizer (which cannot have run
+                    # while we are mid-body) or a pathological external
+                    # recovery. Surface it instead of silently generating
+                    # without serialisation.
+                    raise MLXBarError("ENGINE_BUSY",
+                                      "生成レーンの獲得を別要求に奪われました", 503, True)
                 # No longer waiting: stop counting this request as queued the
                 # moment it owns a lane, matching WorkerSupervisor.generate.
                 slot.gen_queued.pop(request_id, None)
+                # Register with the worker map before the cancellation yield
+                # below: between the lane commit and this registration there is
+                # otherwise no await, but the yield itself can suspend the
+                # request while it already owns a lane, and orphan recovery
+                # must be able to recognise it as live from then on.
+                self._request_workers[request_id] = slot.worker
                 if queued.cancel_requested.is_set():
                     yield {"type": "completed", "finish_reason": "cancelled"}
                     return
@@ -1178,6 +1297,11 @@ class ModelPoolSupervisor:
             # a no-op unless gen_owner matches this request, so it also covers
             # the race where `acquire_task` finished acquiring the lane but
             # the awaiting frame was cancelled before continuing.
+            # The abandon marker goes in before both: any lane state this
+            # request still appears to hold may be released by recovery or the
+            # status poll while our acquire task is still unwinding, and the
+            # marker makes that task abort instead of committing.
+            self._abandoned_lanes.add(request_id)
             slot.gen_queued.pop(request_id, None)
             self._request_workers.pop(request_id, None)
             self._release_lane(slot, request_id)
@@ -1201,6 +1325,12 @@ class ModelPoolSupervisor:
                 await asyncio.shield(asyncio.gather(
                     *(task for task in (cancel_task, acquire_task) if task),
                     return_exceptions=True))
+            if request_id not in self._lane_tasks:
+                # No acquire task ever registered (fast path, task cancelled
+                # before its first step, or it already finished); nothing will
+                # consume the abandon marker, so remove it here. When a task
+                # did run, its own finally removed the marker.
+                self._abandoned_lanes.discard(request_id)
 
     async def generate(self, prompt, images: list[str], options: dict, request_id: str | None = None,
                        image_root: Path | None = None):

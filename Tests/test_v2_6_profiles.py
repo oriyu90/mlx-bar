@@ -242,6 +242,23 @@ class ExportImportTests(unittest.TestCase):
             self.assertIn("api.host", skipped)
             self.assertEqual(store.data["api"]["host"], "127.0.0.1")
 
+    def test_lan_pair_round_trips_together(self):
+        # v2.8.1: an export from a LAN machine must re-import as LAN. Before
+        # the pair-cluster fix, each half alone failed the
+        # "changed together" validation, so a LAN setup could never transfer.
+        with tempfile.TemporaryDirectory() as source_dir, \
+                tempfile.TemporaryDirectory() as target_dir:
+            source = fresh_store(source_dir)
+            source.update({"api": {"host": "0.0.0.0"},
+                           "security": {"allowLan": True}})
+            envelope = build_export(source.public(), collect_hardware())
+            target = fresh_store(target_dir)
+            result = apply_import(target, envelope, port_available=lambda port: True)
+            self.assertIn("api.host", result["applied"])
+            self.assertIn("security.allowLan", result["applied"])
+            self.assertEqual(target.data["api"]["host"], "0.0.0.0")
+            self.assertTrue(target.data["security"]["allowLan"])
+
     def test_invalid_leaf_skipped_with_reason_rest_applies(self):
         with tempfile.TemporaryDirectory() as directory:
             store = fresh_store(directory)

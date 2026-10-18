@@ -17,6 +17,8 @@ from .settings import SettingsStore, deep_merge
 
 EXPORT_FORMAT = "mlxbar-settings-export"
 EXPORT_FORMAT_VERSION = 1
+# `api.host` and `security.allowLan` validate only as a pair (see apply_import).
+LAN_PAIR_KEYS = ("api.host", "security.allowLan")
 
 
 def flatten(node: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -104,9 +106,33 @@ def apply_import(store: SettingsStore, export: dict,
     pending = deepcopy(store.data)
     applied: list[str] = []
     skipped: list[dict[str, str]] = []
+    incoming_leaves = {dotted: value for dotted, value in flatten(incoming)}
+    processed: set[str] = set()
     for dotted, value in flatten(incoming):
         if dotted == "schemaVersion":
             continue
+        # `api.host` and `security.allowLan` are rejected by `_validate` when
+        # they do not change together. Applying them one leaf at a time in
+        # alphabetical order could therefore never import a LAN setup at all:
+        # `api.host` alone failed validation, then `security.allowLan` alone
+        # did too, and both were reported as skipped (v2.6.0 regression untest-
+        # ed until v2.8.1). When the export carries both, validate them as one
+        # candidate cluster.
+        if dotted in LAN_PAIR_KEYS and dotted not in processed:
+            partner = LAN_PAIR_KEYS[0] if dotted == LAN_PAIR_KEYS[1] else LAN_PAIR_KEYS[1]
+            if partner in incoming_leaves:
+                processed.update({dotted, partner})
+                candidate = deep_merge(pending, _nested(dotted, value))
+                candidate = deep_merge(candidate, _nested(partner, incoming_leaves[partner]))
+                try:
+                    SettingsStore._validate(candidate)
+                except ValueError as exc:
+                    skipped.append({"key": dotted, "reason": str(exc)})
+                    skipped.append({"key": partner, "reason": str(exc)})
+                    continue
+                pending = candidate
+                applied.extend([dotted, partner])
+                continue
         filtered, note, blocked = _filter_machine_specific(dotted, value)
         if blocked:
             skipped.append({"key": dotted, "reason": note or "適用できませんでした"})

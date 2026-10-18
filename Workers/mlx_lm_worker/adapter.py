@@ -7,19 +7,10 @@ import os
 import time
 
 # v2.8.0: bound the Rust tokeniser's thread pool (P2 of the CPU report, where
-# `tokenizers` was the single hottest frame).
-#
-# Rayon sizes its pool from the machine's core count at first use, so a 28-core
-# Mac starts ~28 tokeniser threads inside a worker whose whole design is to
-# serialise work onto ONE MLX thread -- threads that can only add contention and
-# context switching there. `setdefault` so an operator who set the variable
-# themselves keeps their value, and it has to happen before anything imports
-# tokenizers (mlx_lm, huggingface tokenizers) or the pool is already sized.
-#
-# This bounds CPU, not correctness: rayon's pool size never changes what is
-# tokenised, only how many threads do it. Prompt-cache hashing and reuse depend
-# on token ids, not on the pool, which is why the prompt-cache suite is the
-# regression gate for this line (TEST_PLAN_v2.8.0.md).
+# `tokenizers` was the single hottest frame). v2.8.1 moved the actual
+# `setdefault` calls into `common/server.py` so the mlx-vlm worker inherits
+# the same bounds; the checks below pin the expected values for this adapter's
+# test harness (TEST_PLAN_v2.8.0.md / TEST_PLAN_v2.8.1.md).
 os.environ.setdefault("RAYON_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

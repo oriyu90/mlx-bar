@@ -78,6 +78,18 @@ class JobManager:
         if job["state"] in {"completed", "failed", "cancelled"}:
             return
         queue = self.queues.setdefault(job_id, asyncio.Queue())
+        # `_run` delivers the terminal event into the queue object and then
+        # *pops* it. If the job turned terminal between the `yield job` above
+        # and this `setdefault`, we would be waiting on a brand-new, empty
+        # queue forever: the SSE stream would never terminate. Re-fetch the
+        # job after subscribing and stop when it is already terminal -- the
+        # queue received the terminal event, we just read the state directly.
+        current = self.database.get_job(job_id)
+        if not current or current["state"] in {"completed", "failed", "cancelled"}:
+            if current:
+                yield {"state": current["state"], "result": current.get("result"),
+                       "error": current.get("error")}
+            return
         while True:
             event = await queue.get()
             yield event

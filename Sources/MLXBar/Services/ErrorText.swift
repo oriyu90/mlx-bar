@@ -111,6 +111,19 @@ enum CoordinatorErrorText {
         "CLIENT_DISCONNECTED": (
             "接続が切断されました",
             "The connection was dropped."),
+        // v2.8.0: per-model idle countdown extension (`model extend-idle` /
+        // the menu-bar extend field). Added here in v2.8.1 because they surface
+        // through the GUI too.
+        "INVALID_IDLE_EXTENSION": (
+            "延長する秒数は1〜86,400秒の間で指定してください",
+            "The extension must be between 1 and 86,400 seconds."),
+        "MODEL_NOT_IDLE_MANAGED": (
+            "このモデルには解放までの時間がありません。常駐固定かkeep Loadedのモデルです",
+            "This model has no idle countdown: it is pinned or set to keep loaded."),
+        // v2.8.1: CLI job-wait cap.
+        "JOB_WAIT_TIMEOUT": (
+            "ジョブが30分以内に終了しませんでした",
+            "The job did not finish within 30 minutes."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

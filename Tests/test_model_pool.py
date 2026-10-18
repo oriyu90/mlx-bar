@@ -253,7 +253,13 @@ class ModelPoolTests(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()
         FakeWorker.load_gate = gate
         loading = asyncio.create_task(self.pool.load_for_api(self.model(1)))
-        await asyncio.sleep(0)
+        # The slot appears only once the admission probe has run; it is not
+        # created at the first event-loop step anymore (v2.8.0 move of slot
+        # creation behind `await self._admit(...)` inside the pool lock).
+        deadline = time.monotonic() + 5
+        while "model-1" not in self.pool._slots and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertIn("model-1", self.pool._slots)
         self.pool._slots["model-1"].last_released_at = time.monotonic() - 100
         gate.set()
         await loading
@@ -418,6 +424,12 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
         slot.gen_owner = "vanished"
         slot.gen_permit = True
         pool._gen_active_lanes = 1
+        # v2.8.1: a vanished owner is recovered on the second consecutive
+        # observation (at least half a second apart) so a request that merely
+        # has not resumed between its lane-acquisition and its worker
+        # registration is never killed by the status poll.
+        self.assertFalse(pool._recover_lane(slot, "test"))
+        slot.orphan_pending_since = time.monotonic() - 1
         self.assertTrue(pool._recover_lane(slot, "test"))
         self.assertFalse(slot.gen_lock.locked())
         self.assertIsNone(slot.gen_owner)

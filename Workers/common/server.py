@@ -25,6 +25,17 @@ from .tool_calls import IncrementalToolStream, StopSequenceFilter
 
 LOGGER = logging.getLogger(__name__)
 
+# v2.8.1: bound the Rust tokeniser's thread pool for BOTH runtime workers.
+# v2.8.0 set this only in the mlx-lm adapter, so an mlx-vlm worker still grew
+# one rayon thread per core the first time `transformers` tokenised a long
+# prompt -- the same `tokenizers.abi3.so` contention the CPU report measured.
+# `setdefault` so an operator who set the variables themselves keeps their
+# values, and it has to happen in `common.server` (imported by both adapters
+# before anything touches tokenizers) or the pool is already sized.
+os.environ.setdefault("RAYON_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
 GENERATION_HEARTBEAT_SECONDS = 10.0
 # A cancel that lands after its generation already finished has nothing left to
 # discard its id, so the set is bounded and aged instead of growing for the life

@@ -301,6 +301,8 @@ class SettingsStore:
         api = data["api"]
         host = api.get("host")
         allow_lan = data.get("security", {}).get("allowLan", False)
+        if not isinstance(api.get("enabled", True), bool):
+            raise ValueError("api.enabled must be boolean")
         if host not in {"127.0.0.1", "0.0.0.0"}:
             raise ValueError("api.host must be 127.0.0.1 or 0.0.0.0")
         if allow_lan != (host == "0.0.0.0"):
@@ -555,7 +557,11 @@ class SettingsStore:
         }
         for key, (minimum, maximum) in integer_ranges.items():
             value = generation.get(key)
-            if not isinstance(value, int) or not minimum <= value <= maximum:
+            # `bool` is an `int` subclass; rejecting it here matches the other
+            # explicit checks in this file so `config set` / imports cannot
+            # smuggle a `true` in as 1.
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or not minimum <= value <= maximum):
                 raise ValueError(f"generation.{key} must be between {minimum} and {maximum}")
         numeric_ranges = {
             "defaultTemperature": (0.0, 2.0),
@@ -567,7 +573,8 @@ class SettingsStore:
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not minimum <= value <= maximum:
                 raise ValueError(f"generation.{key} must be between {minimum} and {maximum}")
         memory_ratio = generation.get("memoryLimitRatio")
-        if not isinstance(memory_ratio, (int, float)) or not 0.5 <= memory_ratio <= 0.99:
+        if (isinstance(memory_ratio, bool) or not isinstance(memory_ratio, (int, float))
+                or not 0.5 <= memory_ratio <= 0.99):
             raise ValueError("generation.memoryLimitRatio must be between 0.5 and 0.99")
         # 0 disables the corresponding MLX limit and keeps the runtime default.
         for key, maximum in (("wiredLimitRatio", 0.95), ("cacheLimitRatio", 0.5)):

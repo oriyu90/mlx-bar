@@ -493,4 +493,4 @@
 "延長" = "Extend";
 "加算済み" = "Added";
 "解放までの時間を加算する秒数" = "Seconds to add to the time until unload";
-"入力した秒数だけ、このモデルの解放までの待機時間を延長します。" = "Adds the entered seconds to how long this model stays loaded.";
+"入力した秒数だけ、このモデルの解放までの待機時間を延長します" = "Adds the entered seconds to how long this model stays loaded.";
