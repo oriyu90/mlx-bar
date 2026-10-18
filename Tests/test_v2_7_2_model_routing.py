@@ -50,12 +50,12 @@ async def _pool_with(root: Path, store: SettingsStore, database: Database):
     return pool
 
 
-def test_max1_switches_to_a_known_distinct_model():
-    # v2.7.3: strict resident-count limit supersedes the v2.7.2 switch-by-
-    # eviction. With maxResidentModels == 1 and one distinct resident, a
-    # request for another distinct catalog model is refused loudly
-    # (RESIDENT_LIMIT_REACHED) instead of silently evicting. The caller
-    # unloads the current resident explicitly, then the request loads.
+def test_max1_loads_a_second_distinct_model_as_non_resident():
+    # v2.8.0 supersedes the v2.7.3 refusal: with maxResidentModels == 1 and one
+    # distinct resident, a request for another distinct catalog model loads it
+    # as a NON-resident rather than failing with RESIDENT_LIMIT_REACHED or
+    # silently evicting the resident. The request is answered by the model it
+    # asked for, and the resident keeps its slot.
     async def scenario():
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,15 +84,21 @@ def test_max1_switches_to_a_known_distinct_model():
                         assert first.json()["model"] == "model-a"
                         second = await client.post("/v1/chat/completions", json={
                             "model": "model-b", "messages": [{"role": "user", "content": "hi"}]})
-                        assert second.status_code == 409
-                        assert second.json()["error"]["code"] == "RESIDENT_LIMIT_REACHED"
-                        assert set(pool._slots) == {"model-a"}
+                        assert second.status_code == 200
+                        assert second.json()["model"] == "model-b"
+                        assert set(pool._slots) == {"model-a", "model-b"}
+                        assert pool._slots["model-a"].resident is True
+                        assert pool._slots["model-b"].resident is False
+                        pool_status = pool.status()["modelPool"]
+                        assert pool_status["residentModelCount"] == 1
+                        assert pool_status["nonResidentModelCount"] == 1
+                        # Explicit unload still frees exactly the named model.
                         await pool.unload_model("model-a")
+                        assert set(pool._slots) == {"model-b"}
                         third = await client.post("/v1/chat/completions", json={
                             "model": "model-b", "messages": [{"role": "user", "content": "hi"}]})
                         assert third.status_code == 200
                         assert third.json()["model"] == "model-b"
-                        assert set(pool._slots) == {"model-b"}
                 finally:
                     await pool.shutdown()
     asyncio.run(scenario())

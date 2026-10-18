@@ -351,7 +351,6 @@
 "未確認" = "Not Checked";
 "Paged SSD使用量" = "Paged SSD Usage";
 "復元トークン" = "Restored Tokens";
-"モデル未ロード" = "No Model Loaded";
 "対応" = "Supported";
 "非対応" = "Unsupported";
 "非対応（従来キャッシュのみ）" = "Unsupported (Standard Cache Only)";
@@ -486,3 +485,12 @@
 /* v2.7.0 -- on-demand parallel replicas + idle TTL visibility */
 "同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを1つ増やして並行し、余裕がなければ順番待ちになります。最大常駐モデル数は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません。" = "Concurrent requests to the same model run in parallel when an idle replica is available. When none is free and memory allows, one replica is added automatically; otherwise requests wait their turn. Maximum resident models caps distinct model kinds -- replicas of one model are not counted.";
 "非固定モデルの待機時間は再起動不要で、次の見回りから反映されます。一覧の待機中の行には解放までの残り時間を表示します。" = "Idle time for unpinned models applies without a restart, from the next reaper pass. Idle rows in the list show the remaining time until unload.";
+
+/* v2.8.0 -- non-resident models past the resident limit + per-model idle extension */
+"非常駐" = "Non-resident";
+"非常駐モデル" = "Non-resident model";
+"加算秒数" = "Seconds to add";
+"延長" = "Extend";
+"加算済み" = "Added";
+"解放までの時間を加算する秒数" = "Seconds to add to the time until unload";
+"入力した秒数だけ、このモデルの解放までの待機時間を延長します。" = "Adds the entered seconds to how long this model stays loaded.";

@@ -250,6 +250,34 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
 
 
+@router.post("/models/{model_id:path}/idle/extend")
+async def extend_idle(model_id: str, request: Request, body: dict = Body(default_factory=dict)):
+    """Push one model's idle-unload deadline out by `seconds`.
+
+    The pair to the row countdown the menu bar shows: the user sees "unloads
+    in 120 sec", types a number, and the model stays loaded that much longer.
+    Additive and bounded, and it is consumed by the next generation for that
+    model, so it can never become a hidden permanent pin.
+    """
+    app = state(request)
+    raw = body.get("seconds", None)
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(422, detail={
+            "code": "INVALID_IDLE_EXTENSION",
+            "message": "延長する秒数は数値で指定してください"})
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):
+        raise HTTPException(422, detail={
+            "code": "INVALID_IDLE_EXTENSION",
+            "message": "延長する秒数は有限の数値で指定してください"})
+    try:
+        result = await app.workers.extend_idle(model_id, seconds)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    return result
+
+
 @router.delete("/models/loaded")
 async def unload(request: Request, force: bool = False):
     app = state(request)

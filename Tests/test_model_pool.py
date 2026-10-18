@@ -143,27 +143,33 @@ class ModelPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FakeWorker.load_calls, 1)
         self.assertEqual(results[0]["id"], results[1]["id"])
 
-    async def test_third_model_evicts_oldest_idle_api_model(self):
-        # v2.7.3: strict resident-count limit. A third distinct model is
-        # refused loudly instead of silently evicting the oldest idle
-        # transient. The caller unloads explicitly, then retries.
+    async def test_third_model_loads_as_non_resident(self):
+        # v2.8.0: the resident limit no longer refuses. A model admitted past
+        # `maxResidentModels` loads as a non-resident -- it answers requests,
+        # does not consume a resident slot, and is freed by the idle TTL.
         await self.pool.load_for_api(self.model(1))
         self.pool._slots["model-1"].last_released_at = time.monotonic() - 20
         await self.pool.load_for_api(self.model(2))
-        with self.assertRaises(MLXBarError) as raised:
-            await self.pool.load_for_api(self.model(3))
-        self.assertEqual(raised.exception.code, "RESIDENT_LIMIT_REACHED")
-        self.assertEqual(set(self.pool._slots), {"model-1", "model-2"})
+        await self.pool.load_for_api(self.model(3))
+        self.assertEqual(set(self.pool._slots), {"model-1", "model-2", "model-3"})
+        self.assertTrue(self.pool._slots["model-1"].resident)
+        self.assertTrue(self.pool._slots["model-2"].resident)
+        self.assertFalse(self.pool._slots["model-3"].resident)
+        pool_status = self.pool.status()["modelPool"]
+        self.assertEqual(pool_status["residentModelCount"], 2)
+        self.assertEqual(pool_status["nonResidentModelCount"], 1)
 
     async def test_manual_pin_is_never_lru_evicted(self):
-        # v2.7.3: strict limit keeps both residents and refuses the third.
+        # The resident limit used to refuse the third model outright (v2.7.3).
+        # Now it loads as a non-resident, and nothing already loaded is
+        # silently evicted to make room for it.
         await self.pool.load(self.model(1), pin=True)
         await self.pool.load_for_api(self.model(2))
-        with self.assertRaises(MLXBarError) as raised:
-            await self.pool.load_for_api(self.model(3))
-        self.assertEqual(raised.exception.code, "RESIDENT_LIMIT_REACHED")
+        await self.pool.load_for_api(self.model(3))
         self.assertIn("model-1", self.pool._slots)
         self.assertIn("model-2", self.pool._slots)
+        self.assertIn("model-3", self.pool._slots)
+        self.assertTrue(self.pool._slots["model-1"].session_pinned)
 
     async def test_ttl_reaps_only_unpinned_idle_models(self):
         await self.pool.load_for_api(self.model(1))

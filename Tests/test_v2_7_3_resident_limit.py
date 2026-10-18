@@ -1,10 +1,22 @@
-"""v2.7.3 strict resident-count limit: add while room, error when full.
+"""v2.7.3 resident-count limit, as superseded by v2.8.0.
 
-Owner request: while the resident count is below maxResidentModels, an API
-request for another catalog-known model is added (loaded) as a new resident.
-Once distinct residents reach the limit, a new distinct model is refused
-loudly (RESIDENT_LIMIT_REACHED, 409) instead of silently evicting.
-Same-model reloads/replicas never count as new and stay allowed.
+v2.7.3 made the limit a refusal: below `maxResidentModels` a requested model
+became a new resident, and at the limit a new distinct model failed loudly
+(RESIDENT_LIMIT_REACHED, 409) instead of silently evicting.
+
+v2.8.0 keeps the part that was right -- nothing is ever silently evicted to
+make room, and same-model reloads/replicas never count as new -- and replaces
+the refusal with a second tier. A model admitted once the limit is full loads
+as a NON-resident: it answers requests, it does not occupy one of the
+`maxResidentModels` slots, and the idle TTL frees it.
+
+`test_below_limit_adds_the_requested_model_as_a_new_resident`,
+`test_same_model_reload_is_allowed_when_full`,
+`test_queue_plus_pressure_sheds_idle_transient_without_waiting_ttl` and
+`test_warning_pressure_without_queue_keeps_fresh_transient` still hold
+unchanged; the two refusal tests are replaced by non-resident equivalents and
+the full non-resident/TTL-extension contract lives in
+`test_v2_8_overflow_idle.py`.
 """
 from __future__ import annotations
 
@@ -21,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "Coordinator"))
 
 import test_model_pool  # noqa: E402
 from mlxbar.database import Database  # noqa: E402
-from mlxbar.errors import MLXBarError  # noqa: E402
+
 from mlxbar.main import make_public_app  # noqa: E402
 from mlxbar.settings import SettingsStore  # noqa: E402
 from mlxbar.workers.model_pool import GIB, ModelPoolSupervisor  # noqa: E402
@@ -78,7 +90,7 @@ def test_below_limit_adds_the_requested_model_as_a_new_resident():
     asyncio.run(scenario())
 
 
-def test_at_limit_returns_resident_limit_reached_without_evicting():
+def test_at_limit_loads_the_requested_model_as_non_resident_without_evicting():
     async def scenario():
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -107,16 +119,18 @@ def test_at_limit_returns_resident_limit_reached_without_evicting():
                         third = await client.post("/v1/chat/completions", json={
                             "model": "model-c",
                             "messages": [{"role": "user", "content": "hi"}]})
-                        assert third.status_code == 409
-                        assert third.json()["error"]["code"] == "RESIDENT_LIMIT_REACHED"
-                        assert set(pool._slots) == {"model-a", "model-b"}
-                        # Explicit unload frees one slot; the next request loads.
+                        assert third.status_code == 200
+                        assert third.json()["model"] == "model-c"
+                        # Nothing was evicted to make room, and the two
+                        # residents kept their slots.
+                        assert set(pool._slots) == {"model-a", "model-b", "model-c"}
+                        assert pool._slots["model-a"].resident
+                        assert pool._slots["model-b"].resident
+                        assert not pool._slots["model-c"].resident
+                        # Freeing a resident promotes nothing by itself; the
+                        # next *new* model takes the freed slot.
                         await pool.unload_model("model-a")
-                        retry = await client.post("/v1/chat/completions", json={
-                            "model": "model-c",
-                            "messages": [{"role": "user", "content": "hi"}]})
-                        assert retry.status_code == 200
-                        assert retry.json()["model"] == "model-c"
+                        assert set(pool._slots) == {"model-b", "model-c"}
                 finally:
                     await pool.shutdown()
     asyncio.run(scenario())
@@ -146,7 +160,7 @@ def test_same_model_reload_is_allowed_when_full():
     asyncio.run(scenario())
 
 
-def test_explicit_pin_load_is_also_strict_when_full():
+def test_explicit_pin_load_at_the_limit_loads_transient_instead_of_failing():
     async def scenario():
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -160,13 +174,15 @@ def test_explicit_pin_load_is_also_strict_when_full():
                 pool._host_capacity = lambda: (24 * GIB, 1)
                 try:
                     await pool.load(_catalog("model-a", "model-a"), pin=True)
-                    try:
-                        await pool.load(_catalog("model-b", "model-b"), pin=True)
-                    except MLXBarError as exc:
-                        assert exc.code == "RESIDENT_LIMIT_REACHED"
-                    else:
-                        raise AssertionError("expected RESIDENT_LIMIT_REACHED")
-                    assert set(pool._slots) == {"model-a"}
+                    await pool.load(_catalog("model-b", "model-b"), pin=True)
+                    assert set(pool._slots) == {"model-a", "model-b"}
+                    # `pin` is the load API's default, so a GUI/CLI load past
+                    # the limit has to mean something: the slot loads, but
+                    # non-resident means NOT pinned, so it is the idle TTL that
+                    # frees it and the resident slot stays with model-a.
+                    assert pool._slots["model-a"].session_pinned
+                    assert not pool._slots["model-b"].session_pinned
+                    assert not pool._slots["model-b"].resident
                 finally:
                     await pool.shutdown()
     asyncio.run(scenario())

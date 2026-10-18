@@ -58,6 +58,18 @@ struct ResidentModel: Identifiable, Hashable {
     /// externally managed models, which never expire. Used only for the
     /// "unloads in N" countdown in the row detail.
     let idleExpiresAt: Date?
+    /// Seconds left before this model is unloaded for idleness, computed by the
+    /// coordinator (pool `idleSecondsRemaining`, v2.8.0). Preferred over
+    /// `idleExpiresAt` because it needs no client-side clock arithmetic and is
+    /// already reconciled with any "keep it loaded N more seconds" grant.
+    let idleSecondsRemaining: Int?
+    /// How many seconds an operator has already added to this model's idle
+    /// countdown. Zero/absent means "nothing extended".
+    let idleExtendSeconds: Int?
+    /// Whether this model holds one of the `maxResidentModels` slots
+    /// (pool `resident`, v2.8.0). Absent on coordinators older than v2.8.0,
+    /// where every loaded model was resident by definition.
+    let resident: Bool
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -77,8 +89,27 @@ struct ResidentModel: Identifiable, Hashable {
         } else {
             idleExpiresAt = nil
         }
+        if let remaining = (value["idleSecondsRemaining"] as? NSNumber)?.doubleValue, remaining >= 0 {
+            idleSecondsRemaining = Int(remaining.rounded(.up))
+        } else {
+            idleSecondsRemaining = nil
+        }
+        if let extended = (value["idleExtendSeconds"] as? NSNumber)?.doubleValue, extended > 0 {
+            idleExtendSeconds = Int(extended.rounded())
+        } else {
+            idleExtendSeconds = nil
+        }
+        resident = value["resident"] as? Bool ?? true
         let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
+    }
+
+    /// Whether the idle-unload countdown (and its "+N seconds" field) applies
+    /// to this row. The coordinator reports `idleSecondsRemaining` only for
+    /// models it will actually free; a pinned, keep-loaded or externally
+    /// managed model has no deadline to extend.
+    var isIdleManaged: Bool {
+        !keepLoaded && !managedExternally && poolState != "loading" && idleSecondsRemaining != nil
     }
 
     /// One of "loading" | "generating" | "queued" | "idle", the four states the
@@ -123,21 +154,19 @@ struct ResidentModel: Identifiable, Hashable {
         return japanese ? "\(value) tok/秒" : "\(value) tok/s"
     }
 
-    /// Countdown until this non-resident model is unloaded for idleness, or
-    /// nil when it does not apply (busy, pinned, externally managed, or no
-    /// expiry reported). The global "idle time for unpinned models" setting
-    /// (30-86400s, live without restart) drives `idleExpiresAt`.
+    /// Seconds remaining until this non-resident model is unloaded for
+    /// idleness, or nil when that does not apply (busy, pinned, externally
+    /// managed, or no expiry reported).
+    ///
+    /// Always rendered in seconds: v2.8.0 dropped the old "minutes above 90s"
+    /// rounding. The point of this line is that the number the user sees is the
+    /// number the coordinator will actually enforce, and switching units at a
+    /// threshold made the remaining time look like it stalled. The global
+    /// "idle time for unpinned models" setting (30-86400s, live without a
+    /// restart) drives the countdown, and `model extend-idle` adds to it.
     func idleCountdownText(japanese: Bool) -> String? {
-        guard activityState == "idle", !keepLoaded, !managedExternally,
-              let expires = idleExpiresAt else { return nil }
-        let remaining = expires.timeIntervalSinceNow
-        guard remaining > 1 else { return nil }
-        if remaining < 90 {
-            return japanese ? "あと\(Int(remaining))秒で解放"
-                : "Unloads in \(Int(remaining)) sec"
-        }
-        return japanese ? "あと\(Int(remaining / 60))分で解放"
-            : "Unloads in \(Int(remaining / 60)) min"
+        guard isIdleManaged, let remaining = idleSecondsRemaining, remaining > 0 else { return nil }
+        return japanese ? "あと\(remaining)秒で解放" : "Unloads in \(remaining) sec"
     }
 }
 
@@ -276,6 +305,10 @@ final class MenuBarViewModel: ObservableObject {
     @Published var queuedRequestCount = 0
     @Published var oldestQueuedSeconds = 0
     @Published var residentModelCount = 0
+    /// Models currently loaded past `maxResidentModels` (v2.8.0). They answer
+    /// requests like any resident, do not occupy a resident slot, and are freed
+    /// by the idle TTL rather than by an explicit unload.
+    @Published var nonResidentModelCount = 0
     @Published var residentModels: [ResidentModel] = []
     @Published var modelPoolReservedBytes: Int64 = 0
     @Published var modelPoolBudgetBytes: Int64 = 0
@@ -468,6 +501,8 @@ final class MenuBarViewModel: ObservableObject {
             if let pool = json["modelPool"] as? [String: Any] {
                 setIfChanged(\.residentModelCount, (pool["residentModelCount"] as? NSNumber)?.intValue
                              ?? (pool["residentCount"] as? NSNumber)?.intValue ?? 0)
+                setIfChanged(\.nonResidentModelCount,
+                             (pool["nonResidentModelCount"] as? NSNumber)?.intValue ?? 0)
                 setIfChanged(\.modelPoolReservedBytes, (pool["reservedBytes"] as? NSNumber)?.int64Value ?? 0)
                 setIfChanged(\.modelPoolBudgetBytes, (pool["budgetBytes"] as? NSNumber)?.int64Value ?? 0)
                 setIfChanged(\.generationConcurrency,
@@ -568,6 +603,34 @@ final class MenuBarViewModel: ObservableObject {
                     existing["idleExpiresAt"] = NSNumber(value: new)
                 default:
                     break
+                }
+                // Same reasoning for the coordinator-computed seconds (v2.8.0):
+                // the row may only promise the soonest deadline in the group.
+                let remainingOf: ([String: Any]) -> Double? = { dict in
+                    guard let raw = (dict["idleSecondsRemaining"] as? NSNumber)?.doubleValue,
+                          raw >= 0 else { return nil }
+                    return raw
+                }
+                switch (remainingOf(existing), remainingOf(value)) {
+                case let (old?, new?):
+                    existing["idleSecondsRemaining"] = NSNumber(value: min(old, new))
+                case (nil, let new?):
+                    existing["idleSecondsRemaining"] = NSNumber(value: new)
+                default:
+                    break
+                }
+                // A model is non-resident only when *every* replica of it is:
+                // one resident replica is enough for the row to count against
+                // `maxResidentModels`. Absent keys mean a pre-v2.8.0
+                // coordinator, where all replicas were resident.
+                let residentOf: ([String: Any]) -> Bool = { dict in
+                    dict["resident"] as? Bool ?? true
+                }
+                existing["resident"] = NSNumber(value: residentOf(existing) && residentOf(value))
+                // An extension granted on one replica is reported for the row,
+                // but the coordinator applies it to the whole group.
+                if let extended = (value["idleExtendSeconds"] as? NSNumber)?.doubleValue, extended > 0 {
+                    existing["idleExtendSeconds"] = NSNumber(value: extended)
                 }
                 mergedByID[id] = existing
             }
@@ -708,6 +771,24 @@ final class MenuBarViewModel: ObservableObject {
         let base = "/api/v1/models/\(pathComponent(id))/unload"
         await perform {
             _ = try await self.json("POST", force ? base + "?force=true" : base)
+            await self.refreshStatus()
+        }
+    }
+
+    /// Keep a non-resident model loaded for `seconds` longer than the idle TTL
+    /// would have allowed (v2.8.0).
+    ///
+    /// The extension is additive and is consumed by this model's next
+    /// generation, so repeating it can never turn into a hidden permanent pin.
+    func extendIdle(_ id: String, seconds: Int) async {
+        guard seconds > 0 else {
+            errorMessage = ui("Enter a number of seconds to add",
+                              "加算する秒数を入力してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("POST", "/api/v1/models/\(self.pathComponent(id))/idle/extend",
+                                    ["seconds": seconds])
             await self.refreshStatus()
         }
     }

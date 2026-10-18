@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.7.5 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.8.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -45,6 +45,9 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 同一モデルのオンデマンド並列生成（v2.7.0）：同時要求で空きレプリカがなくメモリに余裕があれば、レプリカを1つ自動追加して並行します（上限はモデルごとの並列数と同時生成の上限の小さい方）。余裕がなければ従来どおり順番待ちです。`maxResidentModels`は異なるモデルの種類数の上限のままです
 - 非固定モデルの待機時間の可視化（v2.7.0）：設定は従来どおり「Settings…」→モデル→「非固定モデルの待機時間」（30〜86,400秒、再起動不要）で変更でき、待機中の行に解放までの残り時間、`model resident`に待機時間と解放予定時刻を表示します
 - 常駐固定のライフサイクル修正（v2.7.1）：再起動後は固定プロファイルだけが固定復帰し、最後に使った非固定は一時扱いのまま戻ります。ランタイム切替後は固定を優先復元し、入りきらない非固定は更新失敗にせず見送ります。固定解除はその場で一時扱いへ戻ります（通常の手動ロードは従来どおり停止まで保持）。`mlxbarctl model load --no-pin`で一時ロードも選べます
+- 常駐上限を超えるモデルのロード（v2.8.0）：`maxResidentModels` 個を常駐で埋めた状態でも、それ以外のモデルを「非常駐」としてロードできます。常駐枠は消費しませんが通常どおり応答し、非固定モデルの待機時間（既定900秒）が過ぎると自動解放されます。既存の常駐を黙って追い出すことは引き続きありません
+- 解放までの時間の秒表示と延長（v2.8.0）：メニューバーの各行に `あと850秒で解放` を秒刻みで表示し、その下の入力欄で秒数を入れて解放時刻を延長できます（1〜86,400秒）。`mlxbarctl model extend-idle MODEL_ID SECONDS` と同じ操作です。延長は1回の待機期間だけに効き、そのモデルを使うと消費されます
+- 生成中断の即時化（v2.8.0）：クライアントが切断した、または`cancel` された生成は、次にトークンを要求する**前**に停止します。従来は MLX スレッドのキューに閉じる指示を積むだけだったため、1トークン分の生成が残り、その間だけ単一の MLX スレッドを占有していました。「クライアントから通信がないのに CPU が下げられない」症状への対策です。API のレスポンス形式は変わりません
 - アプリ本体の省メモリ・リーク・クラッシュ安全性（v2.7.5）：応答表示・受信バッファ・ログ取得・状態取得の上限化、ジョブ／ランタイム履歴の有界化（最新のみ保持）、起動時DB open 失敗の再試行、Worker 不正応答の作り直し。既定値・設定・API 形状・UI 文言は不変です
 
 ## 動作要件
@@ -56,7 +59,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.7.5.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.8.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -139,9 +142,17 @@ APIが自動ロードした非固定モデルは、最後の要求が終了し�
 
 v1.7.1以降、メニューバーのポップオーバーには常駐している全モデルを一覧表示します。各行にエンジン、メモリ予約量、常駐維持（ピン）の切り替え、その行だけのアンロードボタン、生成中はそのモデルのトークン毎秒があります。v2.7.0以降、同一モデルの複数レプリカは状態を集約して1行に表示し（生成中・順番待ちが隠れません）、非固定モデルの待機中は解放までの残り時間も表示します。ヘッダー部分は引き続き直近に使ったモデルを表示し、「すべてアンロード」は全解放です。v1.9.0以降、この一覧は常駐が1つのときにも表示し、どの構成でもモデルを1つずつアンロードできます。
 
+v2.8.0以降、この一覧は次のことを表示します。
+
+- **常駐／非常駐の内訳** — ヘッダーが `ロード済みモデル · 3（常駐 2・非常駐 1）` になり、枠に入っていないモデルの行には「非常駐」バッジが付きます。
+- **解放までの残り秒** — 各行に `あと850秒で解放`（英語は `Unloads in 850 sec`）を**秒刻み**で表示します。v2.7.0までは90秒を超えると分単位に丸めていましたがやめました。丸めを切り替えると残り時間が止まって見えるためです。
+- **解放までの時間の延長欄** — 残り時間を表示している行の下に数値入力欄と「延長」ボタンがあります。秒数を入れて Return（またはボタン）で、その秒数だけ解放時刻を後ろにずらします。入力済みの合計は `加算済み +600` と表示します。
+
+延長は1〜86,400秒までで、**1回の待機期間にだけ効く**加算です。そのモデルを次に使うと延長は消費され、カウントダウンは設定値（既定900秒）から再開します。繰り返し延長しても恒久的な固定にはならない、という保証です。CLI からは `mlxbarctl model extend-idle MODEL_ID SECONDS` で同じ操作ができます。固定（ピン留め）したモデルと`profiles[].keepLoaded`のモデルには解放時刻がないため、入力欄は表示されません。
+
 ### モデル間の同時生成（v1.7.0）
 
-v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。**同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば、v2.7.0以降は自動でレプリカを1つ増やして並行します**（上限は`models.pool.maxReplicasPerModel`と`generationConcurrency`の小さい方、メモリのヘッドルームガード付き。余裕がなければ従来どおり到着順に待機）。**`models.pool.maxResidentModels`は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません**（v2.0.1以降）。**v2.7.3以降、上限未満では要求モデルを新規常駐として追加し、上限到達後の新規異なるモデルは `RESIDENT_LIMIT_REACHED` (409) で明示エラーにします（黙って追い出しません）。切替時は不要な常駐をアンロードしてから再要求してください**。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
+v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`（既定2、範囲1–8）まで同時に生成**します。**同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば、v2.7.0以降は自動でレプリカを1つ増やして並行します**（上限は`models.pool.maxReplicasPerModel`と`generationConcurrency`の小さい方、メモリのヘッドルームガード付き。余裕がなければ従来どおり到着順に待機）。**`models.pool.maxResidentModels`は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません**（v2.0.1以降）。**v2.7.3以降、上限未満では要求モデルを新規常駐として追加します。上限に達した後の新規異なるモデルは、v2.8.0以降は`RESIDENT_LIMIT_REACHED`で拒否せず「非常駐」としてロードされます（枠を消費しませんが、通常どおり応答します）。既存の常駐を黙って追い出すことはありません**。`generationConcurrency`を1にすると、v1.6.2までと同じく生成は全体で1件ずつになり、生成順序・キュー・キャンセル・`/api/v1/status`の挙動が戻ります（`queue`イベントの`position`のみモデルレーン単位になります。常駐モデルが1つの通常構成では同じです）。プール自体を無効（`models.pool.enabled: false`）にすると v1.6.1 の単一Worker経路に完全一致します。
 
 1件目の生成は常に許可します。2件目以降の並行生成は、常駐予約に生成1件ぶんのヘッドルーム見積を足しても全体メモリ予算に収まり、かつmacOSがメモリ圧を報告していないときだけ開始します。条件を満たさない要求は失敗させず、レーンが空くまでキューで待ちます。macOSがwarning以上のメモリ圧を報告した場合は自動的に直列生成へ降格します。ヘッドルーム見積は`models.pool.perGenerationHeadroomGB`（既定0＝`min(モデル上限×0.15, 2 GiB)`を算出、範囲0.25–32）で上書きできます。
 
@@ -236,6 +247,8 @@ mlxbarctl runtime delete-slot mlx-lm SLOT_ID
 mlxbarctl runtime cancel-job mlx-lm
 mlxbarctl model pin MODEL_ID --replicas 2       # 常駐指定 ＋ 並列数（初回は即ロード）
 mlxbarctl model set-replicas MODEL_ID 3          # pin 済みモデルの並列数だけ変更（再ロードなし）
+mlxbarctl model extend-idle MODEL_ID 600       # 解放までの待機時間を600秒だけ延長（1〜86400）
+mlxbarctl model resident                        # ロード済みモデルの常駐区分・残り秒・加算済み秒を表示
 mlxbarctl model unload --force                   # 全解放（生成中でも強制）
 mlxbarctl config get
 mlxbarctl config set api.port 12000              # 汎用: 任意の設定キーへ JSON 値を書き込み
@@ -291,6 +304,7 @@ GUIで操作できることは**すべて**`mlxbarctl`から操作できます�
 |---|---|
 | モデル画面（ロード / アンロード / スキャン / probe） | `model load` / `model unload [MODEL_ID] [--force]` / `model scan` / `model probe` |
 | 設定 > モデル > 常駐させるモデル | `model pin` / `model unpin` / `model set-replicas` / `model resident` |
+| メニューバーの各行 > 解放までの時間の延長欄（v2.8.0〜） | `model extend-idle MODEL_ID SECONDS` |
 | 設定 > モデル > 複数モデル常駐 | `config set-model-pool --…` |
 | 設定 > モデル > コンテキスト自動圧縮（v1.9.2〜） | `config set-context-compression --…`（v2.0.0〜） |
 | 設定 > 知識ベース（v2.1.0〜） | `config set-rag --…` / `rag status` / `rag collection …` / `rag doc …` / `rag query` / `secrets set-rag-embedding-token` |
@@ -583,7 +597,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-2.7.5.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-2.8.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

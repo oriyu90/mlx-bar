@@ -178,13 +178,17 @@ class ReplicaTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.load(self.model(1), pin=True)
         self.assertEqual(len(self.pool._replica_slots("model-1")), 2)
 
-    async def test_max_resident_models_one_still_rejects_a_second_distinct_model(self):
+    async def test_max_resident_models_one_loads_a_second_distinct_model_as_non_resident(self):
+        # v2.8.0: a distinct model admitted past `maxResidentModels` loads as a
+        # non-resident instead of raising RESIDENT_LIMIT_REACHED, and it never
+        # takes the one resident slot away from the model that has it.
         self.settings.data["models"]["pool"]["maxResidentModels"] = 1
         await self.pool.load(self.model(1), pin=True)
-        with self.assertRaises(MLXBarError) as raised:
-            await self.pool.load_for_api(self.model(2))
-        self.assertEqual(raised.exception.code, "RESIDENT_LIMIT_REACHED")
-        self.assertEqual(set(self.pool._slots), {"model-1"})
+        await self.pool.load_for_api(self.model(2))
+        self.assertEqual(set(self.pool._slots), {"model-1", "model-2"})
+        self.assertTrue(self.pool._slots["model-1"].resident)
+        self.assertFalse(self.pool._slots["model-2"].resident)
+        self.assertFalse(self.pool._slots["model-2"].session_pinned)
 
     async def test_second_replica_still_gated_by_memory_budget_when_models_cap_is_one(self):
         self.settings.data["models"]["pool"]["maxResidentModels"] = 1

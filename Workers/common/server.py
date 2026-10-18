@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import gc
 import json
+import logging
 import os
 import re
 import resource
@@ -22,12 +23,42 @@ import uvicorn
 from .tool_calls import IncrementalToolStream, StopSequenceFilter
 
 
+LOGGER = logging.getLogger(__name__)
+
 GENERATION_HEARTBEAT_SECONDS = 10.0
 # A cancel that lands after its generation already finished has nothing left to
 # discard its id, so the set is bounded and aged instead of growing for the life
 # of the worker process.
 CANCEL_RETENTION_SECONDS = 900.0
 CANCEL_MAX_ENTRIES = 256
+# v2.8.0: cooperative cancellation. A cancelled generation must stop *before*
+# it asks MLX for another token, not after the one already in flight finishes.
+# Without this the only way to stop a stream was to queue `generator.close()`
+# on the single MLX thread, which cannot run until the in-flight
+# `next_event()` returns -- so an abandoned stream kept generating (and kept the
+# only MLX thread busy, starving every later request) for as long as one token
+# of a 35B quantized model takes, on every retry of a client that times out
+# after 120s. The flag is a plain `threading.Event`: the canceller runs on the
+# event loop, the checker runs on the MLX thread, and neither waits for the
+# other.
+CANCEL_POLL_SECONDS = 0.05
+# Generation that outlives every plausible client is an orphan, not a long
+# answer. `tokenIdleTimeoutSeconds` (coordinator side) already catches a worker
+# that has gone silent; this catches the one that is NOT silent -- it keeps
+# heartbeating and emitting tokens to a consumer that will never read them,
+# which is what a dropped-but-not-yet-detected connection looks like. Without a
+# bound, such a request generates to `max_tokens` while holding the only MLX
+# thread.
+#
+# The coordinator passes its own `totalTimeoutSeconds` when it starts a
+# generation, so this setting stays the single source of truth. The constant is
+# only the fallback for a caller that does not, and is deliberately far above
+# any real generation so a legitimate long reply is never cut off.
+ORPHAN_GENERATION_SECONDS = 4 * 3600.0
+# Above this, the coordinator's value is trusted instead: it is the setting the
+# user actually chose, and clamping to it here would silently change what
+# `totalTimeoutSeconds` means.
+MAX_ORPHAN_GENERATION_SECONDS = 24 * 3600.0
 # Re-measuring host memory on every token would cost more than it protects
 # against; the pages this reads change on a far slower timescale.
 HOST_MEMORY_CACHE_SECONDS = 2.0
@@ -109,6 +140,35 @@ class CancellationRegistry:
         return len(self._entries)
 
 
+class GenerationAbort:
+    """Thread-safe cancellation for one in-flight generation.
+
+    `threading.Event` rather than the adapter's `CancellationRegistry`: this is
+    polled on the MLX thread immediately before each `next()`, and the
+    disconnect path (`lines()`'s ``finally``) sets it while unwinding a
+    `GeneratorExit` or `CancelledError`, where awaiting is not reliable. An
+    `Event.set()` needs no lock the canceller can be starved of, and it is
+    checked at a point where no await can intervene.
+    """
+
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self._event = threading.Event()
+        self.reason: str | None = None
+
+    def cancel(self, reason: str) -> None:
+        if not self._event.is_set():
+            self.reason = reason
+        self._event.set()
+
+    @property
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def __bool__(self) -> bool:
+        return self._event.is_set()
+
+
 class BaseAdapter:
     engine = "unknown"
 
@@ -116,6 +176,12 @@ class BaseAdapter:
         self.model: Any = None
         self.processor: Any = None
         self.cancelled = CancellationRegistry()
+        # v2.8.0: request id -> live generation abort, for the checks that must
+        # not go through `cancelled`. Bounded by the number of concurrent
+        # generations this worker can have (one: every MLX call is serialised
+        # on a single thread) and cleaned up by `finish()` in `lines()`'s
+        # `finally`, including on disconnect.
+        self.aborts: dict[str, GenerationAbort] = {}
         # Why a request stopped, when the reason changes what cleanup is right.
         # A user cancelling wants the work so far kept; a memory watchdog
         # stopping the same request wants it released. Without the distinction
@@ -124,6 +190,32 @@ class BaseAdapter:
         self._abort_reasons: dict[str, float] = {}
         self._abort_kinds: dict[str, str] = {}
         self._applied_memory_limits: dict[str, int] = {}
+
+    # --- cooperative generation abort (v2.8.0) ------------------------------
+
+    def begin_abort(self, request_id: str) -> GenerationAbort:
+        """Register (or return) the abort handle for a generation about to run.
+
+        Re-begun rather than reused so a stale handle from a finished request
+        cannot make the next request look cancelled.
+        """
+        abort = GenerationAbort(request_id)
+        self.aborts[request_id] = abort
+        return abort
+
+    def finish_abort(self, request_id: str) -> None:
+        self.aborts.pop(request_id, None)
+
+    def is_aborted(self, request_id: str) -> bool:
+        """Whether ``request_id`` was cancelled, by either mechanism.
+
+        The registry keeps working for the paths that only get here after a
+        token has been produced; the abort handle is what stops the *next* one.
+        """
+        if request_id in self.cancelled:
+            return True
+        abort = self.aborts.get(request_id)
+        return abort is not None and abort.is_set
 
     def note_abort(self, request_id: str, reason: str) -> None:
         if not request_id:
@@ -301,6 +393,25 @@ def memory_pressure_reason(adapter: BaseAdapter, limit_ratio: float,
     return None
 
 
+def _orphan_limit_seconds(params: dict) -> float:
+    """How long one generation may run before it is treated as an orphan.
+
+    The coordinator's `totalTimeoutSeconds` is the user's own setting for this,
+    so when it sends one, that is the limit -- the worker's fallback must not
+    quietly shorten a request the user allowed an hour for. Values outside a
+    sane range are ignored rather than clamped: a bad config must not turn into
+    an unexpected early cut-off.
+    """
+    raw = params.get("total_timeout_seconds")
+    try:
+        value = float(raw) if raw is not None else ORPHAN_GENERATION_SECONDS
+    except (TypeError, ValueError):
+        value = ORPHAN_GENERATION_SECONDS
+    if value != value or not 60.0 <= value <= MAX_ORPHAN_GENERATION_SECONDS:
+        return ORPHAN_GENERATION_SECONDS
+    return value
+
+
 def create_app(adapter: BaseAdapter) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None)
     # MLX keeps GPU stream state per thread.  Loading on asyncio.to_thread()
@@ -314,7 +425,20 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(mlx_executor, function, *args)
 
-    def next_event(iterator):
+    def next_event(iterator, abort: GenerationAbort | None = None):
+        """Produce the next event on the MLX thread, honouring a cancel.
+
+        The abort check is here, *before* `next(iterator)`, and not in the
+        caller: this is the last point at which no MLX work has been started
+        yet. Checking after the call (as the loop used to) meant a cancelled
+        request still paid for one more full token of generation, and on a
+        single-thread MLX pool that one token is what starves everyone else.
+
+        A `close()`d generator also raises `StopIteration` here, so a stream
+        closed by the discard path ends cleanly instead of erroring.
+        """
+        if abort is not None and abort.is_set:
+            return False, None
         try:
             return True, next(iterator)
         except StopIteration:
@@ -326,11 +450,15 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
         A disconnected client tears `lines()` down with GeneratorExit or
         CancelledError, and awaiting inside that teardown is unreliable -- the
         very next await can re-raise CancelledError and skip the close. The
-        adapter generator must still be closed, or `stream_generate` keeps
-        producing tokens for a client that is already gone and occupies the
-        single MLX thread that every later request needs. Submitting the close
-        instead of awaiting it guarantees it is queued; the executor's single
-        worker runs it as soon as the in-flight `next_event` returns.
+        adapter generator must still be closed, or `stream_generate` keeps its
+        KV cache and buffers alive for a client that is already gone.
+
+        Since v2.8.0 this is cleanup rather than the thing that stops
+        generation: the abort flag checked in `next_event` is what stops the
+        work, and it does not need the executor at all. That is why the one
+        place this used to be the only cancellation path -- a disconnect --
+        no longer leaves a generation running until the in-flight `next()`
+        finishes.
         """
         close = getattr(iterator, "close", None)
         if not callable(close):
@@ -377,8 +505,17 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 await on_mlx_thread(adapter.clear_paged_prompt_cache)
                 return {"type": "completed", "cache": await on_mlx_thread(adapter.prompt_cache_stats)}
             if method == "cancel":
-                adapter.cancelled.add(params.get("request_id", ""))
-                return {"cancelled": True, "forced": False}
+                request_id = params.get("request_id", "")
+                adapter.cancelled.add(request_id)
+                # The registry only stops a generation at a point where the
+                # adapter has already produced an event. Setting the abort
+                # flag is what stops it before the next token is requested,
+                # and it costs nothing here because it needs no executor slot.
+                abort = adapter.aborts.get(request_id)
+                if abort is not None:
+                    abort.cancel("rpc_cancel")
+                return {"cancelled": True, "forced": False,
+                        "abortSignalled": abort is not None}
             if method == "count_tokens":
                 try:
                     count = await on_mlx_thread(adapter.count_tokens, params)
@@ -421,6 +558,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
         async def lines():
             iterator = None
             pending = None
+            abort = adapter.begin_abort(request_id)
             try:
                 try:
                     heartbeat_interval = min(30.0, max(0.01, float(
@@ -456,8 +594,39 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 last_progress = started
                 prefill_estimate = None
                 iterator = adapter.stream(request_id, params)
+                # v2.8.0: a generation that has outlived every plausible client
+                # is an orphan, not a long answer. The coordinator's
+                # `tokenIdleTimeoutSeconds` only catches a worker that went
+                # silent; this catches the one that keeps heartbeating to
+                # nobody. The check runs between tokens, like every other
+                # in-loop guard, and at a value no legitimate generation
+                # reaches.
+                orphan_limit = _orphan_limit_seconds(params)
+                orphan_deadline = started + orphan_limit
+                aborted_reason: str | None = None
                 while True:
-                    pending = asyncio.create_task(on_mlx_thread(next_event, iterator))
+                    if abort.is_set:
+                        # Cooperative stop. The generator is already finished
+                        # (`next_event` returns `(False, None)` once the flag
+                        # is set), so this is a clean end of stream, not an
+                        # error: report it as the cancellation it is instead of
+                        # letting the code after the loop claim "stop".
+                        aborted_reason = abort.reason or "cancelled"
+                        adapter.note_abort(request_id, aborted_reason)
+                        adapter.cancelled.discard(request_id)
+                        break
+                    if time.monotonic() >= orphan_deadline:
+                        abort.cancel("orphan_timeout")
+                        adapter.note_abort(request_id, "orphan_timeout")
+                        LOGGER.error(
+                            "Generation for %s exceeded the orphan limit of %.0fs; aborting",
+                            request_id, orphan_limit)
+                        yield json.dumps({"type": "error", "code": "GENERATION_TIMEOUT",
+                                          "message": "生成が安全上限を超えたため停止しました",
+                                          "retryable": True}, ensure_ascii=False) + "\n"
+                        return
+                    pending = asyncio.create_task(
+                        on_mlx_thread(next_event, iterator, abort))
                     while not pending.done():
                         done, _ = await asyncio.wait({pending}, timeout=heartbeat_interval)
                         if done:
@@ -531,11 +700,17 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                         yield json.dumps({"type": "progress", "generated_tokens": live_tokens,
                                           "generation_tps": round(live_tps, 2) if live_tps else None,
                                           "elapsed_seconds": round(last_progress - started, 1)}) + "\n"
-                    if request_id in adapter.cancelled:
+                    if adapter.is_aborted(request_id):
+                        # A `/rpc cancel` that landed after this token was
+                        # produced. Nothing more is requested from MLX, and the
+                        # queue close is cleanup rather than the stop itself --
+                        # awaiting it here would block on the MLX thread, which
+                        # is the very thing that must not be held up.
+                        aborted_reason = abort.reason or "cancelled"
+                        adapter.note_abort(request_id, aborted_reason)
                         adapter.cancelled.discard(request_id)
-                        close = getattr(iterator, "close", None)
-                        if callable(close):
-                            await on_mlx_thread(close)
+                        close_on_mlx_thread(iterator)
+                        iterator = None
                         yield json.dumps({"type": "completed", "finish_reason": "cancelled"}) + "\n"
                         return
                     if event.get("type") == "token_progress":
@@ -578,6 +753,16 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     else:
                         yield json.dumps(event, ensure_ascii=False) + "\n"
                         last_visible_event = time.monotonic()
+                if aborted_reason is not None:
+                    # Cooperative stop: no tokens come after this, so do not run
+                    # the completion machinery below. In particular `finalize()`
+                    # would parse a truncated reply into tool calls and report
+                    # `finish_reason: "stop"`, which is exactly the wrong signal
+                    # for a client that cancelled.
+                    close_on_mlx_thread(iterator)
+                    iterator = None
+                    yield json.dumps({"type": "completed", "finish_reason": "cancelled"}) + "\n"
+                    return
                 elapsed = max(time.monotonic() - started, 0.001)
                 # `length` matters to clients deciding whether to continue, so
                 # take the runtime's verdict rather than always claiming "stop".
@@ -630,6 +815,14 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 # matters -- on the GeneratorExit/CancelledError raised when the
                 # client disconnects mid-generation.
                 adapter.cancelled.discard(request_id)
+                # v2.8.0: signal the abort BEFORE anything else in this
+                # `finally`, and without awaiting. This is the path the CPU
+                # report was about: the client is gone, `lines()` is being torn
+                # down, and the generation must stop asking MLX for another
+                # token rather than run to `max_tokens` and hold the single MLX
+                # thread the whole way. An `Event.set()` is safe to call while
+                # unwinding GeneratorExit/CancelledError; an await is not.
+                abort.cancel("stream_closed")
                 if pending is not None and not pending.done():
                     # A disconnect while `await pending` (or `asyncio.wait`)
                     # orphans one `on_mlx_thread` occupying the single MLX
@@ -637,11 +830,15 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                     # request does not serialize behind abandoned work.
                     pending.cancel()
                 if iterator is not None:
-                    # Deliberately not awaited (see close_on_mlx_thread), so the
-                    # adapter's own cleanup runs *after* this block returns. The
-                    # abort reason must therefore outlive the request here; the
-                    # registry expires and bounds itself instead.
+                    # Cleanup only -- `abort` above is what stops the work.
+                    # Deliberately not awaited (see close_on_mlx_thread), so
+                    # the adapter's own cleanup runs *after* this block
+                    # returns. The abort reason must therefore outlive the
+                    # request here; the registry expires and bounds itself.
                     close_on_mlx_thread(iterator)
+                # Drop the handle last: while it exists, a concurrent `/rpc
+                # cancel` for this id has something to signal.
+                adapter.finish_abort(request_id)
 
         return StreamingResponse(lines(), media_type="application/x-ndjson")
 

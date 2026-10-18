@@ -49,10 +49,7 @@ struct MenuBarView: View {
             if displayRows.isEmpty {
                 Text(LS("モデル未ロード")).font(.caption).foregroundStyle(.secondary)
             } else {
-                Text(displayRows.count > 1
-                     ? "\(LS("ロード済みモデル")) · \(displayRows.count)"
-                     : LS("ロード済みモデル"))
-                    .font(.caption).foregroundStyle(.secondary)
+                loadedModelsHeader
                 // Default max residency is 2 and the ceiling is 8; keep the
                 // popover from growing without bound if it is raised.
                 let rows = ForEach(displayRows) { resident in
@@ -177,6 +174,28 @@ struct MenuBarView: View {
         }
     }
 
+    /// "Loaded models · N", with the resident / non-resident split spelled out
+    /// once the second tier exists (v2.8.0).
+    ///
+    /// Splitting the header keeps the distinction discoverable without adding a
+    /// badge to every row: the badge is on the row (detail line), the numbers
+    /// are here.
+    private var loadedModelsHeader: some View {
+        let count = displayRows.count
+        let overflow = model.nonResidentModelCount
+        let base = count > 1 ? "\(LS("ロード済みモデル")) · \(count)" : LS("ロード済みモデル")
+        return Group {
+            if overflow > 0 {
+                Text(model.guiLanguage == "ja"
+                     ? "\(base)（常駐 \(model.residentModelCount)・非常駐 \(overflow)）"
+                     : "\(base) (\(model.residentModelCount) resident · \(overflow) non-resident)")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text(base).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     /// One row of the v1.10.0 unified model list: name (with a left-side copy
     /// button so any resident model's name can be copied, not just the
     /// primary one), the existing engine/size/replica detail line, and a
@@ -199,6 +218,14 @@ struct MenuBarView: View {
                         .padding(.horizontal, 4).padding(.vertical, 1)
                         .background(Color.secondary.opacity(0.15), in: Capsule())
                         .accessibilityLabel(LS("クイックチャットの既定モデル"))
+                }
+                // v2.8.0: a model loaded past `maxResidentModels` is marked here
+                // so "why does this one not count?" is answerable in place.
+                if !resident.resident && !isVirtualLoadingRow {
+                    Text(LS("非常駐")).font(.caption2).foregroundStyle(.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                        .accessibilityLabel(LS("非常駐モデル"))
                 }
                 Spacer(minLength: 4)
                 if resident.replicaCount > 1 {
@@ -238,8 +265,9 @@ struct MenuBarView: View {
                         .monospacedDigit()
                         .accessibilityLabel(LS("生成速度") + " \(rate)")
                 }
-                // Non-resident idle countdown (v2.7.0): proves the
-                // configurable idle TTL is in effect for this row.
+                // Non-resident idle countdown (v2.7.0, seconds-only since
+                // v2.8.0): proves the configurable idle TTL is in effect for
+                // this row and is the number the field below adds to.
                 if let countdown = resident.idleCountdownText(japanese: model.guiLanguage == "ja") {
                     Text(countdown)
                         .font(.caption2)
@@ -248,6 +276,13 @@ struct MenuBarView: View {
                 }
             }
             .padding(.leading, isVirtualLoadingRow ? 0 : 18)
+            // v2.8.0: extend this model's idle countdown by N seconds.
+            if !isVirtualLoadingRow {
+                IdleExtendField(resident: resident, isBusy: model.busy) { seconds in
+                    await model.extendIdle(resident.id, seconds: seconds)
+                }
+                .padding(.leading, 18)
+            }
             if isVirtualLoadingRow, let phase = model.loadingPhase {
                 Text(phase).font(.caption2).foregroundStyle(.secondary)
             }

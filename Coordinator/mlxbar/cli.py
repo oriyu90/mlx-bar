@@ -63,6 +63,10 @@ def parser() -> argparse.ArgumentParser:
     unload.add_argument("model_id", nargs="?", help="省略すると常駐モデルをすべて解放（従来動作）")
     unload.add_argument("--force", action="store_true")
     model.add_parser("resident")
+    extend = model.add_parser(
+        "extend-idle",
+        help="ロード済みモデルの解放までの待機時間を指定秒だけ延長する（1〜86400秒）")
+    extend.add_argument("model_id"); extend.add_argument("seconds")
     pin = model.add_parser("pin"); pin.add_argument("model_id")
     pin.add_argument("--max-memory-gb", type=float, default=None)
     pin.add_argument("--replicas", type=int, default=None,
@@ -344,10 +348,15 @@ def execute(args, client: Client):
                     "replicaShortfalls": pool.get("replicaShortfalls", []),
                     # Non-resident unload timing (v2.7.0): the global idle TTL
                     # applies live without a restart; per-model expiry rides on
-                    # status idleExpiresAt below.
+                    # status idleExpiresAt below. v2.8.0 adds the same numbers in
+                    # seconds so a script does not have to do clock arithmetic,
+                    # and separates the models that hold a resident slot from the
+                    # ones loaded past `maxResidentModels`.
                     "idleTTLSeconds": pool.get("idleTTLSeconds"),
+                    "nonResidentModelCount": pool.get("nonResidentModelCount"),
                     "models": [{"id": item.get("id"), "engine": item.get("engine"),
                                 "poolState": item.get("poolState"),
+                                "resident": item.get("resident", True),
                                 "replicaIndex": item.get("replicaIndex"),
                                 "replicaCount": item.get("replicaCount"),
                                 "readyReplicaCount": item.get("readyReplicaCount"),
@@ -356,8 +365,24 @@ def execute(args, client: Client):
                                 "keepLoaded": item.get("keepLoaded"),
                                 "activeLeases": item.get("activeLeases"),
                                 "laneQueueDepth": item.get("laneQueueDepth"),
-                                "idleExpiresAt": item.get("idleExpiresAt")}
+                                "idleExpiresAt": item.get("idleExpiresAt"),
+                                "idleSecondsRemaining": item.get("idleSecondsRemaining"),
+                                "idleExtendSeconds": item.get("idleExtendSeconds")}
                                for item in status.get("loadedModels", [])]}
+        if args.action == "extend-idle":
+            # Parse here as well as server-side so a typo fails with a usage
+            # message instead of a round trip. `int()` rejects "60.5" and "abc";
+            # the server still bounds the value for non-CLI callers.
+            raw = getattr(args, "seconds", None)
+            try:
+                seconds = int(str(raw).strip())
+            except (TypeError, ValueError):
+                raise ValueError("seconds には1以上の整数を指定してください")
+            if seconds < 1:
+                raise ValueError("seconds には1以上の整数を指定してください")
+            return client.request(
+                "POST", f"/api/v1/models/{args.model_id}/idle/extend",
+                {"seconds": seconds}).json()
         if args.action in {"pin", "unpin"}:
             settings = client.request("GET", "/api/v1/settings").json()
             pool = settings.get("models", {}).get("pool", {})

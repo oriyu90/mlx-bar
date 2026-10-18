@@ -17,6 +17,10 @@ from .supervisor import QueuedRequest, WorkerSupervisor as SingleWorkerSuperviso
 
 GIB = 1 << 30
 LOGGER = logging.getLogger(__name__)
+# v2.8.0 bounds for the per-model "extend the idle countdown" action. The
+# ceiling keeps a mistyped CLI argument (or a pasted epoch timestamp) from
+# turning a transient model into a permanent resident.
+MAX_IDLE_EXTENSION_SECONDS = 86_400
 
 
 @dataclass
@@ -32,6 +36,17 @@ class PoolSlot:
     replica_index: int = 0
     keep_loaded: bool = False
     session_pinned: bool = False
+    # v2.8.0 resident vs non-resident. `maxResidentModels` caps the number of
+    # *resident* models; a model admitted while that cap is already full loads
+    # as a non-resident instead of being refused (v2.7.3 used to raise
+    # RESIDENT_LIMIT_REACHED). A non-resident slot never becomes session
+    # pinned -- pinning is what makes a model resident -- so it is always
+    # governed by the idle TTL unless a `keepLoaded` profile says otherwise.
+    resident: bool = True
+    # Seconds added to this slot's idle countdown by an explicit "keep it
+    # loaded N more seconds" request. Reset the moment the model is used again,
+    # so repeated extensions can never pin a model permanently.
+    idle_extend_seconds: float = 0.0
     leases: int = 0
     last_released_at: float = 0.0
     state: str = "loading"
@@ -301,7 +316,126 @@ class ModelPoolSupervisor:
         return sum(slot.reservation_bytes for slot in self._slots.values()
                    if slot.state in {"loading", "ready", "evicting"})
 
-    async def _admit(self, model: dict) -> tuple[int, list[PoolSlot]]:
+    # --- resident / non-resident bookkeeping (v2.8.0) -----------------------
+
+    # The states that still occupy the machine. `evicting` is included so a
+    # slot that is on its way out cannot be double-counted as free capacity
+    # while `_reap_once` awaits its worker shutdown.
+    _CHARGED_STATES = frozenset({"loading", "ready", "evicting"})
+
+    def _resident_model_ids(self) -> set[str]:
+        return {str(slot.model.get("id", "")) for slot in self._slots.values()
+                if slot.resident and slot.state in self._CHARGED_STATES
+                and str(slot.model.get("id", ""))}
+
+    def _is_over_resident_limit(self, model_id: str) -> bool:
+        """Would admitting ``model_id`` as a resident exceed the cap?
+
+        An already-resident model (including any extra replica of it) is never
+        over the limit: `maxResidentModels` counts distinct model kinds, which
+        is how the settings UI and `residentModelCount` have always read it.
+        """
+        maximum = max(1, int(self._pool_settings().get("maxResidentModels", 2)))
+        if model_id in self._resident_model_ids():
+            return False
+        return len(self._resident_model_ids()) >= maximum
+
+    def _promote_if_room(self, slot: PoolSlot) -> None:
+        """Give a pinned non-resident slot resident status when the cap allows.
+
+        Pinning is an explicit "keep this model" action, so it should consume a
+        resident slot -- but never past `maxResidentModels`, which stays the
+        hard cap on how many models hold a slot of their own.
+        """
+        if slot.resident:
+            return
+        if self._is_over_resident_limit(str(slot.model.get("id", ""))):
+            return
+        slot.resident = True
+
+    def _pin_slot(self, slot: PoolSlot) -> None:
+        """Session-pin an existing slot, promoting it when a resident slot is free.
+
+        Called from the load path's "already resident" shortcut, where v1.x set
+        `session_pinned` directly. Pinning a non-resident model keeps it (the
+        user asked for that) and gives it a resident slot if the limit allows,
+        without ever pushing the pool past `maxResidentModels`.
+        """
+        slot.session_pinned = True
+        self._promote_if_room(slot)
+
+    def _idle_remaining(self, slot: PoolSlot, now: float | None = None) -> float | None:
+        """Seconds until this slot is unloaded for idleness, or None.
+
+        None means the slot is never unloaded for idleness at all: a pinned or
+        keep-loaded profile is a standing request to keep the weights in
+        memory, and an externally managed model is not this pool's to free.
+        """
+        if slot.keep_loaded or slot.session_pinned:
+            return None
+        ttl = int(self._pool_settings().get("idleTTLSeconds", 900))
+        current = time.monotonic() if now is None else now
+        return max(0.0, ttl + slot.idle_extend_seconds
+                   - (current - slot.last_released_at))
+
+    async def extend_idle(self, model_id: str, seconds: float) -> dict:
+        """Push one model's idle-unload deadline out by ``seconds``.
+
+        One-shot by construction: the next generation for this model resets the
+        extension, so "keep it loaded a while longer" can never become "keep it
+        loaded forever" by repeating the request.
+        """
+        if not self.enabled:
+            raise MLXBarError("MODEL_NOT_LOADED",
+                              "モデルプールが無効のため待機時間を延長できません", 409, False)
+        try:
+            requested = float(seconds)
+        except (TypeError, ValueError):
+            requested = 0.0
+        if requested != requested or requested < 1:  # NaN or non-positive
+            raise MLXBarError("INVALID_IDLE_EXTENSION",
+                              "延長する秒数は1以上で指定してください", 422, False)
+        if requested > MAX_IDLE_EXTENSION_SECONDS:
+            raise MLXBarError(
+                "INVALID_IDLE_EXTENSION",
+                f"延長は1秒から{MAX_IDLE_EXTENSION_SECONDS}秒までです", 422, False)
+        async with self._pool_lock:
+            slots = [slot for slot in self._replica_slots(model_id)
+                     if slot.state in {"loading", "ready"}]
+            if not slots:
+                raise MLXBarError(
+                    "MODEL_NOT_IDLE_MANAGED",
+                    "ロードされていないモデルの待機時間は延長できません", 409, False)
+            # Same self-heal status() runs: a disconnected client can leave a
+            # stale lease behind, and an extended lease would never be reaped.
+            for slot in slots:
+                self._recover_slot_state(slot, "extend_idle")
+            targets = [slot for slot in slots
+                       if not slot.keep_loaded and not slot.session_pinned]
+            if not targets:
+                raise MLXBarError(
+                    "MODEL_NOT_IDLE_MANAGED",
+                    "固定中のモデルには待機時間がないため延長できません。"
+                    "固定を解除してから再度延長してください", 409, False)
+            for slot in targets:
+                slot.idle_extend_seconds = float(min(
+                    MAX_IDLE_EXTENSION_SECONDS,
+                    slot.idle_extend_seconds + requested))
+            remaining = min(self._idle_remaining(slot) or 0.0 for slot in targets)
+            return {
+                "id": model_id,
+                "engine": (targets[0].worker.loaded or targets[0].model).get("engine"),
+                "resident": targets[0].resident,
+                "extendedSeconds": requested,
+                "totalExtendedSeconds": max(slot.idle_extend_seconds
+                                             for slot in targets),
+                "idleTTLSeconds": int(self._pool_settings().get("idleTTLSeconds", 900)),
+                "idleSecondsRemaining": round(remaining, 1),
+                "idleExpiresAt": time.time() + remaining,
+                "replicaCount": len(targets),
+            }
+
+    async def _admit(self, model: dict, *, resident: bool) -> tuple[int, list[PoolSlot]]:
         estimate = self._cold_estimate(model)
         per_model = self._per_model_limit(model)
         if estimate > per_model:
@@ -326,55 +460,27 @@ class ModelPoolSupervisor:
             (slot for slot in self._slots.values()
              if slot.state == "ready" and slot.leases == 0
              and not slot.keep_loaded and not slot.session_pinned),
-            key=lambda item: item.last_released_at,
+            # Non-resident slots first (least-recently-released within each
+            # group): a model admitted past `maxResidentModels` is by definition
+            # the pool's spare capacity, so budget pressure should reclaim it
+            # before a model that holds a resident slot of its own.
+            key=lambda item: (item.resident, item.last_released_at),
         )
         evict: list[PoolSlot] = []
-        resident = self._resident_charge()
-        maximum = int(self._pool_settings().get("maxResidentModels", 2))
-        incoming_id = str(model.get("id", ""))
-        # v2.7.3: strict resident-count limit. While the pool has room for
-        # another distinct model, the request is added (loaded) as a new
-        # resident. Once distinct residents reach the limit, a new distinct
-        # model is refused loudly instead of silently evicting the oldest
-        # idle transient. Same-model reloads/replicas never count as new.
-        existing_ids = {str(slot.model.get("id", "")) for slot in self._slots.values()
-                        if str(slot.model.get("id", ""))}
-        if incoming_id not in existing_ids and len(existing_ids) >= maximum:
-            raise MLXBarError(
-                "RESIDENT_LIMIT_REACHED",
-                f"常駐モデル数が上限（{maximum}）に達しているため、新しいモデルをロードできません。"
-                "不要な常駐モデルをアンロードしてから再実行してください",
-                409, False,
-            )
-
-        def _distinct_models(pending_evict: list[PoolSlot]) -> int:
-            # `maxResidentModels` caps distinct model ids, not worker slots:
-            # the setting UI, `residentModelCount` status and the replicas
-            # feature all treat an extra replica of a resident model as the
-            # *same* model. Counting `len(self._slots)` here rejected a second
-            # replica whenever `maxResidentModels == 1`, defeating `replicas`.
-            dropped = {id(slot) for slot in pending_evict}
-            ids = {str(slot.model.get("id", "")) for slot in self._slots.values()
-                   if id(slot) not in dropped}
-            ids.add(incoming_id)
-            return len(ids)
-
-        # Budget eviction only: the distinct-count limit above is strict and
-        # never satisfied by evicting another model. The remaining
-        # distinct check below is a safety net for a concurrent config
-        # reduction (max lowered while this admission was in flight).
-        while candidates and resident + estimate > budget:
+        charged = self._resident_charge()
+        # v2.8.0: the resident count is no longer a refusal. `maxResidentModels`
+        # decides *which* slots count as resident; a model admitted past the cap
+        # loads as a non-resident instead of failing with
+        # RESIDENT_LIMIT_REACHED (v2.7.3), which made "load a second model"
+        # impossible exactly when the user had filled the pool. Every memory
+        # guard above this point -- per-model cap, global budget, OS pressure,
+        # free-memory headroom -- still applies to non-resident loads, and the
+        # budget eviction below still has to make room.
+        while candidates and charged + estimate > budget:
             victim = candidates.pop(0)
             evict.append(victim)
-            resident -= victim.reservation_bytes
-        if _distinct_models(evict) > maximum:
-            raise MLXBarError(
-                "RESIDENT_LIMIT_REACHED",
-                f"常駐モデル数が上限（{maximum}）に達しているため、新しいモデルをロードできません。"
-                "不要な常駐モデルをアンロードしてから再実行してください",
-                409, False,
-            )
-        if resident + estimate > budget:
+            charged -= victim.reservation_bytes
+        if charged + estimate > budget:
             raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
                               "使用中または固定中のモデルを残したまま安全にロードできません", 503, True)
         return min(per_model, max(estimate, 1 << 30)), evict
@@ -442,7 +548,7 @@ class ModelPoolSupervisor:
             existing = self._slots.get(slot_key)
             if existing:
                 if pin:
-                    existing.session_pinned = True
+                    self._pin_slot(existing)
                 future = existing.load_future
                 if existing.state == "ready":
                     self._primary_model_id = model_id
@@ -462,13 +568,20 @@ class ModelPoolSupervisor:
                 existing = self._slots.get(slot_key)
                 if existing and existing.state == "ready":
                     if pin:
-                        existing.session_pinned = True
+                        self._pin_slot(existing)
                     self._primary_model_id = model_id
                     return existing.worker.loaded or existing.model
                 if existing and existing.load_future is not None:
                     future = existing.load_future
                 else:
-                    reservation, victims = await self._admit(model)
+                    # Residency is decided once, here, under the pool lock: a
+                    # model that is already present keeps the status its first
+                    # replica got, and a brand-new one is resident only while
+                    # the resident limit has room.
+                    siblings = self._replica_slots(model_id)
+                    resident = (siblings[0].resident if siblings
+                                else not self._is_over_resident_limit(model_id))
+                    reservation, victims = await self._admit(model, resident=resident)
                     for victim in victims:
                         victim.state = "evicting"
                     loop = asyncio.get_running_loop()
@@ -484,7 +597,13 @@ class ModelPoolSupervisor:
                         model=dict(model), worker=worker, reservation_bytes=reservation,
                         replica_index=replica_index,
                         keep_loaded=bool(profile.get("keepLoaded", False)),
-                        session_pinned=pin, last_released_at=time.monotonic(), load_future=future,
+                        # A non-resident slot is, by definition, not pinned:
+                        # pinning is what makes a model resident, and the whole
+                        # point of the non-resident tier is that it is freed
+                        # again once its idle time runs out.
+                        session_pinned=bool(pin and resident),
+                        resident=resident,
+                        last_released_at=time.monotonic(), load_future=future,
                     )
                     self._slots[slot_key] = existing
             if future.done():
@@ -1064,6 +1183,11 @@ class ModelPoolSupervisor:
             self._release_lane(slot, request_id)
             slot.leases = max(0, slot.leases - 1)
             slot.last_released_at = time.monotonic()
+            # A "keep it loaded N more seconds" grant covers one idle period
+            # only. Consuming it here is what makes repeated extensions unable
+            # to turn into a permanent pin; the countdown restarts at the
+            # configured TTL, which is exactly what the reaper will now use.
+            slot.idle_extend_seconds = 0.0
             if cancel_task:
                 cancel_task.cancel()
             if acquire_task and not acquire_task.done():
@@ -1277,6 +1401,7 @@ class ModelPoolSupervisor:
                 active_generations += 1
             if child.get("loadedModel"):
                 model_id = str(slot.model.get("id", ""))
+                idle_remaining = self._idle_remaining(slot)
                 entry = {**child["loadedModel"], "poolState": slot.state,
                          "memoryReservationBytes": slot.reservation_bytes,
                          "activeLeases": slot.leases,
@@ -1291,9 +1416,18 @@ class ModelPoolSupervisor:
                          "laneQueueDepth": len(slot.gen_queued),
                          "laneRecoveries": slot.gen_recoveries,
                          "keepLoaded": slot.keep_loaded or slot.session_pinned,
-                         "idleExpiresAt": None if slot.keep_loaded or slot.session_pinned else
-                         time.time() + max(0, self._pool_settings().get("idleTTLSeconds", 900)
-                                           - (time.monotonic() - slot.last_released_at))}
+                         # v2.8.0: whether this slot counts against
+                         # `maxResidentModels`, and the two fields the GUI/CLI
+                         # need to render and extend the idle countdown without
+                         # doing clock arithmetic on the client. Computed from
+                         # the same helper the reaper evicts with, so what the
+                         # row promises is what actually happens.
+                         "resident": slot.resident,
+                         "idleSecondsRemaining": (None if idle_remaining is None
+                                                   else round(idle_remaining)),
+                         "idleExtendSeconds": (slot.idle_extend_seconds or None),
+                         "idleExpiresAt": (None if idle_remaining is None
+                                           else time.time() + idle_remaining)}
                 # Per-replica live generation rate, straight from the same
                 # `_live_generation()` the single-model header already uses. The
                 # GUI shows one row per distinct model (replicas collapse), so an
@@ -1323,7 +1457,12 @@ class ModelPoolSupervisor:
         if external_status.get("loadedModel"):
             loaded_models.append({**external_status["loadedModel"], "poolState": "external",
                                   "memoryReservationBytes": None, "activeLeases": 0,
-                                  "keepLoaded": True, "memoryManagedBy": "lm-studio"})
+                                  "keepLoaded": True, "memoryManagedBy": "lm-studio",
+                                  # LM Studio owns the process, so this pool never
+                                  # evicts it and never counts it against the
+                                  # resident limit it also does not manage.
+                                  "resident": True, "idleSecondsRemaining": None,
+                                  "idleExtendSeconds": None, "idleExpiresAt": None})
         loading = loading or external_status.get("loadingModel")
         primary = self.loaded
         primary_id = primary.get("id") if primary else None
@@ -1368,13 +1507,22 @@ class ModelPoolSupervisor:
             for model_id, info in self._replica_admission_failures.items()
             if model_id in {str(s.model.get("id", "")) for s in self._slots.values()}
         ]
+        # v2.8.0: `residentCount` is every loaded entry (unchanged, it is what
+        # the pool occupies), while `residentModelCount` counts only the models
+        # that hold one of the `maxResidentModels` slots. A model loaded past
+        # that cap is reported as non-resident: it still answers requests, it
+        # just does not consume the cap and is freed by the idle TTL.
+        loaded_ids = {str(item.get("id", "")) for item in loaded_models}
+        resident_ids = {str(item.get("id", "")) for item in loaded_models
+                        if item.get("resident")}
         return {
             "enabled": True,
             "configuredEnabled": configured_enabled,
             "restartRequired": (not configured_enabled
                                 or configured_concurrency != self._gen_concurrency),
             "residentCount": len(loaded_models),
-            "residentModelCount": len({item.get("id") for item in loaded_models}),
+            "residentModelCount": len(resident_ids),
+            "nonResidentModelCount": len(loaded_ids - resident_ids),
             "maxResidentModels": self._pool_settings().get("maxResidentModels", 2),
             "maxReplicasPerModel": self._pool_settings().get("maxReplicasPerModel", 2),
             # Non-resident unload timing (v2.7.0): live without a restart.
@@ -1408,7 +1556,6 @@ class ModelPoolSupervisor:
                 LOGGER.exception("Model pool reaper failed")
 
     async def _reap_once(self) -> int:
-        ttl = int(self._pool_settings().get("idleTTLSeconds", 900))
         now = time.monotonic()
         victims = []
         _, pressure = await asyncio.to_thread(self._host_capacity)
@@ -1425,7 +1572,13 @@ class ModelPoolSupervisor:
                 dead = child.get("workerRunning") is False and not child.get("loadedModel")
                 slot.keep_loaded = bool(self._profile(str(slot.model.get("id", ""))).get(
                     "keepLoaded", False))
-                expired = now - slot.last_released_at >= ttl
+                # An extension granted from the GUI/CLI pushes this deadline out
+                # for exactly one idle period (it is reset the next time the
+                # model is used), so the reaper has to read the same number
+                # status() reports or the countdown would promise a delay that
+                # never happens.
+                remaining = self._idle_remaining(slot, now)
+                expired = remaining is not None and remaining <= 0
                 pressure_victim = time_indifferent and slot.leases == 0
                 if dead and slot.state == "ready" and slot.leases == 0:
                     slot.state = "evicting"
@@ -1472,18 +1625,26 @@ class ModelPoolSupervisor:
                  if slot.state == "ready" and slot.leases == 0
                  and not slot.keep_loaded and not slot.session_pinned
                  and slot not in victims),
-                key=lambda item: item.last_released_at,
+                key=lambda item: (item.resident, item.last_released_at),
             )
-            # Count distinct model ids, not worker slots: extra replicas of one
-            # model are trimmed by the replica-scaledown block above, never by
-            # the `maxResidentModels` cap (which is a distinct-model setting).
-            def _distinct_after(pending: list[PoolSlot]) -> int:
+            # Count distinct *resident* model ids, not worker slots: extra
+            # replicas of one model are trimmed by the replica-scaledown block
+            # above, never by the `maxResidentModels` cap, and non-resident
+            # slots do not consume it at all (v2.8.0).
+            def _resident_models_after(pending: list[PoolSlot]) -> int:
                 dropped = {id(s) for s in pending}
                 return len({str(s.model.get("id", "")) for s in self._slots.values()
-                            if id(s) not in dropped})
+                            if s.resident and id(s) not in dropped})
             for slot in candidates:
-                if resident <= self._global_budget() and _distinct_after(victims) <= maximum:
+                over_budget = resident > self._global_budget()
+                over_residents = _resident_models_after(victims) > maximum
+                if not over_budget and not over_residents:
                     break
+                # Evicting a non-resident slot frees memory but cannot lower
+                # the resident count, so it only helps while the budget is the
+                # binding constraint.
+                if not over_budget and not slot.resident:
+                    continue
                 slot.state = "evicting"
                 victims.append(slot)
                 resident -= slot.reservation_bytes

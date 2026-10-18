@@ -631,6 +631,10 @@ class WorkerSupervisor:
                 worker_params["memory_limit_ratio"] = self.settings.data["generation"].get(
                     "memoryLimitRatio", 0.9)
                 worker_params["memory_limit_bytes"] = self.memory_limit_bytes
+                # v2.8.0: the worker needs the same ceiling this request is
+                # already under, so its own orphan backstop cannot cut a reply
+                # short before `asyncio.timeout` above would have.
+                worker_params["total_timeout_seconds"] = total_timeout
                 if isinstance(prompt, list):
                     worker_params["messages"] = prompt
                 idle_timeout = float(self.settings.data["generation"].get("tokenIdleTimeoutSeconds", 60))

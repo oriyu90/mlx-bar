@@ -132,18 +132,20 @@ class ReloadResidentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transient_listed_first_never_displaces_pinned(self):
         # Snapshots arrive in storage (id-sorted) order with the transient
-        # model first; the pinned model must win the single slot and the
-        # transient skip must not raise.
+        # model first; the pinned model must win the single resident slot.
+        # v2.8.0: the transient is no longer refused -- it comes back as a
+        # non-resident, which does not displace the pinned resident.
         snapshots = [
             {"model": model(2), "engine": "mlx-lm", "sessionPinned": False},
             {"model": model(1), "engine": "mlx-lm", "sessionPinned": True},
         ]
         results = await self.pool.reload_resident(snapshots, "mlx-lm")
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["id"], "model-1")
+        self.assertEqual(len(results), 2)
         self.assertIn("model-1", self.pool._slots)
-        self.assertNotIn("model-2", self.pool._slots)
+        self.assertIn("model-2", self.pool._slots)
         self.assertTrue(self.pool._slots["model-1"].session_pinned)
+        self.assertTrue(self.pool._slots["model-1"].resident)
+        self.assertFalse(self.pool._slots["model-2"].resident)
 
     async def test_transient_reload_is_transient(self):
         snapshots = [{"model": model(2), "engine": "mlx-lm", "sessionPinned": False}]
