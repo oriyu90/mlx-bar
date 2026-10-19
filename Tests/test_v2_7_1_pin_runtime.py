@@ -48,7 +48,7 @@ class FakeWorker:
     @staticmethod
     def _is_our_worker(pid): return False
 
-    async def load(self, model, engine=None):
+    async def load(self, model, engine=None, explicit=None):
         FakeWorker.load_calls += 1
         self.loaded = {**model, "engine": engine or model.get("engine"),
                        "capabilities": {"modelMaxTokens": 4096, "memoryLimits": {

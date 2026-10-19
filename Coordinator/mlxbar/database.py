@@ -165,6 +165,28 @@ class Database:
         item["modalities"] = json.loads(item["modalities"])
         return item
 
+    def update_model_classification(self, model_id: str, *, format: str, engine: str | None,
+                                    modalities: list[str], confidence: float,
+                                    reason: str) -> bool:
+        """Rewrite one catalog row's classification (v2.10.0 load-time self-heal).
+
+        Starts a transaction only for rows that exist; `replace_models` (scan)
+        remains the sole bulk writer, and both go through the same single
+        connection + lock. Returns False when the row vanished between the
+        load and this write (concurrent scan), which the caller treats as a
+        no-op."""
+        with self.lock, self.connection:
+            cursor = self.connection.execute(
+                """UPDATE models
+                   SET format=:format, engine=:engine, modalities=:modalities,
+                       confidence=:confidence, reason=:reason
+                   WHERE id=:id""",
+                {"id": model_id, "format": format, "engine": engine,
+                 "modalities": json.dumps(modalities), "confidence": float(confidence),
+                 "reason": reason},
+            )
+        return cursor.rowcount > 0
+
     def has_duplicate_model_paths(self) -> bool:
         with self.lock:
             rows = self.connection.execute("SELECT path FROM models WHERE path IS NOT NULL AND path != ''").fetchall()

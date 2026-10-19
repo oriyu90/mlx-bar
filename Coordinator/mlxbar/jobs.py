@@ -68,7 +68,28 @@ class JobManager:
             return job
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        return self.database.get_job(job_id)
+        final = self.database.get_job(job_id) or job
+        if final["state"] not in {"completed", "failed", "cancelled"}:
+            # When the cancel lands before the job task's *first* step,
+            # CPython throws CancelledError into a never-started coroutine at
+            # entry, so `_run`'s own `except CancelledError` never runs and
+            # the terminal write never happens. The task is quietly dropped
+            # with its queued/subprocess state intact (an install subprocess
+            # would even keep running). Write the terminal record here, drop
+            # the bookkeeping entries, and let a subscriber still receive a
+            # terminal event from the queue object it may already hold.
+            final.update(state="cancelled", message="利用者が処理を中止しました",
+                         error={"code": "JOB_CANCELLED", "message": "処理を中止しました"},
+                         result=None)
+            self.database.upsert_job(final)
+            queue = self.queues.get(job_id)
+            if queue is not None:
+                queue.put_nowait({"state": "cancelled", "progress": final.get("progress"),
+                                  "message": final.get("message"),
+                                  "result": None, "error": final.get("error")})
+            self.tasks.pop(job_id, None)
+            self.queues.pop(job_id, None)
+        return final
 
     async def events(self, job_id: str):
         job = self.database.get_job(job_id)

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from ..catalog.classifier import detect_engine
 from ..errors import MLXBarError
 
 WORKER_MODULES = {"mlx-lm": "mlx_lm_worker.adapter", "mlx-vlm": "mlx_vlm_worker.adapter"}
@@ -392,12 +393,38 @@ class WorkerSupervisor:
                                   data.get("retryable", False))
             return data
 
-    async def load(self, model: dict, engine: str | None = None) -> dict:
+    async def load(self, model: dict, engine: str | None = None, explicit: bool | None = None) -> dict:
+        # v2.10.0: `explicit` records the difference between "the caller named
+        # this engine" (management body engine / CLI --engine / a resolved
+        # replica or reload) and "use the catalog engine, auto-resolved"
+        # (API autoload, preload, pager reloads of catalog rows). Explicit
+        # choices are honored strictly: no cross-engine fallback and no
+        # mlx-vlm guard bypass. Everything else may re-derive the engine from
+        # the model directory and fall back across the engine boundary, which
+        # is what rescues a stale catalog row (v2.9.0 and earlier) or a
+        # text-only model that mlx-lm cannot load.
+        if explicit is None:
+            explicit = bool(engine and engine != "auto")
+        # v2.10.0: "auto" reaches this supervisor verbatim when a caller passes
+        # the pool's engine straight down (management.py normalizes the REST
+        # body, but the pool just forwards). "auto" must mean the same thing
+        # as None here: the catalog engine plus load-time re-derivation, not
+        # the misleading "利用可能なエンジンがありません" refusal.
+        if engine == "auto":
+            engine = None
         chosen = engine or model.get("engine")
         model_max_tokens = self._detect_model_max_tokens(model.get("path"))
         if chosen not in {"mlx-lm", "mlx-vlm"}:
             if chosen != "lm-studio":
                 raise MLXBarError("MODEL_INCOMPATIBLE", "利用可能なエンジンがありません", 409)
+        if not explicit and chosen in {"mlx-lm", "mlx-vlm"}:
+            detected = detect_engine(Path(model["path"])) if model.get("path") else None
+            if detected and detected != chosen:
+                LOGGER.info(
+                    "Auto engine re-detection for %s: catalog=%s load-time=%s",
+                    model.get("id") or model.get("name"), chosen, detected,
+                )
+                chosen = detected
         async with self.lock:
             if (self.loaded and self.loaded.get("id") == model.get("id")
                     and self.loaded.get("engine") == chosen):
@@ -417,10 +444,13 @@ class WorkerSupervisor:
                                    "capabilities": {"modelMaxTokens": model_max_tokens}}
                     return self.loaded
                 candidates = [chosen]
-                if chosen == "mlx-lm":
-                    # mlx-vlm includes native and compatibility implementations
-                    # for some text-only architectures that mlx-lm does not.
-                    candidates.append("mlx-vlm")
+                if not explicit:
+                    # Symmetric auto fallback (v2.10.0): mlx-vlm also retries
+                    # with mlx-lm for the text-only path, mirror of the old
+                    # mlx-lm -> mlx-vlm rescue. An explicit choice never
+                    # silently switches engines — the user picked one on
+                    # purpose and its failure must surface as an error.
+                    candidates.append("mlx-vlm" if chosen == "mlx-lm" else "mlx-lm")
                 last_error: MLXBarError | None = None
                 for candidate in candidates:
                     chosen = candidate
@@ -430,7 +460,8 @@ class WorkerSupervisor:
                         await self._start_worker(chosen)
                         self.loading["phase"] = "モデルデータを読み込み中"
                         result = await self._call("load", {"path": model.get("path"),
-                                                            "trust_remote_code": False}, timeout=timeout)
+                                                            "trust_remote_code": False,
+                                                            "allow_vlm": explicit}, timeout=timeout)
                         break
                     except MLXBarError as exc:
                         await self._stop_worker()
@@ -438,7 +469,10 @@ class WorkerSupervisor:
                         if exc.code != "MODEL_INCOMPATIBLE":
                             raise
                 else:
-                    if not model.get("provider_key"):
+                    if explicit or not model.get("provider_key"):
+                        # v2.10.0: an explicit engine is honored strictly —
+                        # no silent LM Studio delegation behind a failed
+                        # explicit request.
                         raise last_error or MLXBarError("MODEL_INCOMPATIBLE", "モデルをロードできません", 409)
                     chosen = "lm-studio"
                     self.loading["engine"] = chosen

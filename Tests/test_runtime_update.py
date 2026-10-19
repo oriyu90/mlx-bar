@@ -71,7 +71,7 @@ class FakeWorkers:
             raise RuntimeError("health failed")
         return {"ok": True}
 
-    async def load(self, model, engine):
+    async def load(self, model, engine, explicit=None):
         self.loaded = {**model, "engine": engine}
         self.reloaded.append(engine)
         return self.loaded

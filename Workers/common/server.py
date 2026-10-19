@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 from .tool_calls import IncrementalToolStream, StopSequenceFilter
+from . import vision
 
 
 LOGGER = logging.getLogger(__name__)
@@ -254,7 +255,11 @@ class BaseAdapter:
                 "modalities": ["text"], "loaded": self.model is not None,
                 "memoryLimits": dict(self._applied_memory_limits)}
 
-    def load(self, path: str, trust_remote_code: bool = False) -> dict:
+    def load(self, path: str, trust_remote_code: bool = False,
+             allow_vlm: bool = False) -> dict:
+        # v2.10.0: `allow_vlm` is part of the worker protocol (see the load
+        # RPC below); engines that do not need the mlx-lm vision guard
+        # accept and ignore it.
         raise NotImplementedError
 
     def unload(self) -> None:
@@ -499,7 +504,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             if method == "memory":
                 return {"type": "completed", "memory": await on_mlx_thread(adapter.memory_stats)}
             if method == "load":
-                result = await on_mlx_thread(adapter.load, params.get("path"), params.get("trust_remote_code", False))
+                # v2.10.0: `allow_vlm` skips the vision guard when the caller
+                # explicitly chose mlx-lm (text-only use of a vision config
+                # is a deliberate decision, not a misclassification).
+                result = await on_mlx_thread(adapter.load, params.get("path"),
+                                             params.get("trust_remote_code", False),
+                                             bool(params.get("allow_vlm", False)))
                 return {"type": "completed", "capabilities": result}
             if method == "unload":
                 await on_mlx_thread(adapter.unload)
@@ -549,6 +559,8 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             lowered = text.lower()
             if "remote code" in lowered:
                 code, human = "MODEL_REQUIRES_REMOTE_CODE", "このモデルはリモートコードの実行が必要なため読み込めません"
+            elif vision.GUARD_TAG in text:
+                code, human = "MODEL_INCOMPATIBLE", "vision対応モデルではmlx-lmは画像を扱えないため読み込めません（mlx-vlmで読み込みます）"
             elif "out of memory" in lowered or "insufficient memory" in lowered or (
                     "metal" in lowered and "memory" in lowered):
                 code, human = "MODEL_INCOMPATIBLE", "メモリ不足のためモデルを読み込めませんでした"

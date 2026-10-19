@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 2.8.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 2.10.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -37,6 +37,9 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 既定で無効な実験的機能「アダプティブ・ハイブリッド・コンテキストメモリ」（v2.2.0）：古い会話ターンをEXACT（逐語）／LATENT（短い要約、任意でソフトトークンのHybrid Prefill）／COLD（推論から除外、元メッセージから復元）へ動的に振り分けてTTFTとKVメモリを削減。コンテキスト自動圧縮とは排他。あらゆる失敗は通常のEXACT推論へ自動フォールバック
 - GUIと同じ管理APIを利用する`mlxbarctl`
 - OMLX相当機能の設定一元管理（v2.4.0）：モデル常駐上限・同時生成ヘッドルーム・モデル別メモリ上限、プロンプトキャッシュ詳細（世代保持・メモリ比率・分岐チェックポイント・書き込み予算）、生成の入力上限・タイムアウト・メモリガード比率、API要求上限、ログレベル、前回モデル復元、LM Studio連携、RAG埋め込み調整、Adaptive Memoryフォールバックを「Settings…」と`mlxbarctl`のnamedコマンドの両方から操作。将来phase用のゲート（RAMホット層・Hybrid KV再利用）は状態表示のみで有効化手段を提供しない
+- oMLX連携（v2.9.0）：Apple Silicon向け推論サーバーoMLX（https://github.com/jundot/omlx）をモデル単位でルーティング先に追加。接続設定・モデルごとのoMLX実行トグル・oMLX使用メモリの統合メモリ管理・`mlxbarctl omlx` 各コマンド
+- oMLXセットアップ（v2.10.0）：「Settings…」→「Runtime」のoMLXカードから`brew install jundot/omlx/omlx`によるインストール、`omlx start`/`omlx stop`の実行、進捗とキャンセルを含むジョブ管理。`models.omlx.autoConnect`有効時はCoordinator起動時に自動接続
+- 明示エンジン選択（v2.10.0）：モデル一覧から「mlx-lm で読み込む」／「mlx-vlm で読み込む」を一回限り指定可能。カタログ判別v3（アーキ名トークン判定・laguna等mlx-vlm nativeテキスト系）でビジョンモデルのmlx-lm誤ロードをガードし、自動時のみロード時再導出と mlx-lm⇄mlx-vlm フォールバック、成功後にカタログ行を自己修復
 - 既定bf16の実験的KVキャッシュ量子化（v2.5.0、v2.6.0でmlx-vlmへ拡張）：mlx-lm／mlx-vlmのライブKVを8bit（ほぼ無劣化）／4bit（最大省メモリ・品質低下あり）で量子化。mlx-vlmはテキスト生成のみ、画像付きはbf16経路。Paged KVとは排他（量子化中有効時はPaged休止）、失敗時はbf16へ自動退避
 - 一括設定モード（v2.6.0）：「Settings…」→「General」で軽量（KV 8bit・メモリ上限はPCの80%・ディスク控えめ）／フル（KV bf16・ディスク少し多め）／カスタム（記録のみ、設定変更なし）を切替。ハードウェアから自動計算し、`config apply-preset`でも適用可
 - 設定の書き出し・読み込み（v2.6.0）：全設定と版数情報をJSONで書出し（APIキー類は除外）、読込時はこのPCで適用できない項目だけ理由付きで除外。`config export`／`config import`
@@ -59,7 +62,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.8.1.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-2.10.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。

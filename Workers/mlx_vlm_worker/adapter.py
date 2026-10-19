@@ -539,7 +539,12 @@ class MLXVLMAdapter(BaseAdapter):
             LOGGER.warning("Checkpoint restore failed; continuing cold: %s", exc)
             return None
 
-    def load(self, path: str, trust_remote_code: bool = False) -> dict:
+    def load(self, path: str, trust_remote_code: bool = False,
+             allow_vlm: bool = False) -> dict:
+        # v2.10.0: `allow_vlm` is accepted for protocol parity with the
+        # mlx-lm adapter (the server sends it positionally to every
+        # adapter). The vision guard is a mlx-lm-only concern: mlx-vlm IS the
+        # vision engine, so the flag is deliberately ignored here.
         if not path:
             raise ValueError("model path is required")
         self.apply_memory_limits()

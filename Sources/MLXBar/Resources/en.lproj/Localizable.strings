@@ -527,3 +527,23 @@
 "加算済み" = "Added";
 "解放までの時間を加算する秒数" = "Seconds to add to the time until unload";
 "入力した秒数だけ、このモデルの解放までの待機時間を延長します" = "Adds the entered seconds to how long this model stays loaded.";
+
+/* v2.10.0 -- explicit engine choice + oMLX setup card */
+"mlx-lm で読み込む" = "Load with mlx-lm";
+"mlx-vlm で読み込む" = "Load with mlx-vlm";
+"エンジン指定" = "Choose Engine";
+"エンジンを指定して読み込む" = "Load with an explicit engine";
+"oMLXサーバー" = "oMLX Server";
+"oMLXは外部のOpenAI互換サーバーです。ここからHomebrewでインストールし、起動・停止できます。" = "oMLX is an external OpenAI-compatible server. Install it with Homebrew here and start or stop it.";
+"oMLXの状態を確認しています…" = "Checking the oMLX state…";
+"oMLXをインストール済み" = "oMLX Installed";
+"oMLXはインストールされていません" = "oMLX is not installed";
+"Homebrewでインストール" = "Install with Homebrew";
+"oMLX — Homebrewでインストール" = "oMLX — Install with Homebrew";
+"Homebrewが見つからないため、ここからはインストールできません" = "Homebrew was not found, so oMLX cannot be installed here";
+"oMLXのリリースページを開く" = "Open the oMLX releases page";
+"サーバーを起動" = "Start Server";
+"サーバーを停止" = "Stop Server";
+"oMLX — サーバーを起動" = "oMLX — Start Server";
+"oMLX — サーバーを停止" = "oMLX — Stop Server";
+"oMLX — 処理を中止" = "oMLX — Cancel Operation";

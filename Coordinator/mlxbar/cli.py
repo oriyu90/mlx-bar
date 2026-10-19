@@ -311,6 +311,12 @@ def parser() -> argparse.ArgumentParser:
     omlx_set_enabled = omlx.add_parser("set-enabled", help="oMLX連携を有効/無効化"); omlx_set_enabled.add_argument("value", choices=["true", "false"])
     omlx_set_url = omlx.add_parser("set-url", help="oMLXサーバーURLを設定"); omlx_set_url.add_argument("url")
     omlx_set_routing = omlx.add_parser("set-routing", help="モデルのoMLXルーティングを設定"); omlx_set_routing.add_argument("model_id"); omlx_set_routing.add_argument("value", choices=["true", "false"])
+    omlx_install = omlx.add_parser("install", help="HomebrewでoMLXをインストール")
+    omlx_install.add_argument("--wait", action="store_true", help="完了まで待機する")
+    omlx_start = omlx.add_parser("start", help="oMLXサーバーを起動 (omlx start)")
+    omlx_start.add_argument("--wait", action="store_true", help="完了まで待機する")
+    omlx_stop = omlx.add_parser("stop", help="oMLXサーバーを停止 (omlx stop)")
+    omlx_stop.add_argument("--wait", action="store_true", help="完了まで待機する")
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
@@ -524,6 +530,9 @@ def execute(args, client: Client):
         if args.action == "set-routing":
             return client.request("PUT", "/api/v1/settings",
                                   {"models": {"omlx": {"modelRouting": {args.model_id: args.value == "true"}}}}).json()
+        if args.action in {"install", "start", "stop"}:
+            job = client.request("POST", f"/api/v1/omlx/setup/{args.action}").json()
+            return wait_job(client, job, args.global_json) if args.wait else job
     if args.command == "runtime":
         if args.action == "list": return client.request("GET", "/api/v1/runtimes").json()
         if args.action == "check": return client.request("POST", f"/api/v1/runtimes/{args.engine}/check").json()

@@ -15,6 +15,7 @@ from pathlib import Path
 from .catalog.scanner import scan_all
 from .database import Database
 from .jobs import JobManager
+from .omlx_setup import OMLXSetupService
 from .runtimes.slots import SlotStore
 from .runtimes.updater import RuntimeUpdater
 from .runtimes.service import RuntimeUpdateService
@@ -22,7 +23,11 @@ from .rag import RagService
 from .settings import SettingsStore
 from .workers.model_pool import ModelPoolSupervisor
 
-CATALOG_CLASSIFIER_VERSION = "2"
+# v2.10.0: bumped to "3" so every existing install rescans its catalog at
+# startup and picks up the corrected VLM classification (classifier.py).
+# Bump this together with any change to `catalog/classifier.py` decision
+# rules, or stale rows keep serving the wrong engine until a manual scan.
+CATALOG_CLASSIFIER_VERSION = "3"
 
 
 class AppState:
@@ -34,11 +39,15 @@ class AppState:
         # Knowledge base (RAG). Dormant unless `rag.enabled`; opens its own
         # SQLite file lazily on the first collection.
         self.rag = RagService(self.root, self.settings)
-        self.workers = ModelPoolSupervisor(self.root, self.settings)
+        self.workers = ModelPoolSupervisor(self.root, self.settings, self.database)
         self.slots = SlotStore(self.root)
         self.updater = RuntimeUpdater(self.slots)
         self.runtime_updates = RuntimeUpdateService(self.updater, self.slots, self.workers, self.database)
         self.runtime_update_jobs: dict[str, str] = {}
+        # oMLX server setup (v2.10.0): install/start/stop of the external
+        # server app, exposed as cancellable jobs by the Runtime page's card.
+        self.omlx_setup = OMLXSetupService()
+        self.omlx_setup_jobs: dict[str, str] = {}
         self.model_autoload_lock = asyncio.Lock()
         self.listener = None
         self.management_server = None
@@ -93,6 +102,51 @@ class AppState:
             return []
         return [self.runtime_update_job(engine) for engine in ("mlx-lm", "mlx-vlm")
                 if not self.slots.active(engine).get("active")]
+
+    def omlx_setup_job(self, action: str) -> dict:
+        """Install/start/stop the oMLX server as a cancellable job.
+
+        Same 202-plus-`/jobs/{id}` plumbing the runtime page already uses, so
+        progress, SSE events and cancel reuse existing machinery. One job per
+        action: a second submit while the same action is queued/running
+        returns the existing job instead of stacking a second brew install.
+        Different actions serialize inside the service's own lock.
+        """
+        if action not in {"install", "start", "stop"}:
+            raise ValueError("unsupported oMLX setup action")
+        existing_id = self.omlx_setup_jobs.get(action)
+        if existing_id:
+            existing = self.database.get_job(existing_id)
+            if existing and existing["state"] in {"queued", "running"}:
+                return existing
+
+        async def work(update):
+            if action == "install":
+                return await self.omlx_setup.install(update)
+            if action == "start":
+                return await self.omlx_setup.start_server(update, verify=self.omlx_connect_probe)
+            return await self.omlx_setup.stop_server(update, verify=self.omlx_connect_probe)
+
+        job = self.jobs.create(f"omlx_{action}", work)
+        self.omlx_setup_jobs[action] = job["id"]
+        return job
+
+    async def omlx_connect_probe(self):
+        """Reachability truth source for `omlx start/stop` jobs.
+
+        Returns the provider's own OMLXStatus (or None when this pool has no
+        provider to probe); its `connected` field decides whether the action
+        is confirmed. The probe never raises — the adapter folds connection
+        failures into the status object — so the start poll stays a wait, not
+        an error, no matter what the configured server URL is doing.
+        """
+        provider = getattr(self.workers, "_omlx_provider", None)
+        if provider is None:
+            return None
+        try:
+            return await provider.connect()
+        except Exception:  # noqa: BLE001 - unreachability is not job failure
+            return None
 
     async def reset_all(self) -> None:
         """Cancels all work, wipes every file this coordinator owns, and

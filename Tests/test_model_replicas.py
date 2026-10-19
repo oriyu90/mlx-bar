@@ -38,7 +38,7 @@ class ReplicaWorker:
         self.gen_release: asyncio.Event | None = None
         ReplicaWorker.instances.append(self)
 
-    async def load(self, model, engine=None):
+    async def load(self, model, engine=None, explicit=None):
         self.loaded = {**model, "engine": engine or model.get("engine"),
                        "capabilities": {"modelMaxTokens": 4096,
                                         "memoryLimits": {"set_memory_limit": self.memory_limit_bytes}}}

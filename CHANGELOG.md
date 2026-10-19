@@ -2,6 +2,60 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [2.10.0] - 2026-10-19
+
+**VLMの誤起動を防ぎ、エンジンを明示選択可能に。oMLXをMLXBar内でセットアップ。** カタログ判別をv3に強化（アーキ名トークン判定・laguna等mlx-vlm nativeテキスト系）し、mlx-lmへのビジョンモデル誤ロードをガード。モデル一覧からmlx-lm/mlx-vlmを一回限り明示指定できるようにした。設定画面のランタイムページにoMLXカードを追加し、`brew install jundot/omlx/omlx`・`omlx start`/`stop`をMLXBarから実行可能に。`models.omlx.autoConnect`を Coordinator 起動時の自動接続として実装。
+
+### 新機能
+
+- **VLM自動ガード／明示エンジン選択**
+  - カタログ分類v3（`CATALOG_CLASSIFIER_VERSION=3`）: vision key 拡張、アーキ名トークン/部分一致判定（qwen2_vl/llava/internvl/mllama/paligemma/molmo/pixtral/minicpm(v)/smolvlm/deepseek_vl/aria/ovis）、mlx-vlm native テキスト系（laguna）直接分類
+  - 自動ロード時: `detect_engine` でロード時再導出し、失敗時は mlx-lm⇄mlx-vlm に1回のみフォールバック。成功後はカタログ行を自己修復（`_refresh_catalog_classification`）
+  - 明示選択: モデル一覧の「エンジン指定」メニュー（mlx-lm で読み込む / mlx-vlm で読み込む）。再導出・フォールバック・カタログ書換なしで、選択を最優先
+  - mlx-lm アダプタ: 自動時の VLM 誤ロードを `MODEL_INCOMPATIBLE` でガード（明示時は `allow_vlm=True` で意図どおり実行）
+
+- **oMLXセットアップ（ランタイムページのoMLXカード）**
+  - `GET /omlx/setup/requirements`、`POST /omlx/setup/{install,start,stop}`（202+ジョブ）、`POST /omlx/setup/jobs/{id}/cancel`
+  - Homebrew検出（`/opt/homebrew/bin/brew` フォールバック）、`brew install jundot/omlx/omlx`（子プロセスグループ隔離・最大1時間）、`omlx start`/`stop` と設定URLへの到達待ち（最大2分）
+  - 同一アクションの重複投入はジョブ複製なし、異アクションは直列化。brew 無し環境はリリースページ案内
+  - CLI: `mlxbarctl omlx install|start|stop [--wait]`
+  - GUI: requirements表示、install/start/stopボタン、進捗・キャンセル付きジョブカード（英語UIは既知メッセージを翻訳）
+
+- **oMLX autoConnect**
+  - `models.omlx.autoConnect` を Coordinator 起動時のbest-effort自動接続（`/omlx/connect` 相当）として実装。20秒間隔最大6回、失敗はログのみで起動は妨げない
+  - `ModelPoolSupervisor.connect_omlx()` を公開中継として新設
+
+### ステータス統合（正形パネル）
+
+- `/omlx/status`・`/omlx/models` を canonical payload に統一: per-model `memoryBytes`/`pleOffload`/`available`/`providerKey`/`contextLength`、top-level `connected`/`version`/`error`/`serverUrl`/`totalMemoryBytes`
+- `POST /omlx/connect` は `{connected, version, error, serverUrl}`（旧GUIが読んでいた `success` キーは存在しない）
+- GUIは `models.omlx`（deep-merge）＋ `models.omlx.modelRouting` を正系に合わせ、routing は単一キーPATCH化、oMLX設定のモデル行は `available` で選択可否を判定
+
+### jobs.cancel の頑健化
+
+- queued / ワーカーtask未飛来の running でも必ず DB terminal 書込み・queue event・tasks/queues pop をfallbackするよう修正（Setup job cancel等が依存）
+
+### 修復した実バグ（v2.9.0由来）
+
+- mlx-vlm ワーカーへの load が全て失敗する（`allow_vlm` 未対応の TypeError）
+- `engine="auto"` が pool 経由で正規化されず「利用可能なエンジンがありません」で拒否される
+- omlx setup テストの並列検証が実質非同期だった（テスト修正）
+
+### 同梱／配布訂正
+
+- v2.9.0 のDMG実体には `2.8.1 / build 54` が入ったまま出荷されていた（packaging 更新漏れ）。本版から `2.10.0 / build 55` に是正
+
+### 後方互換性・安全性
+
+- REST/CLI/API形状・既定値・設定スキーマは不変
+- 自動フォールバック・自動再分類・autoConnect・インストールジョブはopt-in／明示操作由来のみ
+- 日本語・英語UI完全対応（新規文字列20キー追加点検・重複なし）
+- テスト: Python 721件 全通過（新設41+26件を含む）
+
+詳細は[`DESIGN_v2.10.0.md`](DESIGN_v2.10.0.md)、検証記録は[`TEST_PLAN_v2.10.0.md`](TEST_PLAN_v2.10.0.md)を参照してください。
+
+---
+
 ## [2.9.0] - 2026-10-18
 
 **oMLXを第4の推論ランタイムとして統合**。mlx-lm、mlx-vlm、LM Studioに加え、oMLX（https://github.com/jundot/omlx）をモデル単位で選択利用可能にしました。PLE SSD Offload、Lightning MTP、TurboQuant KV、ANE Prefill、MoE Expert Offload などのoMLX固有高速化機能をMLXBarから活用できます。

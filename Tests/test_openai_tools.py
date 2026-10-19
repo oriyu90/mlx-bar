@@ -431,7 +431,7 @@ class AutoLoadWorker:
         self.load_calls = 0
         self.received = None
 
-    async def load(self, model):
+    async def load(self, model, engine=None, explicit=None):
         self.load_calls += 1
         await asyncio.sleep(0.01)
         self.loaded = {**model, "state": "loaded", "capabilities": {"modelMaxTokens": 32768}}

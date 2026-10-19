@@ -24,6 +24,13 @@ struct RuntimeManagerView: View {
             } header: {
                 Label(LS("更新の設定"), systemImage: "gearshape")
             }
+            Section {
+                OMLXSetupSection(model: model)
+            } header: {
+                Label(LS("oMLXサーバー"), systemImage: "server.rack")
+            } footer: {
+                Text(LS("oMLXは外部のOpenAI互換サーバーです。ここからHomebrewでインストールし、起動・停止できます。"))
+            }
             ForEach(model.runtimes) { runtime in
                 Section {
                     runtimeSummary(runtime)
@@ -315,6 +322,197 @@ struct RuntimeManagerView: View {
         if value.contains("をダウンロード・インストール中") {
             return value.replacingOccurrences(of: "をダウンロード・インストール中", with: " — downloading and installing")
                 .replacingOccurrences(of: "秒経過", with: "s elapsed")
+        }
+        return value
+    }
+}
+
+/// oMLX external-server setup card (v2.10.0).
+///
+/// Reads `GET /omlx/setup/requirements` through the view model and drives
+/// `POST /omlx/setup/{install,start,stop}` as jobs — the same 202 + jobs
+/// plumbing the runtime cards use. Install state and the CLI probe are the
+/// server's words (`omlx_setup.py`); the card only decides what is tappable.
+private struct OMLXSetupSection: View {
+    @ObservedObject var model: MenuBarViewModel
+
+    private static let actions = ["install", "start", "stop"]
+
+    private var cli: [String: Any] { model.omlxRequirements["cli"] as? [String: Any] ?? [:] }
+    private var brew: [String: Any] { model.omlxRequirements["brew"] as? [String: Any] ?? [:] }
+    private var installed: Bool { model.omlxRequirements["installed"] as? Bool ?? false }
+    private var brewFound: Bool { brew["found"] as? Bool ?? false }
+    private var anyJobActive: Bool { model.omlxSetupJobs.values.contains { $0.isActive } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if model.omlxRequirements.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(LS("oMLXの状態を確認しています…")).foregroundStyle(.secondary)
+                }
+            } else {
+                statusRow
+                actions
+            }
+            ForEach(Self.actions, id: \.self) { action in
+                if let job = model.omlxSetupJobs[action] {
+                    omlxJobCard(action, job: job)
+                }
+            }
+        }
+        .task { await model.refreshOMLXSetupRequirements() }
+    }
+
+    @ViewBuilder
+    private var statusRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: installed ? "checkmark.circle.fill" : "circle.dashed")
+                .foregroundStyle(installed ? Color.green : .secondary)
+            if installed {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(LS("oMLXをインストール済み")).font(.headline)
+                    if let version = cli["version"] as? String, !version.isEmpty {
+                        Text(version).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Text(LS("oMLXはインストールされていません")).font(.headline)
+            }
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        if !installed {
+            if brewFound {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button(LS("Homebrewでインストール")) {
+                        Task { await model.startOMLXSetup("install") }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(anyJobActive || model.omlxBusySetupActions.contains("install"))
+                    .accessibilityLabel(LS("oMLX — Homebrewでインストール"))
+                    if let command = brew["installCommand"] as? String, !command.isEmpty {
+                        Text(command).font(.caption2).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(LS("Homebrewが見つからないため、ここからはインストールできません"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    if let releases = model.omlxRequirements["releasesUrl"] as? String,
+                       !releases.isEmpty {
+                        Link(LS("oMLXのリリースページを開く"), destination: URL(string: releases) ?? URL(string: "https://github.com/jundot/omlx/releases")!)
+                            .font(.caption)
+                    }
+                }
+            }
+        } else {
+            HStack(spacing: 10) {
+                Button(LS("サーバーを起動")) {
+                    Task { await model.startOMLXSetup("start") }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(anyJobActive)
+                .accessibilityLabel(LS("oMLX — サーバーを起動"))
+                Button(LS("サーバーを停止")) {
+                    Task { await model.startOMLXSetup("stop") }
+                }
+                .disabled(anyJobActive)
+                .accessibilityLabel(LS("oMLX — サーバーを停止"))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func omlxJobCard(_ action: String, job: RuntimeJobInfo) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                if job.isActive {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: job.isFailed ? "xmark.circle.fill"
+                          : (job.isCancelled ? "stop.circle.fill" : "checkmark.circle.fill"))
+                        .foregroundStyle(job.isFailed ? Color.red
+                                         : (job.isCancelled ? Color.orange : Color.green))
+                }
+                Text(headline(action, job: job)).font(.headline)
+                Spacer()
+                if let progress = job.progress {
+                    Text("\(Int(min(max(progress, 0), 1) * 100))%")
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            if let progress = job.progress, job.isActive {
+                ProgressView(value: min(max(progress, 0), 1))
+            }
+            Text(job.isFailed ? (job.errorMessage ?? job.message) : message(job.message))
+                .font(.caption)
+                .foregroundStyle(job.isFailed ? .red : .secondary)
+            if job.isActive {
+                Button(LS("処理を中止"), role: .destructive) {
+                    Task { await model.cancelOMLXSetup(action) }
+                }
+                .accessibilityLabel(LS("oMLX — 処理を中止"))
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func headline(_ action: String, job: RuntimeJobInfo) -> String {
+        let japanese = model.guiLanguage == "ja"
+        if !job.isActive {
+            if japanese { return job.isFailed ? "処理に失敗しました" : (job.isCancelled ? "処理を中止しました" : "処理が完了しました") }
+            return job.isFailed ? "Operation Failed" : (job.isCancelled ? "Operation Cancelled" : "Operation Completed")
+        }
+        if japanese { return job.operationName }
+        switch job.kind {
+        case "omlx_install": return "Install oMLX"
+        case "omlx_start": return "Start the oMLX server"
+        case "omlx_stop": return "Stop the oMLX server"
+        default: return job.operationName
+        }
+    }
+
+    /// The setup service reports in Japanese only; translate the recurring
+    /// lines for an English interface (same approach as `runtimeMessage`).
+    private func message(_ value: String) -> String {
+        guard model.guiLanguage != "ja" else { return value }
+        let exact = [
+            "サーバーの応答を待っています": "Waiting for the server to respond",
+            "oMLXのインストールが完了しました": "oMLX installation completed",
+            "oMLXサーバーを起動しました": "oMLX server started",
+            "oMLXサーバーを起動しました（設定したURLにはまだ到達できません）":
+                "oMLX server started (the configured URL is not reachable yet)",
+            "oMLXサーバーの停止コマンドを実行しました": "The oMLX stop command completed",
+        ]
+        if let translated = exact[value] { return translated }
+        if value.contains("をダウンロード・インストール中（") {
+            return value
+                .replacingOccurrences(of: "oMLXをダウンロード・インストール中（", with: "Downloading and installing oMLX (")
+                .replacingOccurrences(of: "秒経過）", with: "s elapsed)")
+        }
+        if value.contains("HomebrewでoMLXをインストールしています") {
+            return value.replacingOccurrences(
+                of: "HomebrewでoMLXをインストールしています", with: "Installing oMLX via Homebrew")
+        }
+        if value.contains("oMLXサーバーを起動しています") {
+            return value.replacingOccurrences(
+                of: "oMLXサーバーを起動しています", with: "Starting the oMLX server")
+        }
+        if value.contains("oMLXサーバーを停止しています") {
+            return value.replacingOccurrences(
+                of: "oMLXサーバーを停止しています", with: "Stopping the oMLX server")
+        }
+        if value.contains("omlxコマンドを実行中（") {
+            return value
+                .replacingOccurrences(of: "omlxコマンドを実行中（", with: "Running the omlx command (")
+                .replacingOccurrences(of: "秒経過）", with: "s elapsed)")
         }
         return value
     }

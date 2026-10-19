@@ -89,6 +89,27 @@ struct ModelCatalogView: View {
             HStack {
                 Text("\(filtered.count) \(LS("モデル"))").foregroundStyle(.secondary)
                 Spacer()
+                if let selected, let item = model.models.first(where: { $0.id == selected }),
+                   item.engine == "mlx-lm" || item.engine == "mlx-vlm" {
+                    // v2.10.0: explicit engine selection for this one load.
+                    // Temporary by design: the coordinator keeps no per-model
+                    // engine override, so the next auto request (API/CLI)
+                    // resolves from the catalog + load-time detection again.
+                    Menu {
+                        Button(LS("mlx-lm で読み込む")) {
+                            Task { await model.load(item, engine: "mlx-lm") }
+                        }
+                        .disabled(model.busy || model.loadingModelName != nil)
+                        Button(LS("mlx-vlm で読み込む")) {
+                            Task { await model.load(item, engine: "mlx-vlm") }
+                        }
+                        .disabled(model.busy || model.loadingModelName != nil)
+                    } label: {
+                        Label(LS("エンジン指定"), systemImage: "ellipsis.circle")
+                    }
+                    .accessibilityLabel(LS("エンジンを指定して読み込む"))
+                    .disabled(model.loadingModelName != nil)
+                }
                 Button(LS(model.loadingModelName == nil ? "ロード" : "ロード中…")) {
                     if let selected, let item = model.models.first(where: { $0.id == selected }) { Task { await model.load(item) } }
                 }.disabled(selected == nil || model.busy || model.loadingModelName != nil)

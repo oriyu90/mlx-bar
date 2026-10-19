@@ -50,6 +50,10 @@ class OMLXAdapter:
         self._status_cache: OMLXStatus | None = None
         self._cache_at: float = 0.0
         self._cache_ttl = 5.0  # 5 second cache for status
+        # v2.10.0: connection identity so a changed URL/token in settings
+        # rebuilds the client instead of living with the old one until the
+        # coordinator restarts.
+        self._identity = (self.server_url, self.api_key)
 
     def _get_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -72,7 +76,13 @@ class OMLXAdapter:
             self._client = None
 
     async def test_connection(self) -> OMLXStatus:
-        """Test connection to oMLX server and return status."""
+        """Test connection to oMLX server and return status.
+
+        v2.10.0: the health fetch also attaches the model list and the total
+        memory so `/omlx/status`, the oMLX tab's routing list and the
+        memory-budget charging actually work (v2.9.0 always returned zero
+        models / 0 bytes here because the status came from the probe alone).
+        A failed model fetch never fails the connection itself."""
         client = await self._get_client()
         try:
             # Try admin API first for version info
@@ -118,6 +128,11 @@ class OMLXAdapter:
                 error=f"Unexpected error: {exc}",
                 server_url=self.server_url,
             )
+        if status.connected:
+            # Model fetch failure never fails the connection itself.
+            with contextlib.suppress(Exception):
+                status.models = await self.list_models()
+                status.total_memory_bytes = sum(m.memory_bytes for m in status.models)
         self._status_cache = status
         self._cache_at = time.monotonic()
         return status
@@ -336,29 +351,78 @@ class OMLXProvider:
         self._lock = asyncio.Lock()
         self._cached_status: dict[str, Any] = {"connected": False, "models": [], "totalMemoryBytes": 0}
         self._status_update_task: asyncio.Task | None = None
+        self._pending_closes: list[asyncio.Task] = []
 
     def _get_omlx_config(self) -> dict[str, Any]:
         return self.settings.data.get("models", {}).get("omlx", {})
 
     def _is_model_routed_to_omlx(self, model_id: str) -> bool:
         routing = self._get_omlx_config().get("modelRouting", {})
-        return routing.get(model_id, False)
+        return isinstance(routing, dict) and bool(routing.get(model_id, False))
+
+    def _connection_credentials(self) -> tuple[str, str | None]:
+        config = self._get_omlx_config()
+        server_url = str(config.get("serverUrl", "http://127.0.0.1:8000") or "http://127.0.0.1:8000")
+        api_key = config.get("apiKey")
+        # Token lives in a separate 0600 file; prefer the dedicated token
+        # source and always re-read it so a token update is live immediately.
+        token = None
+        if hasattr(self.settings, "omlx_token"):
+            token = self.settings.omlx_token
+        if not token and isinstance(api_key, str):
+            token = api_key
+        return server_url, token
 
     def _ensure_adapter(self) -> OMLXAdapter:
-        if self.adapter is None:
-            config = self._get_omlx_config()
-            server_url = config.get("serverUrl", "http://127.0.0.1:8000")
-            api_key = config.get("apiKey")
-            # Also check for token file
-            if not api_key and hasattr(self.settings, "omlx_token"):
-                api_key = self.settings.omlx_token
-            self.adapter = OMLXAdapter(server_url, api_key)
+        # v2.10.0: re-derive the adapter from the *current* settings every
+        # time, and rebuild it when the URL or token changed. v2.9.0 latched
+        # the first server URL forever, so changing it in the settings UI
+        # never took effect until the coordinator restarted.
+        server_url, token = self._connection_credentials()
+        identity = (server_url, token)
+        adapter = self.adapter
+        if adapter is not None and adapter._identity == identity:
+            return adapter
+        if adapter is not None:
+            # Retire the old client in the background so switching URLs never
+            # blocks the caller; the list is bounded so a churn of edits
+            # cannot accumulate tasks forever.
+            old = adapter
+
+            async def _retire() -> None:
+                with contextlib.suppress(Exception):
+                    await old.close()
+
+            self._pending_closes.append(asyncio.create_task(_retire()))
+            self._pending_closes = self._pending_closes[-8:]
+        self.adapter = OMLXAdapter(server_url, token)
         return self.adapter
 
     async def connect(self) -> OMLXStatus:
         """Test and establish connection to oMLX."""
         adapter = self._ensure_adapter()
         return await adapter.test_connection()
+
+    def _model_payload(self, m: OMLXModelInfo) -> dict[str, Any]:
+        """v2.10.0: one canonical dict shape for status()/list_models().
+
+        Field names the GUI actually reads: `memoryBytes`/`pleOffload` (the
+        v2.9.0 GUI decoders expected `memoryGB`/`pleOffloadEnabled`, which the
+        server never emitted, so memory/PLE rows never rendered). `available`
+        is the routing-toggle gate: models surfaced by the oMLX server are
+        available there; a catalog-only model is not."""
+        return {
+            "id": m.id,
+            "name": m.name,
+            "loaded": m.loaded,
+            "memoryBytes": m.memory_bytes,
+            "contextLength": m.context_length,
+            "mtpEnabled": m.mtp_enabled,
+            "pleOffload": m.ple_offload,
+            "engine": m.engine,
+            "providerKey": m.provider_key,
+            "available": True,
+        }
 
     async def status(self) -> dict[str, Any]:
         """Get comprehensive oMLX status."""
@@ -369,19 +433,7 @@ class OMLXProvider:
             "version": status.version,
             "error": status.error,
             "serverUrl": status.server_url,
-            "models": [
-                {
-                    "id": m.id,
-                    "name": m.name,
-                    "loaded": m.loaded,
-                    "memoryBytes": m.memory_bytes,
-                    "contextLength": m.context_length,
-                    "mtpEnabled": m.mtp_enabled,
-                    "pleOffload": m.ple_offload,
-                    "engine": m.engine,
-                }
-                for m in status.models
-            ],
+            "models": [self._model_payload(m) for m in status.models],
             "totalMemoryBytes": status.total_memory_bytes,
         }
 
@@ -389,20 +441,7 @@ class OMLXProvider:
         """List all oMLX models."""
         adapter = self._ensure_adapter()
         models = await adapter.list_models()
-        return [
-            {
-                "id": m.id,
-                "name": m.name,
-                "loaded": m.loaded,
-                "memoryBytes": m.memory_bytes,
-                "contextLength": m.context_length,
-                "mtpEnabled": m.mtp_enabled,
-                "pleOffload": m.ple_offload,
-                "engine": m.engine,
-                "providerKey": m.provider_key,
-            }
-            for m in models
-        ]
+        return [self._model_payload(m) for m in models]
 
     async def load(self, model: dict[str, Any], engine: str | None = None) -> dict[str, Any]:
         """Load a model via oMLX."""
@@ -419,12 +458,21 @@ class OMLXProvider:
         adapter = self._ensure_adapter()
         result = await adapter.load_model(model_id)
 
+        # Report the model's real context window when the oMLX status carries
+        # it; fall back to the catalog guess otherwise.
+        model_max_tokens = 0
+        with contextlib.suppress(Exception):
+            for info in (await adapter.get_status()).models:
+                if info.id == model_id and info.context_length:
+                    model_max_tokens = int(info.context_length)
+                    break
+
         loaded_info = {
             **model,
             "engine": "omlx",
             "state": "loaded",
             "capabilities": {
-                "modelMaxTokens": model.get("context_length", 32768),
+                "modelMaxTokens": model_max_tokens or model.get("context_length", 32768),
                 "toolCalling": True,
                 "streaming": True,
             },
@@ -488,6 +536,9 @@ class OMLXProvider:
             self._status_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._status_update_task
+        while self._pending_closes:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._pending_closes.pop(0)
         if self.adapter:
             await self.adapter.close()
             self.adapter = None
@@ -519,19 +570,7 @@ class OMLXProvider:
                 "version": status.version,
                 "error": status.error,
                 "serverUrl": status.server_url,
-                "models": [
-                    {
-                        "id": m.id,
-                        "name": m.name,
-                        "loaded": m.loaded,
-                        "memoryBytes": m.memory_bytes,
-                        "contextLength": m.context_length,
-                        "mtpEnabled": m.mtp_enabled,
-                        "pleOffload": m.ple_offload,
-                        "engine": m.engine,
-                    }
-                    for m in status.models
-                ],
+                "models": [self._model_payload(m) for m in status.models],
                 "totalMemoryBytes": status.total_memory_bytes,
             }
         except Exception:

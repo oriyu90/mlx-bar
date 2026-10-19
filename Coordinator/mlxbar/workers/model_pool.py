@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..catalog.classifier import classify as _classify_catalog_model
 from ..errors import MLXBarError
 from .supervisor import QueuedRequest, WorkerSupervisor as SingleWorkerSupervisor
 from .omlx_adapter import OMLXProvider
@@ -92,9 +93,12 @@ class ModelPoolSupervisor:
     protocols.
     """
 
-    def __init__(self, root: Path, settings):
+    def __init__(self, root: Path, settings, database=None):
         self.root = root
         self.settings = settings
+        # v2.10.0: the catalog database, used to self-heal a stale engine
+        # classification after a successful auto load. Optional for tests.
+        self.database = database
         self._legacy = SingleWorkerSupervisor(root, settings)
         self._slots: dict[str, PoolSlot] = {}
         self._primary_model_id: str | None = None
@@ -247,11 +251,54 @@ class ModelPoolSupervisor:
     def _is_omlx_model(self, model_id: str) -> bool:
         """Check if a model is routed to oMLX."""
         routing = self.settings.data.get("models", {}).get("omlx", {}).get("modelRouting", {})
-        return bool(routing.get(model_id, False))
+        return isinstance(routing, dict) and bool(routing.get(model_id, False))
+
+    def _refresh_catalog_classification(self, model: dict, loaded: dict) -> None:
+        """Self-heal a stale catalog row after a successful auto load (v2.10.0).
+
+        The load chain resolved a different engine than the catalog row was
+        scanned with; rewrite that row (`format`/`modalities` from the current
+        classifier, `engine` from the load result) so the GUI and the next
+        request stop replaying the wrong engine. Best-effort: any failure is
+        logged and never surfaces to the caller, and the next scan overwrites
+        the row anyway. Never called for explicit engine choices — a one-off
+        override must not rewrite the catalog."""
+        if not self.database or not model.get("id"):
+            return
+        try:
+            classification = _classify_catalog_model(Path(str(model.get("path"))))
+            self.database.update_model_classification(
+                str(model["id"]),
+                format=classification["format"],
+                engine=str(loaded.get("engine")),
+                modalities=classification["modalities"],
+                confidence=min(classification["confidence"], 0.7),
+                reason=f"ロード時の自動再検出: {classification['reason']}",
+            )
+            LOGGER.info("Catalog row %s re-classified: engine %s -> %s",
+                        model["id"], model.get("engine"), loaded.get("engine"))
+        except Exception:  # noqa: BLE001 - the load already succeeded
+            LOGGER.exception("Catalog re-classification failed for %s", model.get("id"))
 
     def _omlx_enabled(self) -> bool:
         """Check if oMLX integration is enabled."""
         return bool(self.settings.data.get("models", {}).get("omlx", {}).get("enabled", False))
+
+    async def connect_omlx(self):
+        """Attempt to connect to the oMLX server (v2.10.0).
+
+        Public relay for `serve()`'s auto-connect task and anything else that
+        needs the provider's own connect() without reaching into a private
+        attribute. Returns the provider's OMLXStatus (never raises for a
+        failed connection — the adapter folds errors into the status), or
+        raises `MLXBarError(OMLX_NOT_AVAILABLE)` when this pool has no oMLX
+        provider (e.g. non-pool tests constructing a different workers type).
+        """
+        provider = getattr(self, "_omlx_provider", None)
+        if provider is None:
+            raise MLXBarError(
+                "OMLX_NOT_AVAILABLE", "oMLXプロバイダーが初期化されていません", 409, False)
+        return await provider.connect()
 
     def _get_omlx_memory_usage_cached(self) -> int:
         """Get total memory used by oMLX models from cached status (synchronous)."""
@@ -564,6 +611,12 @@ class ModelPoolSupervisor:
         model_id = str(model.get("id", ""))
         if not model_id:
             raise MLXBarError("MODEL_INCOMPATIBLE", "モデルIDがありません", 409)
+        # v2.10.0: engine == None (or "auto") is the auto path — the catalog
+        # engine may be re-derived at load time and may fall back across the
+        # native engine boundary. Anything else is an explicit choice
+        # (management body engine / CLI --engine / a resolved replica value)
+        # and is honored strictly.
+        explicit = bool(engine and engine != "auto")
         chosen = engine or model.get("engine")
         if chosen in self.maintenance_engines:
             raise MLXBarError("ENGINE_BUSY", "ランタイム切替中です", 409, True)
@@ -606,7 +659,8 @@ class ModelPoolSupervisor:
         result: dict | None = None
         for replica_index in range(desired):
             try:
-                result = await self._load_replica(model, engine, model_id, replica_index, pin=pin)
+                result = await self._load_replica(model, engine, model_id, replica_index,
+                                                  pin=pin, explicit=explicit)
             except MLXBarError as exc:
                 if replica_index == 0 or result is None:
                     raise
@@ -630,9 +684,16 @@ class ModelPoolSupervisor:
         return result
 
     async def _load_replica(self, model: dict, engine: str | None, model_id: str,
-                            replica_index: int, *, pin: bool) -> dict:
+                            replica_index: int, *, pin: bool,
+                            explicit: bool | None = None) -> dict:
         """Ensure one copy (replica) of ``model`` is resident. Singleflight per
-        replica; replica 0 is byte-identical to the pre-v1.8.0 single slot."""
+        replica; replica 0 is byte-identical to the pre-v1.8.0 single slot.
+
+        `explicit` mirrors the pool-level distinction (v2.10.0): None derives
+        it from `engine`, and only auto loads (engine None/"auto") may
+        self-heal a stale catalog classification after a successful load."""
+        if explicit is None:
+            explicit = bool(engine and engine != "auto")
         slot_key = self._slot_key(model_id, replica_index)
         async with self._pool_lock:
             existing = self._slots.get(slot_key)
@@ -701,7 +762,10 @@ class ModelPoolSupervisor:
             for victim in victims:
                 await self._evict_slot(victim)
             try:
-                result = await existing.worker.load(model, engine)
+                result = await existing.worker.load(model, engine, explicit=explicit)
+                if (not explicit and str(result.get("engine", "")) in {"mlx-lm", "mlx-vlm"}
+                        and str(model.get("engine", "")) != str(result.get("engine", ""))):
+                    self._refresh_catalog_classification(model, result)
                 applied_limit = ((result.get("capabilities") or result).get("memoryLimits") or {}).get(
                     "set_memory_limit")
                 if applied_limit != existing.worker.memory_limit_bytes:
@@ -1915,8 +1979,11 @@ class ModelPoolSupervisor:
             model = dict(base.model)
             for index in (i for i in range(desired) if i not in present):
                 try:
+                    # v2.10.0: background restore is not an explicit user
+                    # choice — keep the auto semantics (re-derive + candidate
+                    # chain) so a stale profile engine still self-heals.
                     await self._load_replica(model, model.get("engine"), model_id, index,
-                                             pin=base.session_pinned)
+                                             pin=base.session_pinned, explicit=False)
                 except MLXBarError as exc:
                     self._replica_admission_failures[model_id] = {
                         "desired": desired,

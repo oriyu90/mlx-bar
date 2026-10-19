@@ -544,6 +544,52 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     return asyncio.create_task(work())
 
 
+def _omlx_auto_connect_task(state: AppState) -> "asyncio.Task | None":
+    """Best-effort oMLX connection at startup (v2.10.0).
+
+    `models.omlx.autoConnect` shipped in v2.9.0 but nothing consumed it, so a
+    restart left routed models answering from a provider whose cached status
+    still said "not connected" until a user opened the oMLX settings page and
+    pressed 接続テスト. This task performs the same `provider.connect()` the
+    `/omlx/connect` endpoint uses, once, shortly after the management API is
+    serving. The server may itself still be coming up (both apps are launchd
+    agents), so it retries a few times; a server that never answers is logged
+    honestly and abandoned — the status refresh loop and any later
+    `/omlx/connect` request keep the contract alive without this task.
+    """
+    omlx = state.settings.data.get("models", {}).get("omlx", {}) or {}
+    if not (omlx.get("autoConnect") and omlx.get("enabled", False)):
+        return None
+    if getattr(state.workers, "_omlx_provider", None) is None:
+        return None
+
+    async def work() -> None:
+        log = logging.getLogger(__name__)
+        for attempt in range(6):
+            if attempt:
+                await asyncio.sleep(20)
+            try:
+                status = await state.workers.connect_omlx()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - convenience, never fatal
+                log.warning("oMLX auto-connect failed (attempt %s): %s", attempt + 1, exc)
+                return
+            if isinstance(status, dict):
+                connected, error, server_url = (status.get("connected"), status.get("error"),
+                                                status.get("serverUrl"))
+            else:
+                connected, error = status.connected, status.error
+                server_url = status.server_url
+            if connected:
+                log.info("oMLX auto-connect reached %s", server_url or "the configured server")
+                return
+            log.info("oMLX auto-connect: server not reachable yet (attempt %s: %s)",
+                     attempt + 1, error)
+
+    return asyncio.create_task(work())
+
+
 async def _runtime_auto_check_loop(state: AppState) -> None:
     """Honour `runtimes.*.autoCheck` / `runtimes.checkIntervalHours` (v2.8.1).
 
@@ -609,6 +655,7 @@ async def serve(root: Path | None = None) -> None:
     state.management_server = management
     management_task = asyncio.create_task(management.serve())
     auto_check_task = asyncio.create_task(_runtime_auto_check_loop(state))
+    omlx_connect_task = _omlx_auto_connect_task(state)
     # Started only after the management API is serving, for the same reason the
     # runtime install is: a long synchronous step before the socket is live is a
     # window in which a client can reach half-built state. Loading a 27B model
@@ -635,6 +682,10 @@ async def serve(root: Path | None = None) -> None:
         auto_check_task.cancel()
         with contextlib.suppress(BaseException):
             await asyncio.wait_for(asyncio.shield(auto_check_task), timeout=5)
+        if omlx_connect_task is not None:
+            omlx_connect_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(omlx_connect_task), timeout=5)
         # A runtime install (e.g. the automatic first-launch install above)
         # spawns `uv` in its own session so it can be killed by process
         # group; left alone, it survives this coordinator as an orphan still

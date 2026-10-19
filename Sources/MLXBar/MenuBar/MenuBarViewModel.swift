@@ -170,7 +170,12 @@ struct ResidentModel: Identifiable, Hashable {
     }
 }
 
-/// Model entry from oMLX with routing state
+/// Model entry from oMLX with routing state.
+///
+/// v2.10.0 decodes the canonical per-model payload (`memoryBytes`, `pleOffload`,
+/// `available`) that `omlx_adapter._model_payload` emits; the v2.9.0 decoder
+/// looked for `memoryGB`/`pleOffloadEnabled`, which the server never emitted,
+/// so the memory and PLE rows never rendered.
 struct OMLXModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -180,6 +185,8 @@ struct OMLXModel: Identifiable, Hashable {
     let generationTPS: Double?
     let mtpEnabled: Bool?
     let pleOffloadEnabled: Bool?
+    /// Whether the oMLX server actually serves this model (routing-gate).
+    let available: Bool
     var useOMLX: Bool
 
     init?(_ value: [String: Any], useOMLX: Bool = false) {
@@ -188,10 +195,16 @@ struct OMLXModel: Identifiable, Hashable {
         self.name = value["name"] as? String ?? id
         self.engine = value["engine"] as? String
         self.loaded = value["loaded"] as? Bool ?? false
-        self.memoryGB = (value["memoryGB"] as? NSNumber)?.doubleValue
+        if let bytes = value["memoryBytes"] as? NSNumber {
+            memoryGB = bytes.doubleValue / (1024 * 1024 * 1024)
+        } else {
+            // Older coordinator payloads used the memoryGB shortcut.
+            memoryGB = (value["memoryGB"] as? NSNumber)?.doubleValue
+        }
         self.generationTPS = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         self.mtpEnabled = value["mtpEnabled"] as? Bool
-        self.pleOffloadEnabled = value["pleOffloadEnabled"] as? Bool
+        self.pleOffloadEnabled = value["pleOffload"] as? Bool ?? (value["pleOffloadEnabled"] as? Bool)
+        self.available = value["available"] as? Bool ?? true
         self.useOMLX = useOMLX
     }
 
@@ -205,6 +218,7 @@ struct OMLXModel: Identifiable, Hashable {
         self.generationTPS = generationTPS
         self.mtpEnabled = mtpEnabled
         self.pleOffloadEnabled = pleOffloadEnabled
+        self.available = true
         self.useOMLX = useOMLX
     }
 }
@@ -267,7 +281,16 @@ struct RuntimeJobInfo {
     var isActive: Bool { state == "queued" || state == "running" }
     var isFailed: Bool { state == "failed" }
     var isCancelled: Bool { state == "cancelled" }
-    var operationName: String { kind.hasPrefix("runtime_stage:") ? "ランタイムをダウンロード・検証" : "ランタイムを更新" }
+    /// Japanese headline shown while the job runs; the views render their own
+    /// English for the same `kind` (see `runtimeJobCard` / `omlxJobCard`).
+    var operationName: String {
+        switch kind {
+        case "omlx_install": return "oMLXをインストール"
+        case "omlx_start": return "oMLXサーバーを起動"
+        case "omlx_stop": return "oMLXサーバーを停止"
+        default: return kind.hasPrefix("runtime_stage:") ? "ランタイムをダウンロード・検証" : "ランタイムを更新"
+        }
+    }
 }
 
 struct RagCollectionInfo: Identifiable, Hashable {
@@ -438,6 +461,12 @@ final class MenuBarViewModel: ObservableObject {
     @Published var omlxError: String?
     @Published var omlxModels: [OMLXModel] = []
     @Published var omlxConnectionTestInProgress = false
+    // oMLX setup (v2.10.0): the Runtime page's card drives install/start/stop.
+    @Published var omlxRequirements: [String: Any] = [:]
+    /// Live job per setup action ("install" / "start" / "stop").
+    @Published var omlxSetupJobs: [String: RuntimeJobInfo] = [:]
+    /// Actions with a job in flight right now (button disabling).
+    @Published var omlxBusySetupActions: Set<String> = []
     private let client = CoordinatorClient()
     private let cancellationClient = CoordinatorClient()
     private var polling: Task<Void, Never>?
@@ -446,6 +475,7 @@ final class MenuBarViewModel: ObservableObject {
     private var requestedCancellations: Set<String> = []
     private var localLoadInProgress = false
     private var monitoredRuntimeJobIDs: Set<String> = []
+    private var monitoredOMLXSetupJobIDs: Set<String> = []
 
     private func ui(_ english: String, _ japanese: String) -> String {
         guiLanguage == "ja" ? japanese : english
@@ -781,7 +811,9 @@ final class MenuBarViewModel: ObservableObject {
     func refreshOMLXSettings() async {
         do {
             let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
-            if let omlx = settings["omlx"] as? [String: Any] {
+            // v2.10.0 canonical location: `models.omlx` (the flat `omlx`
+            // section the v2.9.0 GUI read is gone server-side).
+            if let omlx = (settings["models"] as? [String: Any])?["omlx"] as? [String: Any] {
                 omlxEnabled = omlx["enabled"] as? Bool ?? false
                 omlxServerUrl = omlx["serverUrl"] as? String ?? "http://127.0.0.1:8000"
             }
@@ -793,41 +825,49 @@ final class MenuBarViewModel: ObservableObject {
         do {
             guard let json = try await self.json("GET", "/api/v1/omlx/status") as? [String: Any] else {
                 omlxStatus = "error"
-                omlxError = "No response from oMLX"
+                omlxError = ui("No response from the oMLX server.", "oMLXサーバーから応答がありません")
                 return
             }
+            // Canonical top-level payload (v2.10.0): connected / version /
+            // error / serverUrl. Echo the server's URL back so a bind the
+            // provider corrected stays visible in the settings field.
+            if let url = json["serverUrl"] as? String, !url.isEmpty { omlxServerUrl = url }
             omlxVersion = json["version"] as? String ?? ""
             omlxError = json["error"] as? String
+            let connected = json["connected"] as? Bool ?? false
             let modelsData = (json["models"] as? [[String: Any]]) ?? []
-            // Get current routing config from settings
+            // Routing lives in `models.omlx.modelRouting` (v2.10.0); the
+            // v2.9.0 GUI read a flat `omlx.routing` the server never wrote.
             let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
-            let routing = (settings["omlx"] as? [String: Any])?["routing"] as? [String: Bool] ?? [:]
-
+            let routing = (((settings["models"] as? [String: Any])?["omlx"] as? [String: Any])?["modelRouting"] as? [String: Any]) ?? [:]
             omlxModels = modelsData.compactMap { model in
-                guard var m = OMLXModel(model, useOMLX: routing[model["id"] as? String ?? ""] ?? false) else { return nil }
-                // Override useOMLX if model is not available on oMLX
-                if let available = model["available"] as? Bool, !available {
-                    m = OMLXModel(id: m.id, name: m.name, engine: m.engine, loaded: m.loaded,
-                                  memoryGB: m.memoryGB, generationTPS: m.generationTPS,
-                                  mtpEnabled: m.mtpEnabled, pleOffloadEnabled: m.pleOffloadEnabled,
-                                  useOMLX: false)
-                }
+                guard var m = OMLXModel(model) else { return nil }
+                // A model the oMLX server cannot serve is never routed, even
+                // if the settings key still says so.
+                m.useOMLX = ((routing[m.id] as? Bool) ?? false) && m.available
                 return m
             }
-            if omlxError != nil {
-                omlxStatus = "error"
-            } else {
-                omlxStatus = "connected"
-            }
+            resolveOMLXStatus(connected: connected)
         } catch {
             omlxStatus = "error"
             omlxError = presentError(error)
         }
     }
 
+    private func resolveOMLXStatus(connected: Bool) {
+        if omlxError != nil, omlxError?.isEmpty == false {
+            omlxStatus = "error"
+        } else if connected {
+            omlxStatus = "connected"
+        } else {
+            omlxStatus = "disconnected"
+        }
+    }
+
     func setOMLXEnabled(_ enabled: Bool) async {
         await perform {
-            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": ["enabled": enabled]])
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    ["models": ["omlx": ["enabled": enabled]]])
             await self.refreshOMLXSettings()
             if enabled { await self.refreshOMLXStatus() }
         }
@@ -841,7 +881,8 @@ final class MenuBarViewModel: ObservableObject {
             return
         }
         await perform {
-            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": ["serverUrl": trimmed]])
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    ["models": ["omlx": ["serverUrl": trimmed]]])
             await self.refreshOMLXSettings()
             await self.refreshOMLXStatus()
         }
@@ -860,8 +901,11 @@ final class MenuBarViewModel: ObservableObject {
         omlxStatus = "connecting"
         defer { omlxConnectionTestInProgress = false }
         do {
+            // `/omlx/connect` returns {connected, version, error, serverUrl};
+            // there is no `success` key (v2.10.0 canonical payload).
             let result = try await json("POST", "/api/v1/omlx/connect") as? [String: Any] ?? [:]
-            if result["success"] as? Bool == true {
+            if let version = result["version"] as? String, !version.isEmpty { omlxVersion = version }
+            if result["connected"] as? Bool == true {
                 omlxStatus = "connected"
                 await refreshOMLXStatus()
             } else {
@@ -876,12 +920,11 @@ final class MenuBarViewModel: ObservableObject {
 
     func setOMLXModelRouting(modelId: String, useOMLX: Bool) async {
         await perform {
-            let settings = try await self.json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
-            var omlx = (settings["omlx"] as? [String: Any]) ?? [:]
-            var routing = (omlx["routing"] as? [String: Bool]) ?? [:]
-            routing[modelId] = useOMLX
-            omlx["routing"] = routing
-            _ = try await self.json("PUT", "/api/v1/settings", ["omlx": omlx])
+            // The server deep-merges nested objects, so a single-key routing
+            // patch is enough — v2.9.0 re-sent the whole routing map, which
+            // dropped concurrent edits made elsewhere.
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    ["models": ["omlx": ["modelRouting": [modelId: useOMLX]]]])
             await self.refreshOMLXSettings()
             await self.refreshOMLXStatus()
         }
@@ -905,6 +948,68 @@ final class MenuBarViewModel: ObservableObject {
         do {
             if let token = try await json("GET", "/api/v1/settings/omlx-token") as? [String: Any] {
                 omlxApiKey = token["token"] as? String ?? ""
+            }
+        } catch { errorMessage = presentError(error) }
+    }
+
+    // MARK: - oMLX setup (v2.10.0) — install / start / stop from the Runtime page
+
+    func refreshOMLXSetupRequirements() async {
+        do {
+            omlxRequirements = try await json("GET", "/api/v1/omlx/setup/requirements") as? [String: Any] ?? [:]
+        } catch { errorMessage = presentError(error) }
+    }
+
+    func startOMLXSetup(_ action: String) async {
+        guard ["install", "start", "stop"].contains(action),
+              !omlxBusySetupActions.contains(action) else { return }
+        omlxBusySetupActions.insert(action)
+        defer { omlxBusySetupActions.remove(action) }
+        do {
+            guard let job = try await json("POST", "/api/v1/omlx/setup/\(action)") as? [String: Any],
+                  let info = RuntimeJobInfo(job) else { return }
+            omlxSetupJobs[action] = info
+            guard info.isActive else {
+                await refreshOMLXSetupRequirements()
+                await refreshOMLXStatus()
+                return
+            }
+            await monitorOMLXSetupJob(action, initial: job)
+        } catch {
+            errorMessage = presentError(error)
+            await refreshOMLXSetupRequirements()
+        }
+    }
+
+    /// Follows a setup job to its terminal state with the shared `waitForJob`
+    /// poller, then re-probes requirements and server reachability — an
+    /// install may have produced an `omlx` CLI, a start may have made the
+    /// server answer.
+    private func monitorOMLXSetupJob(_ action: String, initial: [String: Any]) async {
+        guard let id = initial["id"] as? String else { return }
+        defer {
+            monitoredOMLXSetupJobIDs.remove(id)
+            omlxBusySetupActions.remove(action)
+        }
+        do {
+            let completed = try await waitForJob(initial) { state in
+                if let info = RuntimeJobInfo(state) { self.omlxSetupJobs[action] = info }
+            }
+            if let info = RuntimeJobInfo(completed) { omlxSetupJobs[action] = info }
+        } catch {
+            errorMessage = presentError(error)
+        }
+        await refreshOMLXSetupRequirements()
+        await refreshOMLXStatus()
+    }
+
+    func cancelOMLXSetup(_ action: String) async {
+        guard let job = omlxSetupJobs[action], job.isActive else { return }
+        do {
+            if let value = try await json("POST",
+                                          "/api/v1/omlx/setup/jobs/\(pathComponent(job.id))/cancel") as? [String: Any],
+               let info = RuntimeJobInfo(value) {
+                omlxSetupJobs[action] = info
             }
         } catch { errorMessage = presentError(error) }
     }

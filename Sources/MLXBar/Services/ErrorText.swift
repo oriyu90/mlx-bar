@@ -124,6 +124,52 @@ enum CoordinatorErrorText {
         "JOB_WAIT_TIMEOUT": (
             "ジョブが30分以内に終了しませんでした",
             "The job did not finish within 30 minutes."),
+        // v2.10.0: oMLX runtime (setup + routing + model load/unload).
+        "OMLX_NOT_AVAILABLE": (
+            "oMLXプロバイダーが初期化されていません。MLXBarを再起動してください",
+            "The oMLX provider is not initialized. Restart MLXBar."),
+        "OMLX_CONNECTION_FAILED": (
+            "oMLXサーバーに接続できませんでした。サーバーの起動とURL設定を確認してください",
+            "Could not reach the oMLX server. Check that it is running and the URL is right."),
+        "OMLX_LIST_FAILED": (
+            "oMLXのモデル一覧を取得できませんでした",
+            "Could not list the oMLX models."),
+        "OMLX_LOAD_FAILED": (
+            "oMLXでのモデルロードに失敗しました",
+            "Loading the model on oMLX failed."),
+        "OMLX_UNLOAD_FAILED": (
+            "oMLXでのモデルアンロードに失敗しました",
+            "Unloading the model from oMLX failed."),
+        "OMLX_LOAD_TIMEOUT": (
+            "oMLXでのモデルロードが時間内に完了しませんでした",
+            "Loading the model on oMLX timed out."),
+        "OMLX_UNLOAD_TIMEOUT": (
+            "oMLXでのモデルアンロードが時間内に完了しませんでした",
+            "Unloading the model from oMLX timed out."),
+        "OMLX_TIMEOUT": (
+            "oMLXへの要求が時間内に完了しませんでした",
+            "The request to oMLX timed out."),
+        "OMLX_REQUEST_FAILED": (
+            "oMLXへの要求が失敗しました",
+            "The request to oMLX failed."),
+        "OMLX_ERROR": (
+            "oMLXがエラーを返しました",
+            "oMLX returned an error."),
+        "OMLX_BREW_NOT_FOUND": (
+            "Homebrewが見つかりません。https://github.com/jundot/omlx/releases から手動でインストールできます",
+            "Homebrew was not found. Install oMLX manually from https://github.com/jundot/omlx/releases."),
+        "OMLX_INSTALL_FAILED": (
+            "Homebrewの処理は完了しましたが、omlxコマンドが見つかりません。ターミナルで omlx --version を確認してください",
+            "Homebrew finished, but the omlx command was not found. Run omlx --version in Terminal to check."),
+        "OMLX_NOT_INSTALLED": (
+            "omlxコマンドが見つかりません。先にoMLXをインストールしてください",
+            "The omlx command was not found. Install oMLX first."),
+        "OMLX_COMMAND_TIMEOUT": (
+            "oMLXのコマンドが時間内に完了しなかったため中止しました",
+            "The oMLX command did not finish within its time limit and was stopped."),
+        "OMLX_COMMAND_FAILED": (
+            "oMLXのコマンドが失敗しました",
+            "The oMLX command failed."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

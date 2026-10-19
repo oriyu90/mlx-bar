@@ -17,6 +17,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 LOGGER = logging.getLogger(__name__)
 
 from common import cache_state
+from common import vision
 from common.server import BaseAdapter, run
 from common.tool_calls import normalize_tool_call_messages, parse_tool_markup, tool_template_kwargs_attempts
 
@@ -136,9 +137,21 @@ class MLXLMAdapter(BaseAdapter):
         return {"kv_bits": self.kv_bits, "kv_group_size": self.kv_group_size,
                 "quantized_kv_start": self.kv_start}
 
-    def load(self, path: str, trust_remote_code: bool = False) -> dict:
+    def load(self, path: str, trust_remote_code: bool = False, allow_vlm: bool = False) -> dict:
         if not path:
             raise ValueError("model path is required")
+        # v2.10.0 vision guard: a model the coordinator (or the operator)
+        # did NOT explicitly pin to mlx-lm must never be text-served here if
+        # it is a vision-language model — its image inputs would be dropped
+        # end to end. Raise a tagged error the server classifies so the
+        # coordinator Candidate chain can retry with mlx-vlm. An explicit
+        # user engine choice passes `allow_vlm=True` and keeps working.
+        if not allow_vlm and vision.looks_like_vlm(path):
+            raise RuntimeError(
+                f"{vision.GUARD_TAG}: vision-language model config detected; "
+                "mlx-lm cannot serve image inputs for this model. Load it with "
+                "the mlx-vlm engine, or pass allow_vlm=true for an explicit "
+                "text-only selection.")
         # The allocator ceiling has to exist before the runtime starts creating
         # arrays. Applying it only after load cannot contain a cold-load peak.
         self.apply_memory_limits()

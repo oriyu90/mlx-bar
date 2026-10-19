@@ -652,6 +652,40 @@ async def omlx_unload_model(model_id: str, request: Request, force: bool = False
         raise HTTPException(503, detail={"code": "OMLX_UNLOAD_FAILED", "message": str(exc), "retryable": True})
 
 
+# --- oMLX setup (v2.10.0): install / start / stop of the external server ---
+# The Runtime page's oMLX card drives this instead of pointing the user at a
+# manual brew command. 202 + /jobs/{id} plumbing, same as runtime updates.
+@router.get("/omlx/setup/requirements")
+async def omlx_setup_requirements(request: Request):
+    app = state(request)
+    cli = await app.omlx_setup.probe_cli()
+    return app.omlx_setup.requirements(cli)
+
+
+@router.post("/omlx/setup/install", status_code=202)
+async def omlx_setup_install(request: Request):
+    return state(request).omlx_setup_job("install")
+
+
+@router.post("/omlx/setup/start", status_code=202)
+async def omlx_setup_start(request: Request):
+    return state(request).omlx_setup_job("start")
+
+
+@router.post("/omlx/setup/stop", status_code=202)
+async def omlx_setup_stop(request: Request):
+    return state(request).omlx_setup_job("stop")
+
+
+@router.post("/omlx/setup/jobs/{job_id}/cancel")
+async def omlx_setup_cancel_job(job_id: str, request: Request):
+    app = state(request)
+    job = app.database.get_job(job_id)
+    if not job or job.get("kind") not in {"omlx_install", "omlx_start", "omlx_stop"}:
+        raise HTTPException(404, detail={"code": "JOB_NOT_FOUND", "message": "指定されたジョブが見つかりません"})
+    return await app.jobs.cancel(job_id)
+
+
 def _profile_pin_map(data: dict) -> dict[str, bool]:
     return {str(item.get("modelId")): bool(item.get("keepLoaded", False))
             for item in data.get("models", {}).get("pool", {}).get("profiles", [])

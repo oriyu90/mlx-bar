@@ -28,7 +28,8 @@ class ThreadBoundAdapter(BaseAdapter):
         super().__init__()
         self.load_thread: int | None = None
 
-    def load(self, path: str, trust_remote_code: bool = False) -> dict:
+    def load(self, path: str, trust_remote_code: bool = False,
+             allow_vlm: bool = False) -> dict:
         self.load_thread = threading.get_ident()
         self.model = object()
         return self.capabilities()

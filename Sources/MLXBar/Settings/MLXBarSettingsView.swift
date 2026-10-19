@@ -294,10 +294,6 @@ struct OMLXSettingsView: View {
     @State private var connectionTestInProgress = false
     @State private var confirmsClearApiKey = false
 
-    private var omlxSettings: [String: Any] {
-        (model.settings["omlx"] as? [String: Any]) ?? [:]
-    }
-
     var body: some View {
         ScrollView {
         Form {
@@ -501,10 +497,9 @@ struct OMLXSettingsView: View {
     }
 
     private func isModelAvailable(_ item: OMLXModel) -> Bool {
-        // The model is available if it has the 'available' flag or if we can't determine it
-        // Since we don't store 'available' in OMLXModel, we check if it was disabled during refresh
-        // A model with useOMLX=false but loaded=true is likely available but not routed
-        return true // We handle unavailable models in refreshOMLXStatus by setting useOMLX=false
+        // v2.10.0: the decoder keeps the server's `available` flag, so a model
+        // oMLX cannot serve is simply disabled here (no heuristic).
+        item.available
     }
 
     private var statusText: String {
