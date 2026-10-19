@@ -300,8 +300,29 @@ class ModelPoolSupervisor:
                 "OMLX_NOT_AVAILABLE", "oMLXプロバイダーが初期化されていません", 409, False)
         return await provider.connect()
 
+    def _ensure_omlx_background(self) -> None:
+        """Start the cached-status loop whenever the oMLX integration is on.
+
+        The loop is armed at init only when oMLX was *already* enabled at
+        launch. A user who flips `models.omlx.enabled` on while the
+        coordinator runs (Settings page / `mlxbarctl omlx set-enabled true`)
+        otherwise never gets refreshed cached status, and `_resident_charge()`
+        — which reads the cached `totalMemoryBytes` — would under-count the
+        oMLX server's memory against the global budget. Idempotent: the
+        provider keeps an existing loop running."""
+        if not self._omlx_enabled():
+            return
+        provider = getattr(self, "_omlx_provider", None)
+        if provider is None:
+            return
+        try:
+            provider.start_status_updates()
+        except Exception:  # noqa: BLE001 - bookkeeping must never fail a load
+            LOGGER.exception("Could not start the oMLX cached-status updater")
+
     def _get_omlx_memory_usage_cached(self) -> int:
         """Get total memory used by oMLX models from cached status (synchronous)."""
+        self._ensure_omlx_background()
         try:
             cached = self._omlx_provider.get_cached_status()
             return int(cached.get("totalMemoryBytes", 0))
@@ -605,6 +626,31 @@ class ModelPoolSupervisor:
                               "使用中または固定中のモデルを残したまま安全にロードできません", 503, True)
         return min(per_model, max(estimate, 1 << 30)), evict
 
+    async def _switch_ready_slots_to_explicit_engine(self, model_id: str, engine: str) -> None:
+        """v2.10.1: honor an explicit engine choice on already-ready slots.
+
+        The slot fast-paths treat any request for an *existing* ready slot as a
+        no-op, which silently swallowed an explicit `mlx-lm`/`mlx-vlm` choice
+        when that model was already resident on the other engine — the GUI's
+        engine menu did nothing for loaded models. Evict the mismatched
+        replicas (their own workers, so their memory is actually freed) and
+        let the normal replica loop reload on the requested engine. Auto
+        loads keep the former semantics: an existing ready slot wins, no
+        churn. A slot with active leases cannot switch hands mid-generation
+        and refuses with `ENGINE_BUSY` instead."""
+        mismatched: list[PoolSlot] = []
+        for slot in self._slots.values():
+            if str(slot.model.get("id", "")) != model_id or slot.state != "ready":
+                continue
+            if slot.leases:
+                raise MLXBarError("ENGINE_BUSY", "使用中のモデルは解放できません", 409, True)
+            actual = (slot.worker.loaded or {}).get("engine")
+            if actual != engine:
+                mismatched.append(slot)
+        for slot in mismatched:
+            slot.state = "evicting"
+            await self._evict_slot(slot)
+
     async def load(self, model: dict, engine: str | None = None, *, pin: bool = True) -> dict:
         if not self.enabled:
             return await self._legacy.load(model, engine)
@@ -631,6 +677,7 @@ class ModelPoolSupervisor:
                 if self.active_requests or self.queued_requests:
                     raise MLXBarError("ENGINE_BUSY", "生成中はoMLXモデルをロードできません", 409, True)
                 # Check memory budget including oMLX usage
+                self._ensure_omlx_background()
                 omlx_memory = await self._get_omlx_memory_usage()
                 # For oMLX, we don't manage the process directly, but we track memory
                 result = await self._omlx_provider.load(model, "omlx")
@@ -650,6 +697,10 @@ class ModelPoolSupervisor:
                 self._primary_model_id = str(model.get("id", ""))
                 return result
         self._ensure_reaper()
+        # v2.10.1: an explicit mlx-lm/mlx-vlm choice must actually act on an
+        # already-resident model even if it currently runs on the other engine.
+        if explicit and engine in {"mlx-lm", "mlx-vlm"}:
+            await self._switch_ready_slots_to_explicit_engine(model_id, engine)
         # An explicit load (GUI / CLI / preload) brings every configured replica
         # up now. An API autoload only needs one copy resident to answer -- the
         # reaper tops a pinned model up to its replica count in the background,
@@ -765,7 +816,14 @@ class ModelPoolSupervisor:
                 result = await existing.worker.load(model, engine, explicit=explicit)
                 if (not explicit and str(result.get("engine", "")) in {"mlx-lm", "mlx-vlm"}
                         and str(model.get("engine", "")) != str(result.get("engine", ""))):
-                    self._refresh_catalog_classification(model, result)
+                    # v2.10.1: the write reads config files and takes the
+                    # catalog database lock — a concurrent scan holds that
+                    # lock in an executor thread for its whole bulk replace.
+                    # Run it off the event loop so the loop (status polling,
+                    # heartbeats, the load chain itself) never stalls behind
+                    # it. The method stays synchronous for its unit tests.
+                    await asyncio.to_thread(self._refresh_catalog_classification,
+                                            model, result)
                 applied_limit = ((result.get("capabilities") or result).get("memoryLimits") or {}).get(
                     "set_memory_limit")
                 if applied_limit != existing.worker.memory_limit_bytes:

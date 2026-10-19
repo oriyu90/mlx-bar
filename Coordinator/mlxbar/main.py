@@ -544,7 +544,8 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     return asyncio.create_task(work())
 
 
-def _omlx_auto_connect_task(state: AppState) -> "asyncio.Task | None":
+def _omlx_auto_connect_task(state: AppState, *, max_attempts: int = 6,
+                            interval: float = 20.0) -> "asyncio.Task | None":
     """Best-effort oMLX connection at startup (v2.10.0).
 
     `models.omlx.autoConnect` shipped in v2.9.0 but nothing consumed it, so a
@@ -556,6 +557,11 @@ def _omlx_auto_connect_task(state: AppState) -> "asyncio.Task | None":
     agents), so it retries a few times; a server that never answers is logged
     honestly and abandoned — the status refresh loop and any later
     `/omlx/connect` request keep the contract alive without this task.
+
+    v2.10.1: a raised (not folded) error no longer burns the whole retry
+    budget on one glitch — every non-cancellation failure counts as one
+    attempt and the loop keeps its promised shape (interval * max_attempts
+    at most).
     """
     omlx = state.settings.data.get("models", {}).get("omlx", {}) or {}
     if not (omlx.get("autoConnect") and omlx.get("enabled", False)):
@@ -565,16 +571,16 @@ def _omlx_auto_connect_task(state: AppState) -> "asyncio.Task | None":
 
     async def work() -> None:
         log = logging.getLogger(__name__)
-        for attempt in range(6):
+        for attempt in range(max_attempts):
             if attempt:
-                await asyncio.sleep(20)
+                await asyncio.sleep(interval)
             try:
                 status = await state.workers.connect_omlx()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - convenience, never fatal
                 log.warning("oMLX auto-connect failed (attempt %s): %s", attempt + 1, exc)
-                return
+                continue
             if isinstance(status, dict):
                 connected, error, server_url = (status.get("connected"), status.get("error"),
                                                 status.get("serverUrl"))

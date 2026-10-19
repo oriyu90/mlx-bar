@@ -475,7 +475,6 @@ final class MenuBarViewModel: ObservableObject {
     private var requestedCancellations: Set<String> = []
     private var localLoadInProgress = false
     private var monitoredRuntimeJobIDs: Set<String> = []
-    private var monitoredOMLXSetupJobIDs: Set<String> = []
 
     private func ui(_ english: String, _ japanese: String) -> String {
         guiLanguage == "ja" ? japanese : english
@@ -988,7 +987,6 @@ final class MenuBarViewModel: ObservableObject {
     private func monitorOMLXSetupJob(_ action: String, initial: [String: Any]) async {
         guard let id = initial["id"] as? String else { return }
         defer {
-            monitoredOMLXSetupJobIDs.remove(id)
             omlxBusySetupActions.remove(action)
         }
         do {

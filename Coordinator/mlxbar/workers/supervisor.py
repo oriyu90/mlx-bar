@@ -414,17 +414,24 @@ class WorkerSupervisor:
             engine = None
         chosen = engine or model.get("engine")
         model_max_tokens = self._detect_model_max_tokens(model.get("path"))
-        if chosen not in {"mlx-lm", "mlx-vlm"}:
-            if chosen != "lm-studio":
-                raise MLXBarError("MODEL_INCOMPATIBLE", "利用可能なエンジンがありません", 409)
-        if not explicit and chosen in {"mlx-lm", "mlx-vlm"}:
-            detected = detect_engine(Path(model["path"])) if model.get("path") else None
+        # v2.10.0: re-derive the engine from the directory for auto loads so
+        # a stale catalog row self-heals. v2.10.1: this now also runs when the
+        # catalog row classified *None* (before the gate below used to refuse
+        # with a generic 409) — auto means "figure it out", so a readable
+        # directory gets its engine derived instead of a refusal; anything
+        # still unresolvable (no config.json, exotic layout) keeps raising the
+        # honest gate error. An explicit choice never consults the directory.
+        if not explicit and model.get("path") and chosen in {"mlx-lm", "mlx-vlm", None}:
+            detected = detect_engine(Path(model["path"]))
             if detected and detected != chosen:
                 LOGGER.info(
-                    "Auto engine re-detection for %s: catalog=%s load-time=%s",
+                    "Auto engine derivation for %s: catalog=%s load-time=%s",
                     model.get("id") or model.get("name"), chosen, detected,
                 )
                 chosen = detected
+        if chosen not in {"mlx-lm", "mlx-vlm"}:
+            if chosen != "lm-studio":
+                raise MLXBarError("MODEL_INCOMPATIBLE", "利用可能なエンジンがありません", 409)
         async with self.lock:
             if (self.loaded and self.loaded.get("id") == model.get("id")
                     and self.loaded.get("engine") == chosen):
@@ -455,7 +462,9 @@ class WorkerSupervisor:
                 for candidate in candidates:
                     chosen = candidate
                     self.loading["engine"] = chosen
-                    self.loading["phase"] = ("mlx-vlmへ切り替え中" if last_error else "Workerを起動中")
+                    # v2.10.1: the fallback is now symmetric, so name the
+                    # engine actually being tried (mlx-vlm -> mlx-lm too).
+                    self.loading["phase"] = (f"{chosen}へ切り替え中" if last_error else "Workerを起動中")
                     try:
                         await self._start_worker(chosen)
                         self.loading["phase"] = "モデルデータを読み込み中"

@@ -484,12 +484,21 @@ private struct OMLXSetupSection: View {
     private func message(_ value: String) -> String {
         guard model.guiLanguage != "ja" else { return value }
         let exact = [
+            "待機中": "Queued",
+            "開始しています": "Starting",
+            "完了": "Completed",
+            "失敗": "Failed",
             "サーバーの応答を待っています": "Waiting for the server to respond",
             "oMLXのインストールが完了しました": "oMLX installation completed",
             "oMLXサーバーを起動しました": "oMLX server started",
             "oMLXサーバーを起動しました（設定したURLにはまだ到達できません）":
                 "oMLX server started (the configured URL is not reachable yet)",
             "oMLXサーバーの停止コマンドを実行しました": "The oMLX stop command completed",
+            // v2.10.1: the remaining job-framework messages (cancel + terminal
+            // states) were leaking to English users in Japanese.
+            "利用者が処理を中止しました": "Operation cancelled by the user",
+            "処理に失敗しました": "The operation failed",
+            "処理が完了しました": "The operation completed",
         ]
         if let translated = exact[value] { return translated }
         if value.contains("をダウンロード・インストール中（") {

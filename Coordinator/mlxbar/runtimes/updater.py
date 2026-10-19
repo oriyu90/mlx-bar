@@ -199,6 +199,12 @@ class RuntimeUpdater:
                 raise MLXBarError("UPDATE_TIMEOUT",
                                   f"更新処理が{timeout}秒以内に完了しなかったため中止しました", 504, True)
             raise
+        except BaseException:
+            # v2.10.1: same guard as the oMLX setup runner -- a failure inside
+            # the heartbeat/update plumbing must not leave a runtime download
+            # running unsupervised for the rest of its timeout window.
+            await self._terminate(proc, communication)
+            raise
         text = out.decode(errors="replace")
         if proc.returncode:
             raise MLXBarError("UPDATE_PROBE_FAILED", text[-4000:] or "更新コマンドに失敗しました", 409)

@@ -574,7 +574,13 @@ class OMLXProvider:
                 "totalMemoryBytes": status.total_memory_bytes,
             }
         except Exception:
-            self._cached_status = {"connected": False, "error": "Failed to fetch status", "models": [], "totalMemoryBytes": 0}
+            # v2.10.1: keep the canonical shape (incl. `serverUrl`) even when
+            # the refresh fails — consumers map over this dict's keys, and
+            # dropping `serverUrl` blanked the settings echo for a cycle.
+            previous = self._cached_status if isinstance(self._cached_status, dict) else {}
+            self._cached_status = {"connected": False, "error": "Failed to fetch status",
+                                   "serverUrl": previous.get("serverUrl"),
+                                   "models": [], "totalMemoryBytes": 0}
 
     def get_cached_status(self) -> dict[str, Any]:
         """Get cached oMLX status (synchronous)."""

@@ -257,6 +257,13 @@ class OMLXSetupService:
                                   f"oMLXのコマンド({label})が{timeout}秒以内に完了しなかったため中止しました",
                                   504, True) from None
             raise
+        except BaseException:
+            # v2.10.1: a failure inside the update/heartbeat plumbing (a
+            # database hiccup in the job writer, for example) must not leave
+            # a `brew install` running unsupervised for its remaining timeout
+            # window. Tear the subprocess group down and surface the cause.
+            await self._terminate(proc, communication)
+            raise
         text = out.decode(errors="replace")
         if proc.returncode:
             raise MLXBarError("OMLX_COMMAND_FAILED",
