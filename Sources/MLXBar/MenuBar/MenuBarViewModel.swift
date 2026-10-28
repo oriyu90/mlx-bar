@@ -423,7 +423,18 @@ final class MenuBarViewModel: ObservableObject {
     @Published var exportImportMessage: String?
     @Published var diagnosticsSummary: [String: String] = [:]
     @Published var busy = false
-    @Published var errorMessage: String?
+    @Published var errorMessage: String? {
+        didSet {
+            errorClearTask?.cancel()
+            if errorMessage != nil {
+                errorClearTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(20))
+                    await MainActor.run { self?.errorMessage = nil }
+                }
+            }
+        }
+    }
+    private var errorClearTask: Task<Void, Never>?
     @Published var chatOutput = ""
     /// Upper bound for `chatOutput`: a long agent reply would otherwise live
     /// for the whole app session as an ever-copied Swift String (plus a full

@@ -643,11 +643,13 @@ async def serve(root: Path | None = None) -> None:
     # call e.g. /system/reset while this synchronous setup was still
     # in-flight, tearing down state this was about to write to.
     state.install_missing_runtimes()
+    scan_task = None
     if (state.database.metadata_value("catalog_classifier_version") != CATALOG_CLASSIFIER_VERSION
             or not state.database.list_models()
             or state.database.has_duplicate_model_paths()
             or state.database.has_mergeable_pathless_providers()):
-        state.scan_job()
+        job = state.scan_job()
+        scan_task = state.jobs.tasks.get(job["id"])
     listener = PublicListener(state)
     state.listener = listener
     if state.settings.data["api"].get("enabled", True):
@@ -667,6 +669,9 @@ async def serve(root: Path | None = None) -> None:
     # window in which a client can reach half-built state. Loading a 27B model
     # takes tens of seconds, and the first request after a restart should not be
     # the thing that pays for it.
+    if scan_task is not None:
+        with contextlib.suppress(Exception):
+            await scan_task
     preload_task = _preload_last_model(state)
     # launchd sends SIGTERM on logout, restart and `launchctl bootout`. Without
     # a handler the process dies before `finally` runs, stranding the worker

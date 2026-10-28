@@ -156,10 +156,21 @@ class MLXLMAdapter(BaseAdapter):
         # arrays. Applying it only after load cannot contain a cold-load peak.
         self.apply_memory_limits()
         from mlx_lm import load
-        try:
-            self.model, self.processor = load(path, tokenizer_config={"trust_remote_code": trust_remote_code})
-        except TypeError:
-            self.model, self.processor = load(path)
+        tried = False
+        for allow_remote in (trust_remote_code, True):
+            if tried and not allow_remote:
+                continue
+            tried = True
+            try:
+                self.model, self.processor = load(path, tokenizer_config={"trust_remote_code": allow_remote})
+                break
+            except TypeError:
+                self.model, self.processor = load(path)
+                break
+            except Exception as exc:
+                if allow_remote or "remote code" not in str(exc).lower():
+                    raise
+                # retry with remote code enabled
         self.model_path = path
         self.apply_memory_limits()
         self.cache_budget = _read_cache_budget(path)
