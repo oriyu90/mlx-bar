@@ -2,6 +2,48 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [3.2.0] - 2026-10-29
+
+**ユーザー報告7件（ISS-1〜7）への対応版。** 赤文字が消えない・VLMの起動先が誤る・常駐モデルが起動時に載らない・再起動直後の言語/設定・niwakiがロードできない・メモリ拒否の誤判定・常駐設定が反映されない、の7点。設計は `DESIGN_v3.2.0.md`、ユーザー向け要約は `RELEASE_NOTES_v3.2.0.md`。設定スキーマ（`schemaVersion=1`）と既存API形状は不変で、追加は任意キー2つ（`models.pool.memoryAdmission` / `models.bundledLoaders`）とadditiveなフィールドのみ。
+
+### 新機能
+
+- **モデル能力の判定（ISS-2 / WP-210）**: カタログに `capabilities` / `runtimeFit` / `evidence` / `loaderId` を追加。vision は index/safetensors の**実テンソル**で判定し（キーワード推定ではない）、engine と capabilities を独立に決める。DB は additive 4列（旧DBはそのまま読める）
+- **失敗理由の保持（ISS-2 / WP-211）**: auto チェーンの失敗で `error.attempts[]` に全エンジンの理由を添付（既存3キーは不変）。vision モデルを mlx-lm で明示ロードしたときは `warnings` に `VISION_IMAGE_DROPPED`（日英）を返す
+- **メモリ受入の再構成（ISS-6 / WP-610〜612）**: per-model上限 → 全体予算 → OS pressure → 退避計画 → **回収後の実効空き**で headroom、の順に判定。`MEMORY_BUDGET_TOTAL` / `MEMORY_HEADROOM_INSUFFICIENT` / `MEMORY_POOL_EXHAUSTED` / `MEMORY_POSTLOAD_EXCEEDED` に分離（旧 `MEMORY_BUDGET_EXCEEDED` は残置）。任意設定 `models.pool.memoryAdmission`（既定 `strict`）
+- **同梱ローダのレジストリと preflight（ISS-5 / WP-510・511）**: `Workers/mlx_vlm_worker/loaders/`（リポジトリ内モジュールのみ import）と `models.bundledLoaders`（既定 `false`）。未知形式・量子化・arch は**数十GBを確保する前に** `MODEL_FORMAT_UNSUPPORTED` / `MODEL_QUANT_UNSUPPORTED` / `MODEL_TOKENIZER_MISSING` / `MODEL_NEEDS_BUNDLED_LOADER` で即失敗
+- **常駐プロフィールの per-model API（ISS-7 / WP-710〜712）**: `PUT /api/v1/settings/models/pool/profiles/{model_id:path}`（マージ、`keepLoaded=false` で解除）と `status.loadedModels[].profilePinned`
+- **Swiftテストターゲット（WP-910）**: `Package.swift` に `MLXBarTests` を追加（21件）
+
+### 修正
+
+- **赤字エラーが消えない（ISS-1 / WP-110・111）**: `errorMessage` に20秒の自動消去（世代トークンでキャンセル競合を解消）。ポーリング由来の代入14箇所を無音化し、接続断は `connectionLost` に分離。設定画面フッターにバナーを追加
+- **起動時の常駐ロード（ISS-3 / WP-310）**: 走査の完了を待ってから preload。pinned があるときは `last_loaded_model_id` を載せない。`status.preload`（常に5キー）で失敗理由を表示。単一アンロードで他の pinned を止めない
+- **再起動直後の言語・設定（ISS-4 / WP-410・411）**: `UserDefaults("guiLanguage")` を初期値へミラーし `applyGUILanguage` に集約。設定取得は 3/10/30 秒の有界バックオフ、復旧は一度だけ通知
+- **英語UIに日本語が出る未登録コード（AC-5-6 / WP-R1）**: `INVALID_PROFILE` ほか API が返すコードを `ErrorText.swift` に日英登録。契約テストは手書きリストをやめ、`Coordinator/mlxbar/api/*.py` からコードを自動抽出して表と突き合わせる方式へ変更
+
+### 既知の制限（この版の範囲）
+
+- **niwaki が実際にロードできる（ISS-5 / AC-5-1）**: 重み再構成フック（`kept_experts` 24層のcompact bank＋masked routing / PLE 2bit ペア行128 shard / detokenizer tokenmap拡張）をリポジトリコードとして実装。モデル同梱 `*.py` は実行しない。このMacの実機で `Qwen3.8-Flash-Next-102B-A5B-Niwaki-v2.4-3bit-mlx` のロード成功・logits正常を確認。長い生成の品質評価は継続検証中
+- **常駐A→Bの自動反映は GUI 経由のみ（AC-7-2）**: GUI は PUT → `POST /models/{id}/load` で B を載せる。サーバの PUT は設定更新のみでロードを起動せず、A の自動解除もしない（API/CLI では設定のみ）
+- `warnings`（`VISION_IMAGE_DROPPED`）は API で返るが GUI では未表示（次ラウンド / WP-212）
+- 実機 `/Applications/MLXBar.app` は未更新（v2.8.1 のまま）。実機スモークは `TEST_PLAN_v3.2.0.md`
+
+### テスト
+
+- `pytest Tests`（全件）: **819 passed / 1 failed**（失敗1件は本変更と無関係の既知flaky。詳細は `DESIGN_v3.2.0.md` §3）
+- `swift test`: **21 tests / 0 failures**
+- 新規 `test_v3_1_0_*.py` / `test_v3_2_0_*.py` / `test_v3_3_0_loader.py` の8ファイル: **77 passed**（loader テストを実装対応に更新）
+
+## [3.1.0] - 2026-10-19
+
+**起動直後の安定性・ロード耐性・表示寿命の安定化。**（本エントリは v3.2.0 の文書整合で追記。実装はタグ `9530341` に含まれる）
+
+- 赤字エラーの20秒自動消去（手動クリア時はタイマーをキャンセル）
+- 常駐モデルの起動時ロード確実化（`scan_job` 完了後に `_preload_last_model`）
+- MLX系モデルの remote code 必須モデルを1回まで自動再試行
+- 詳細: `DESIGN_v3.1.0.md` / `RELEASE_NOTES_v3.1.0.md`
+
 ## [3.0.0] - 2026-10-19
 
 **v2.10.0の設計レビューに基づく安定版。** v2.10.0の全機能（VLM誤起動ガード・明示エンジン選択・oMLXカードからのセットアップ・autoConnect）を起点に、メモリ安全性／クラッシュ安全性／動作安定性／GUI完全性／設定整合性／互換性／表示正確性の7観点で精査し、見つかった問題を修正した。

@@ -14,5 +14,10 @@ Workers/**/__pycache__/
 dist/
 .DS_Store
 icon.zip
+# エージェント運用メタデータ。リリース差分・成果物には含めない（AC-T-5）。
+.agent-state/
+# TO/実装/レビューのオーケストレーション文書。成果物の一覧は
+# tasks/*/EXEC/ARTIFACT_MANIFEST.md に記載し、リポジトリの追跡対象にはしない。
+tasks/
 スクリーンショット 2026-08-11 13.49.25.png
 .wrangler/
