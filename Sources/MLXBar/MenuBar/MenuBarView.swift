@@ -51,6 +51,23 @@ struct MenuBarView: View {
                     .lineLimit(3)
             }
 
+            // Model-state warnings from `status.loadedModel.warnings`
+            // (v3.2.0 additive). They sit under the preload line because they
+            // are the same kind of persistent state: an explicit mlx-lm load
+            // of a vision-capable model drops attached images, and nothing
+            // else tells the user. Same treatment as `cacheWarningText` —
+            // orange, no background, no timer: the line goes away when the
+            // coordinator stops reporting the warning.
+            ForEach(model.modelWarnings, id: \.self) { warning in
+                Label(warning.text(language: model.guiLanguage),
+                      systemImage: warning.symbolName)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(3)
+                    .accessibilityIdentifier("model-warning-\(warning.code)")
+            }
+
             if let status = model.modelCopyStatus {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
@@ -301,6 +318,19 @@ struct MenuBarView: View {
             }
             Text(residentDetail(resident)).font(.caption2).foregroundStyle(.secondary)
                 .padding(.leading, isVirtualLoadingRow ? 0 : 18)
+            // Per-row model-state warnings (A2). Without this line a warning
+            // on a non-primary resident only exists in `loadedModels[]`, so
+            // loading a second model made the first one's warning disappear
+            // from the GUI even though the coordinator still reported it.
+            ForEach(resident.warnings, id: \.self) { warning in
+                Label(warning.text(language: model.guiLanguage),
+                      systemImage: warning.symbolName)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(3)
+                    .padding(.leading, isVirtualLoadingRow ? 0 : 18)
+            }
             HStack(spacing: 6) {
                 let symbol = resident.activitySymbol
                 Label(resident.activityText(japanese: model.guiLanguage == "ja"), systemImage: symbol.name)

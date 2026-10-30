@@ -81,6 +81,10 @@ struct ResidentModel: Identifiable, Hashable {
     /// (pool `resident`, v2.8.0). Absent on coordinators older than v2.8.0,
     /// where every loaded model was resident by definition.
     let resident: Bool
+    /// Model-state warnings the coordinator reports for this model (v3.2.0
+    /// additive `warnings` in `loadedModels[]`). Empty when nothing is wrong;
+    /// the menu row renders each one as an orange line.
+    let warnings: [ModelWarning]
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -112,6 +116,7 @@ struct ResidentModel: Identifiable, Hashable {
             idleExtendSeconds = nil
         }
         resident = value["resident"] as? Bool ?? true
+        warnings = ModelWarning.list(from: value)
         let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
     }
@@ -211,6 +216,76 @@ struct PreloadStatus: Hashable {
         } else {
             at = nil
         }
+    }
+}
+
+/// One model-state warning from `/api/v1/status`.
+///
+/// v3.2.0 (WP-211) reports these on `loadedModel.warnings` and on every
+/// `loadedModels[]` entry — never on a generation response. The only code the
+/// coordinator emits today is `VISION_IMAGE_DROPPED`, set when the user
+/// explicitly loads a vision-capable catalog model with `mlx-lm`, so attached
+/// images would be silently discarded. That is *state*, not a transient error:
+/// the GUI shows it until the coordinator stops reporting it and never puts it
+/// on a 20-second timer (`errorMessage` is for transient failures only).
+struct ModelWarning: Hashable {
+    let code: String
+    let message: String
+    let messageEn: String?
+    let engine: String?
+
+    init?(_ value: [String: Any]) {
+        guard let code = value["code"] as? String, !code.isEmpty else { return nil }
+        self.code = code
+        message = value["message"] as? String ?? ""
+        messageEn = value["messageEn"] as? String
+        engine = value["engine"] as? String
+    }
+
+    /// The warnings of one `loadedModel` / `loadedModels[]` payload.
+    ///
+    /// Only that position is object-shaped. The API's other `warnings` keys
+    /// (presets, hardware, runtime probe) are arrays of strings, so decoding
+    /// one of those here yields nothing instead of a bogus warning.
+    static func list(from value: [String: Any]?) -> [ModelWarning] {
+        ((value?["warnings"] as? [[String: Any]]) ?? []).compactMap(ModelWarning.init)
+    }
+
+    /// Union of the raw warning payloads of same-model replicas, keyed by
+    /// `code` (de-duplicated by position when a code is missing).
+    ///
+    /// `loadedModels[]` carries one entry per replica, and a warning reported
+    /// by any replica belongs to the model row: a later replica that reports
+    /// none must not erase an earlier replica's warning.
+    static func merge(_ existing: [[String: Any]], _ incoming: [[String: Any]]) -> [[String: Any]] {
+        var seen = Set<String>()
+        var merged: [[String: Any]] = []
+        for raw in existing + incoming {
+            let key = (raw["code"] as? String) ?? (raw["message"] as? String) ?? ""
+            if seen.insert(key).inserted { merged.append(raw) }
+        }
+        return merged
+    }
+
+    /// Display text in `language` ("ja" or "en").
+    ///
+    /// The server field for the current language comes first: it is more
+    /// specific than the general `ErrorText` entry (that one says "this
+    /// runtime" where the server names `mlx-lm`). Only a missing or empty
+    /// server field falls back to the error-text table — and, for a code the
+    /// table does not know, to the server's message and then the code.
+    func text(language: String) -> String {
+        let serverText = language == "en" ? (messageEn ?? "") : message
+        if !serverText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return serverText
+        }
+        return CoordinatorErrorText.resolve(code: code, serverMessage: message, language: language)
+    }
+
+    /// SF Symbol for this warning: a dropped image has its own glyph, and any
+    /// code added later falls back to a generic triangle rather than nothing.
+    var symbolName: String {
+        code == "VISION_IMAGE_DROPPED" ? "photo.badge.exclamationmark" : "exclamationmark.triangle"
     }
 }
 
@@ -403,6 +478,10 @@ final class MenuBarViewModel: ObservableObject {
     @Published var loadedEngine: String?
     @Published var loadedModalities: [String] = []
     @Published var loadedModelMaxTokens: Int?
+    /// Model-state warnings from `/api/v1/status` (v3.2.0 additive
+    /// `loadedModel.warnings`). Empty on older coordinators and whenever no
+    /// warning is in effect; shown as an orange line, never on a timer.
+    @Published var modelWarnings: [ModelWarning] = []
     @Published var effectiveMaxTokens = 8192
     @Published var effectiveMaxPromptCharacters = 100000
     @Published var cacheCapability: String?
@@ -899,6 +978,16 @@ final class MenuBarViewModel: ObservableObject {
                 if value["memoryManagedBy"] != nil {
                     existing["memoryManagedBy"] = value["memoryManagedBy"]
                 }
+                // Same-model replicas normally report the same warning, but a
+                // replica loaded with a different engine may report none. Keep
+                // the union so the row never loses a warning because of the
+                // order the coordinator listed its replicas in (A2).
+                let mergedWarnings = ModelWarning.merge(
+                    existing["warnings"] as? [[String: Any]] ?? [],
+                    value["warnings"] as? [[String: Any]] ?? [])
+                if !mergedWarnings.isEmpty {
+                    existing["warnings"] = mergedWarnings
+                }
                 // Busiest pool state wins so a loading / busy replica is never
                 // hidden behind an idle first replica.
                 let stateRank: ([String: Any]) -> Int = { dict in
@@ -970,12 +1059,17 @@ final class MenuBarViewModel: ObservableObject {
                 setIfChanged(\.loadedModelMaxTokens, ((loaded["capabilities"] as? [String: Any])?["modelMaxTokens"] as? NSNumber)?.intValue)
                 setIfChanged(\.effectiveMaxTokens, (loaded["effectiveMaxTokens"] as? NSNumber)?.intValue ?? configuredMaxTokens)
                 setIfChanged(\.effectiveMaxPromptCharacters, (loaded["effectiveMaxPromptCharacters"] as? NSNumber)?.intValue ?? 100000)
+                // Model-state warnings (v3.2.0 additive). An unload or a
+                // re-load with a different engine drops them, because the key
+                // disappears from the response — hence no dismiss button.
+                setIfChanged(\.modelWarnings, ModelWarning.list(from: loaded))
             } else {
                 setIfChanged(\.loadedName, nil); setIfChanged(\.loadedEngine, nil); setIfChanged(\.loadedModalities, [])
                 setIfChanged(\.loadedModelMaxTokens, nil); setIfChanged(\.effectiveMaxTokens, configuredMaxTokens)
                 setIfChanged(\.effectiveMaxPromptCharacters, 100000); setIfChanged(\.activeRequestCount, 0)
                 setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
                 setIfChanged(\.liveGenerationTPS, nil)
+                setIfChanged(\.modelWarnings, [])
             }
             if let loading = json["loadingModel"] as? [String: Any] {
                 setIfChanged(\.loadingModelName, loading["name"] as? String)

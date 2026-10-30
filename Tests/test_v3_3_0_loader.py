@@ -171,6 +171,69 @@ class BundledLoaderSafetyTests(unittest.TestCase):
                          "a model's own *.py must never be imported or executed")
 
 
+class EosWiringTests(unittest.TestCase):
+    """TASK-002/WP-B P0-1 regression: load_impl must pass the checkpoint EOS
+    set to load_processor. Without it, 248044 (<|endoftext|>) drops out of
+    the stopping criteria and leaks as text."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_load_impl_passes_checkpoint_eos_to_load_processor(self):
+        import sys
+
+        try:
+            import mlx_vlm.models.qwen4_exp.qwen4_exp as qmod
+            import mlx_vlm.utils as utils
+        except ImportError:
+            self.skipTest("mlx_vlm runtime not installed in test env")
+
+        loader_mod = sys.modules.get("mlx_vlm_worker.loaders.niwaki_qwen4_exp")
+        if loader_mod is None:
+            import importlib
+            loader_mod = importlib.import_module(
+                "mlx_vlm_worker.loaders.niwaki_qwen4_exp")
+        loader = loader_mod.NiwakiQwen4ExpLoader()
+        path = make_niwaki(self.root)
+
+        captured: dict = {}
+
+        class FakeConfig:
+            eos_token_id = [248046, 248044]
+
+        class FakeModel:
+            config = FakeConfig()
+
+        def fake_load_model(*args, **kwargs):
+            return FakeModel()
+
+        def fake_load_processor(p, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop after capture")
+
+        def fake_load_weights(self, weights, strict=True):
+            return None
+
+        real_load_model = utils.load_model
+        real_load_processor = utils.load_processor
+        real_load_weights = qmod.Model.load_weights
+        utils.load_model = fake_load_model
+        utils.load_processor = fake_load_processor
+        qmod.Model.load_weights = fake_load_weights
+        try:
+            with self.assertRaises(RuntimeError):
+                loader.load_impl(path)
+        finally:
+            utils.load_model = real_load_model
+            utils.load_processor = real_load_processor
+            qmod.Model.load_weights = real_load_weights
+        self.assertEqual(captured.get("eos_token_ids"), [248046, 248044])
+
+
 class OptInSettingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

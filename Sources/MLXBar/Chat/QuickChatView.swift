@@ -40,6 +40,21 @@ struct QuickChatView: View {
                     .font(.caption).foregroundStyle(.red).lineLimit(3)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // Model-state warnings from `status.loadedModel.warnings`
+            // (v3.2.0 additive): an explicit mlx-lm load of a vision model
+            // discards attached images. It belongs above the input field
+            // because drag-and-drop bypasses the modality check that disables
+            // the "画像を追加" button, so an image can still be attached here
+            // and silently lost. Persistent state, so no 20-second timer.
+            ForEach(model.modelWarnings, id: \.self) { warning in
+                Label(warning.text(language: model.guiLanguage),
+                      systemImage: warning.symbolName)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(3)
+                    .accessibilityIdentifier("model-warning-\(warning.code)")
+            }
             TextEditor(text: $prompt).frame(height: 90).overlay(RoundedRectangle(cornerRadius: 6).stroke(dropTarget ? Color.accentColor : Color(nsColor: .separatorColor)))
                 .accessibilityLabel(LS("プロンプト"))
                 .onDrop(of: [UTType.image.identifier, UTType.fileURL.identifier], isTargeted: $dropTarget) { providers in

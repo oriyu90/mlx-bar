@@ -238,7 +238,8 @@ class NiwakiQwen4ExpLoader(BundledLoader):
                         import mlx.nn as nn
                         nn.quantize(
                             block.switch_mlp,
-                            group_size=old.group_size, bits=old.bits)
+                            group_size=old.group_size, bits=old.bits,
+                            mode=getattr(old, "mode", "affine"))
                     _apply_compact_mask(
                         block, expert_ids,
                         full_experts if full_experts > 0 else None)
@@ -264,14 +265,18 @@ class NiwakiQwen4ExpLoader(BundledLoader):
                              and ".ple." in k),
                             None)
                         if key is None:
-                            break
+                            # L-3 (TASK-002): 部分的な差し替えのまま進むと
+                            # strict ロードで判読困難な Missing になるため、
+                            # ここで fail-fast する（作者実装は StopIteration）。
+                            raise ModelLoadError(
+                                "MODEL_FORMAT_UNSUPPORTED",
+                                f"PLE n-gram shard {n} の重みが見つかりません"
+                                "（ダウンロードが不完全か破損しています）",
+                                detail=str(path))
                         packed_rows = int(weight_dict[key].shape[0])
                         new_shards.append(_PairedQuantizedEmbedding(
                             packed_rows, dims * pair, group, bits, pair, dims))
-                    else:
-                        emb.shards = new_shards
-                        continue
-                    break
+                    emb.shards = new_shards
             return orig_load_weights(model, weights, strict=strict)
 
         Q.Model.load_weights = _load_weights_hooked
@@ -282,7 +287,17 @@ class NiwakiQwen4ExpLoader(BundledLoader):
 
             mx.eval(model.parameters())
             model.eval()
-            processor = load_processor(path)
+            # P0-1 (TASK-002): checkpoint の EOS 集合を明示的に渡す。
+            # 未指定だと tokenizer の EOS (248046) のみが停止条件になり、
+            # 248044 (<|endoftext|>) が停止せず文字として漏れる。
+            # model.config.eos_token_id == [248046, 248044] をそのまま使う。
+            eos_ids = getattr(getattr(model, "config", None), "eos_token_id", None)
+            try:
+                processor = load_processor(
+                    path, eos_token_ids=eos_ids) if eos_ids else load_processor(path)
+            except TypeError:
+                # 旧シグネチャの load_processor への後方互換
+                processor = load_processor(path)
             _extend_detokenizer_tokenmap(model, processor)
             return model, processor
         finally:
@@ -327,6 +342,15 @@ def _extend_detokenizer_tokenmap(model, processor) -> None:
         except Exception:
             pass
         extra = []
+        # L-7 (TASK-002): filler must exist in mlx-vlm's BPE byte decoder,
+        # otherwise detokenizer.add_token raises KeyError at generate time.
+        try:
+            from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
+            byte_decoder = getattr(BPEStreamingDetokenizer, "_byte_decoder", None) or {}
+            if not isinstance(byte_decoder, dict) or fallback not in byte_decoder:
+                fallback = "?"
+        except Exception:
+            fallback = "?"
         for token_id in range(len(tokenmap), width):
             try:
                 surface = tok.decode([token_id])

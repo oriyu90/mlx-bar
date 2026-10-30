@@ -79,6 +79,9 @@ class MLXVLMAdapter(BaseAdapter):
         self.kv_group_size = 64
         self.kv_start = 0
         self.kv_fallback_reason: str | None = None
+        # TASK-002/WP-B: bundled-loader 使用モデルの ID（未使用時は None）。
+        # skip_special_tokens の既定値決定に使う（niwaki は文字漏れ防止のため True）。
+        self._bundled_loader_id: str | None = None
 
     def capabilities(self) -> dict:
         result = super().capabilities()
@@ -580,10 +583,12 @@ class MLXVLMAdapter(BaseAdapter):
             # a record of every use.
             LOGGER.warning("Bundled loader enabled: %s for %s",
                            load_plan["loaderId"], path)
+            self._bundled_loader_id = load_plan["loaderId"]
             self.model, self.processor = load_plan["loader"].load(
                 path, trust_remote_code=trust_remote_code)
         else:
             from mlx_vlm import load
+            self._bundled_loader_id = None
             self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
         self.model_path = path
         self.apply_memory_limits()
@@ -727,6 +732,30 @@ class MLXVLMAdapter(BaseAdapter):
                   "temperature": float(params.get("temperature", 0.7)),
                   "top_p": float(params.get("top_p", 1.0)),
                   "repetition_context_size": int(params.get("repetition_context_size", 20))}
+        # TASK-002/WP-B P0-2: bundled-loader 使用モデル（niwaki）は特殊トークンが
+        # 文字として漏れるため、未指定時は skip_special_tokens=True を既定にする。
+        # リクエスト明示指定は常に優先。他モデルへの影響なし。
+        if "skip_special_tokens" in params:
+            kwargs["skip_special_tokens"] = bool(params.get("skip_special_tokens"))
+        elif self._bundled_loader_id is not None:
+            kwargs["skip_special_tokens"] = True
+        # TASK-002/WP-B F5: bundled-loader 使用モデルはモデルカードの既定
+        # (temp 1.0 / top_p 0.95 / top_k 20) を使う。未指定時のみ。
+        # 他モデルは従来どおり 0.7/1.0/top_kなし。
+        if self._bundled_loader_id is not None:
+            if "temperature" not in params:
+                try:
+                    card_temp = float(
+                        (getattr(getattr(self.model, "config", None),
+                                         "generation_config", None) or {}).get(
+                            "temperature", 1.0))
+                    kwargs["temperature"] = card_temp
+                except (TypeError, ValueError):
+                    kwargs["temperature"] = 1.0
+            if "top_p" not in params:
+                kwargs["top_p"] = 0.95
+            if "top_k" not in params:
+                kwargs["top_k"] = 20
         seed = params.get("seed")
         if isinstance(seed, int) and not isinstance(seed, bool):
             try:

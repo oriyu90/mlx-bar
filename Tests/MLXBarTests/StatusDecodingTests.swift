@@ -227,4 +227,146 @@ final class StatusDecodingTests: XCTestCase {
         XCTAssertEqual(counter.value, 2)
         XCTAssertEqual(model.settingsRetryAttempts, 2)
     }
+
+    // MARK: - model warnings (TASK-002 / AC-W1..W3)
+
+    /// The four keys the coordinator's `VISION_IMAGE_DROPPED` payload carries
+    /// (`supervisor.py:600-607`) all survive decoding, so the banner can show
+    /// the server's own text and the engine it applies to.
+    func testModelWarningDecodesAllFields() throws {
+        let warning = try XCTUnwrap(ModelWarning([
+            "code": "VISION_IMAGE_DROPPED",
+            "message": "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます",
+            "messageEn": "This model supports image input, but mlx-lm drops images.",
+            "engine": "mlx-lm",
+        ]))
+        XCTAssertEqual(warning.code, "VISION_IMAGE_DROPPED")
+        XCTAssertEqual(warning.message, "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます")
+        XCTAssertEqual(warning.messageEn, "This model supports image input, but mlx-lm drops images.")
+        XCTAssertEqual(warning.engine, "mlx-lm")
+    }
+
+    /// AC-W1: a `loadedModel.warnings` array decodes to typed rows; a payload
+    /// without the key (older coordinator, no warning in effect) decodes to
+    /// nothing rather than to a placeholder.
+    func testModelWarningListDecodesLoadedModelWarnings() {
+        let loaded: [String: Any] = [
+            "id": "mlx-community/Qwen3-VL-8B",
+            "name": "Qwen3-VL-8B",
+            "engine": "mlx-lm",
+            "warnings": [[
+                "code": "VISION_IMAGE_DROPPED",
+                "message": "画像は破棄されます",
+                "messageEn": "Images are dropped.",
+                "engine": "mlx-lm",
+            ]],
+        ]
+        let warnings = ModelWarning.list(from: loaded)
+        XCTAssertEqual(warnings.count, 1)
+        XCTAssertEqual(warnings.first?.code, "VISION_IMAGE_DROPPED")
+
+        // nil `loadedModel` is the `refreshStatus` else branch; a `loadedModel`
+        // without `warnings` is the "nothing wrong" case. Both show nothing.
+        XCTAssertEqual(ModelWarning.list(from: nil), [])
+        XCTAssertEqual(ModelWarning.list(from: ["id": "m", "name": "M"]), [])
+    }
+
+    /// AC-W3 / §5.9: the server's language-specific field wins, because it
+    /// names the engine (`mlx-lm`) where the `ErrorText` table only says
+    /// "this runtime".
+    func testModelWarningUsesServerTextPerLanguage() throws {
+        let warning = try XCTUnwrap(ModelWarning([
+            "code": "VISION_IMAGE_DROPPED",
+            "message": "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます",
+            "messageEn": "This model supports image input, but mlx-lm drops images.",
+            "engine": "mlx-lm",
+        ]))
+        XCTAssertEqual(warning.text(language: "en"),
+                       "This model supports image input, but mlx-lm drops images.")
+        XCTAssertEqual(warning.text(language: "ja"),
+                       "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます")
+    }
+
+    /// AC-W3 / §5.9: without `messageEn`, English falls back to the registered
+    /// `ErrorText` sentence — never to the server's Japanese text. An unknown
+    /// code with no English field keeps the server message as the last resort.
+    func testModelWarningFallsBackToErrorTextTable() throws {
+        let noEnglish = try XCTUnwrap(ModelWarning([
+            "code": "VISION_IMAGE_DROPPED",
+            "message": "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます",
+        ]))
+        XCTAssertEqual(
+            noEnglish.text(language: "en"),
+            "This runtime does not accept images, so attached images are discarded.")
+        XCTAssertFalse(noEnglish.text(language: "en").contains("画像"))
+
+        // `message` missing as well: the table still answers in both languages.
+        let bare = try XCTUnwrap(ModelWarning(["code": "VISION_IMAGE_DROPPED"]))
+        XCTAssertEqual(
+            bare.text(language: "ja"),
+            "このランタイムでは画像入力が使われないため、添付画像は破棄されます")
+        XCTAssertEqual(
+            bare.text(language: "en"),
+            CoordinatorErrorText.resolve(code: "VISION_IMAGE_DROPPED",
+                                        serverMessage: nil, language: "en"))
+
+        // A future code the table has never seen still shows the server text.
+        let future = try XCTUnwrap(ModelWarning([
+            "code": "SOME_FUTURE_WARNING",
+            "message": "サーバからの新しい警告です",
+        ]))
+        XCTAssertEqual(future.text(language: "en"), "サーバからの新しい警告です")
+        XCTAssertEqual(future.symbolName, "exclamationmark.triangle")
+        XCTAssertEqual(noEnglish.symbolName, "photo.badge.exclamationmark")
+    }
+
+    /// AC-W2: a status whose `loadedModel` has no warnings produces no rows —
+    /// the banner disappears on unload / re-load with another engine, because
+    /// the coordinator drops the key. A string-array `warnings` (the shape of
+    /// presets / hardware warnings) must not be mistaken for a model warning.
+    func testModelWarningsAreClearedWhenTheStatusReportsNone() {
+        XCTAssertEqual(ModelWarning.list(from: nil), [])
+        XCTAssertEqual(ModelWarning.list(from: ["id": "m", "state": "loaded"]), [])
+        XCTAssertEqual(ModelWarning.list(from: ["warnings": ["物理メモリ容量を検出できませんでした"]]), [])
+
+        let model = MenuBarViewModel()
+        XCTAssertTrue(model.modelWarnings.isEmpty)
+        let one = ModelWarning(["code": "VISION_IMAGE_DROPPED", "message": "m"]).map { [$0] } ?? []
+        model.modelWarnings = one
+        XCTAssertEqual(model.modelWarnings.count, 1)
+        // The `else` branch of `refreshStatus` assigns exactly this.
+        model.modelWarnings = ModelWarning.list(from: nil)
+        XCTAssertTrue(model.modelWarnings.isEmpty)
+    }
+
+    /// AC-W1 (A2): `ResidentModel` keeps a row's warnings, and the replica
+    /// merge unions them — a replica that reports none cannot erase another
+    /// replica's warning, which is how the non-primary row survives a second
+    /// model being loaded.
+    func testResidentModelKeepsWarningsAcrossReplicaMerge() throws {
+        let warning: [String: Any] = [
+            "code": "VISION_IMAGE_DROPPED",
+            "message": "画像は破棄されます",
+            "messageEn": "Images are dropped.",
+            "engine": "mlx-lm",
+        ]
+        let resident = try XCTUnwrap(ResidentModel(["id": "m", "warnings": [warning]]))
+        XCTAssertEqual(resident.warnings.count, 1)
+        XCTAssertEqual(resident.warnings.first?.code, "VISION_IMAGE_DROPPED")
+
+        // No warnings key: an ordinary row.
+        XCTAssertTrue(try XCTUnwrap(ResidentModel(["id": "m"])).warnings.isEmpty)
+
+        // Replica with the warning + replica without it, in either order.
+        let mergedForward = ModelWarning.merge([warning], [])
+        XCTAssertEqual(mergedForward.count, 1)
+        XCTAssertEqual(ModelWarning.merge([], [warning]).count, 1)
+        // The same warning on both replicas is one row, not two.
+        XCTAssertEqual(ModelWarning.merge([warning], [warning]).count, 1)
+        XCTAssertTrue(ModelWarning.merge([], []).isEmpty)
+
+        let mergedResident = try XCTUnwrap(
+            ResidentModel(["id": "m", "warnings": ModelWarning.merge([warning], [])]))
+        XCTAssertEqual(mergedResident.warnings.map(\.code), ["VISION_IMAGE_DROPPED"])
+    }
 }

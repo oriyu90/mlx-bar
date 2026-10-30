@@ -79,6 +79,20 @@ struct ModelCatalogView: View {
                     }
                     Text("\(LS("モデル上限")): \(model.loadedModelMaxTokens.map(MenuBarViewModel.tokenCount) ?? LS("不明")) tokens · \(LS("API有効上限")): \(MenuBarViewModel.tokenCount(model.effectiveMaxTokens)) tokens")
                         .font(.caption).foregroundStyle(.secondary)
+                    // Model-state warnings (v3.2.0 additive `loadedModel
+                    // .warnings`), shown in the loaded footer so the screen
+                    // that starts an engine-specific load also reports the
+                    // result — e.g. "mlx-lm drops images" right after choosing
+                    // "mlx-lm で読み込む".
+                    ForEach(model.modelWarnings, id: \.self) { warning in
+                        Label(warning.text(language: model.guiLanguage),
+                              systemImage: warning.symbolName)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(3)
+                            .accessibilityIdentifier("model-warning-\(warning.code)")
+                    }
                 }.padding(.horizontal).padding(.top, 10)
             }
             if let error = model.errorMessage {
