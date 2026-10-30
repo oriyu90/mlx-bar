@@ -547,3 +547,13 @@
 "oMLX — サーバーを起動" = "oMLX — Start Server";
 "oMLX — サーバーを停止" = "oMLX — Stop Server";
 "oMLX — 処理を中止" = "oMLX — Cancel Operation";
+
+/* v3.2.0 -- ISS-1 error channels, ISS-3 preload state, ISS-4 language mirror /
+   settings recovery, ISS-7 pin semantics. Keys are the Japanese source
+   literals used with LS(_:); %@ is filled with String(format:). */
+"常駐モデルを読み込み中…" = "Loading resident model…";
+"常駐モデルの読み込みに失敗しました（理由: %@）" = "Could not load the resident model (reason: %@).";
+"設定ファイルを読み込めなかったため、初期値に戻しました（バックアップ: %@）" = "The settings file could not be read, so defaults were restored (backup: %@).";
+"一時" = "Temporary";
+"設定を読み込み中" = "Loading settings";
+"閉じる" = "Dismiss";
