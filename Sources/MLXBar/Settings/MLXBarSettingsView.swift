@@ -29,6 +29,22 @@ struct MLXBarSettingsView: View {
         }
         .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         .task { await model.refreshSettings(); await model.refreshSecrets() }
+        // One banner for the whole window, in the same red style as the oMLX
+        // page's error label (AC-1-3). Before this existed, a validation error
+        // raised by any Settings action was assigned to `errorMessage` but never
+        // drawn here — it only appeared inside the menu-bar popover, which is
+        // not where the user was. The 20-second auto-dismiss is the view
+        // model's, so this view only renders what is already timed.
+        .safeAreaInset(edge: .bottom) {
+            if let error = model.errorMessage {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(.regularMaterial)
+            }
+        }
     }
 }
 
@@ -958,6 +974,17 @@ struct ModelSourceSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("常駐させるモデル")) {
+                // Until the settings read succeeds there is no profile list to
+                // act on. The controls are disabled rather than allowed to run
+                // against an empty snapshot (AC-7-4); the server-side per-model
+                // merge (v3.2.0) makes the write itself safe as well.
+                if !model.settingsLoaded {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(LS("設定を読み込み中")).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 if model.models.isEmpty {
                     Text(LS("モデルが見つかりません。フォルダを追加して再スキャンしてください。"))
                         .font(.caption).foregroundStyle(.secondary)
@@ -975,6 +1002,7 @@ struct ModelSourceSettingsView: View {
                         Text(item.name).lineLimit(1).truncationMode(.middle)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .disabled(!model.settingsLoaded)
                     if pinnedModelIds.contains(item.id) {
                         Stepper("\(LS("並列数（replicas）")): \(pinnedModelReplicas[item.id] ?? 1)",
                                 value: Binding(
@@ -986,6 +1014,7 @@ struct ModelSourceSettingsView: View {
                                 in: 1...max(1, maxReplicasPerModel))
                             .font(.caption)
                             .padding(.leading, 20)
+                            .disabled(!model.settingsLoaded)
                         Stepper("\(LS("メモリ上限")): \(pinnedModelMaxGB[item.id] ?? perModelMaxGB) GB",
                                 value: Binding(
                                     get: { pinnedModelMaxGB[item.id] ?? perModelMaxGB },
@@ -996,6 +1025,7 @@ struct ModelSourceSettingsView: View {
                                 in: 1...512)
                             .font(.caption)
                             .padding(.leading, 20)
+                            .disabled(!model.settingsLoaded)
                     }
                 }
                 Text(LS("常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。"))

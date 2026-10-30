@@ -37,6 +37,20 @@ struct MenuBarView: View {
                 if model.busy { ProgressView().controlSize(.small) }
             }
 
+            // Resident-model preload (v3.2.0 additive `preload` in status).
+            // A failed preload used to be a server-side warning only, so the
+            // popover said "no model loaded" with no reason (ISS-3 / AC-3-3).
+            // It is persistent state, not a transient error: it disappears when
+            // the coordinator reports loaded/skipped, not on a 20-second timer.
+            if let preload = model.preloadStatusLine {
+                Label(preload.text, systemImage: preload.failed
+                      ? "exclamationmark.triangle" : "arrow.down.circle")
+                    .font(.caption)
+                    .foregroundStyle(preload.failed ? Color.orange : Color.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .lineLimit(3)
+            }
+
             if let status = model.modelCopyStatus {
                 Text(status).font(.caption).foregroundStyle(.secondary)
             }
@@ -95,6 +109,25 @@ struct MenuBarView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            // Settings recovered from a backup (v3.2.0): shown once per
+            // recovery, and dismissible, because it explains a whole-reset that
+            // otherwise looks like the app forgetting the user's settings.
+            if let notice = model.settingsRecoveryNotice {
+                HStack(alignment: .top, spacing: 6) {
+                    Label(notice, systemImage: "arrow.counterclockwise.circle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(4)
+                    Button { model.dismissSettingsRecoveryNotice() } label: {
+                        Image(systemName: "xmark").font(.caption2)
+                            .accessibilityLabel(LS("閉じる"))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
             }
 
             if let error = model.errorMessage {
@@ -227,6 +260,16 @@ struct MenuBarView: View {
                         .background(Color.secondary.opacity(0.15), in: Capsule())
                         .accessibilityLabel(LS("非常駐モデル"))
                 }
+                // ISS-7: only a saved residency profile is "固定". A model that
+                // is loaded with `pin=True` (manual load) but has no profile is
+                // kept alive for this session only, so it reads "一時" rather
+                // than claiming a pin the user never set.
+                if resident.keepLoaded && !resident.profilePinned && !isVirtualLoadingRow {
+                    Text(LS("一時")).font(.caption2).foregroundStyle(.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                        .accessibilityLabel(LS("一時"))
+                }
                 Spacer(minLength: 4)
                 if resident.replicaCount > 1 {
                     Text("×\(resident.replicaCount)").font(.caption2).monospacedDigit()
@@ -235,13 +278,18 @@ struct MenuBarView: View {
                 }
                 if !resident.managedExternally && !isVirtualLoadingRow {
                     Button {
-                        Task { await model.setModelPin(resident.id, keepLoaded: !resident.keepLoaded) }
+                        Task { await model.setModelPin(resident.id, keepLoaded: !resident.profilePinned) }
                     } label: {
-                        Image(systemName: resident.keepLoaded ? "pin.fill" : "pin")
+                        Image(systemName: resident.profilePinned ? "pin.fill" : "pin")
                             .accessibilityLabel(LS("常駐を維持"))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(resident.keepLoaded ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(resident.profilePinned ? Color.accentColor : Color.secondary)
+                    // Until settings are read, there is no profile list to merge
+                    // against; the server-side merge makes an empty snapshot
+                    // harmless, but an operation with no known current state is
+                    // still disabled rather than guessed (AC-7-4).
+                    .disabled(!model.settingsLoaded || model.busy)
                     Button {
                         Task { await model.unloadModel(resident.id) }
                     } label: {
@@ -300,7 +348,8 @@ struct MenuBarView: View {
         if let bytes = resident.memoryReservationBytes, bytes > 0 {
             parts.append(String(format: "%.1f GB", Double(bytes) / 1_073_741_824))
         }
-        if resident.keepLoaded { parts.append(LS("固定")) }
+        if resident.profilePinned { parts.append(LS("固定")) }
+        else if resident.keepLoaded { parts.append(LS("一時")) }
         return parts.joined(separator: " · ")
     }
 

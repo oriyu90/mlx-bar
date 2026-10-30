@@ -40,6 +40,17 @@ struct ResidentModel: Identifiable, Hashable {
     let memoryReservationBytes: Int64?
     let activeLeases: Int
     let keepLoaded: Bool
+    /// Whether the *saved profile* pins this model (v3.2.0 additive
+    /// `profilePinned` in `loadedModels[]`).
+    ///
+    /// `keepLoaded` has always been `slot.keep_loaded or slot.session_pinned`,
+    /// so a model loaded by hand (`pin=True` by default) looked pinned even
+    /// though no profile named it — and un-pinning it removed nothing, leaving
+    /// the icon on screen (ISS-7). `profilePinned` is the profile-only signal
+    /// and is the sole basis for the "固定" label; a session-only pin is shown
+    /// as "一時" instead. Coordinators older than v3.2.0 omit the key, where
+    /// `keepLoaded` is the only information available, so fall back to it.
+    let profilePinned: Bool
     let managedExternally: Bool
     /// Number of same-model replica processes (v1.8.0); 1 for the common case.
     let replicaCount: Int
@@ -80,6 +91,7 @@ struct ResidentModel: Identifiable, Hashable {
         memoryReservationBytes = (value["memoryReservationBytes"] as? NSNumber)?.int64Value
         activeLeases = (value["activeLeases"] as? NSNumber)?.intValue ?? 0
         keepLoaded = value["keepLoaded"] as? Bool ?? false
+        profilePinned = (value["profilePinned"] as? Bool) ?? (value["keepLoaded"] as? Bool ?? false)
         managedExternally = value["memoryManagedBy"] != nil || (value["poolState"] as? String) == "external"
         replicaCount = (value["replicaCount"] as? NSNumber)?.intValue ?? 1
         replicaIndex = (value["replicaIndex"] as? NSNumber)?.intValue ?? 0
@@ -167,6 +179,38 @@ struct ResidentModel: Identifiable, Hashable {
     func idleCountdownText(japanese: Bool) -> String? {
         guard isIdleManaged, let remaining = idleSecondsRemaining, remaining > 0 else { return nil }
         return japanese ? "あと\(remaining)秒で解放" : "Unloads in \(remaining) sec"
+    }
+}
+
+/// Outcome of the coordinator's startup resident-model preload.
+///
+/// The coordinator reports this as the additive `preload` key of
+/// `/api/v1/status` (v3.2.0). It is absent on older coordinators, so every
+/// access is optional and the GUI simply shows nothing in that case. Without
+/// it, a failed preload was only a `logging.warning` on the server (ISS-3):
+/// the menu bar showed "no model loaded" with no reason.
+struct PreloadStatus: Hashable {
+    /// "pending" | "running" | "loaded" | "failed" | "skipped".
+    let state: String
+    let modelId: String?
+    /// Server-side Japanese detail, used only when `code` is unknown to
+    /// `CoordinatorErrorText`.
+    let reason: String?
+    /// Stable machine code (`MEMORY_BUDGET_EXCEEDED`, …), preferred for display.
+    let code: String?
+    let at: Date?
+
+    init?(_ value: [String: Any]) {
+        guard let state = value["state"] as? String else { return nil }
+        self.state = state
+        modelId = value["modelId"] as? String
+        reason = value["reason"] as? String
+        code = value["code"] as? String
+        if let timestamp = (value["at"] as? NSNumber)?.doubleValue, timestamp > 0 {
+            at = Date(timeIntervalSince1970: timestamp)
+        } else {
+            at = nil
+        }
     }
 }
 
@@ -345,6 +389,16 @@ struct RagQueryHit: Identifiable, Hashable {
 final class MenuBarViewModel: ObservableObject {
     @Published var serviceRunning = false
     @Published var serviceStatus = "Service stopped"
+    /// Whether the last status poll failed, i.e. the coordinator is unreachable.
+    ///
+    /// This is the *persistent* half of what used to be crammed into
+    /// `errorMessage`: an outage lasting minutes cannot be expressed by a
+    /// message that self-destructs after 20 seconds, and re-posting it on every
+    /// poll (once a second while the menu is open) meant the red text never
+    /// went away (ISS-1). Connection loss is now shown by `serviceStatus`
+    /// ("サービス停止" / "Service stopped") plus the menu bar icon, and never by
+    /// the transient banner. Internal state only — no API surface change.
+    @Published private(set) var connectionLost = false
     @Published var loadedName: String?
     @Published var loadedEngine: String?
     @Published var loadedModalities: [String] = []
@@ -372,6 +426,9 @@ final class MenuBarViewModel: ObservableObject {
     /// by the idle TTL rather than by an explicit unload.
     @Published var nonResidentModelCount = 0
     @Published var residentModels: [ResidentModel] = []
+    /// Latest resident-model preload state from `/api/v1/status` (v3.2.0
+    /// additive `preload`). Nil on older coordinators, or before the first poll.
+    @Published var preload: PreloadStatus?
     @Published var modelPoolReservedBytes: Int64 = 0
     @Published var modelPoolBudgetBytes: Int64 = 0
     @Published var generationConcurrency = 1
@@ -423,18 +480,40 @@ final class MenuBarViewModel: ObservableObject {
     @Published var exportImportMessage: String?
     @Published var diagnosticsSummary: [String: String] = [:]
     @Published var busy = false
+    /// Transient, user-action-scoped error text (auto-dismisses; see
+    /// `errorDismissDuration`). Background polling must never write here — use
+    /// `connectionLost` for that. `didSet` arms a cancellation-safe timer and
+    /// only clears the message it was armed for.
     @Published var errorMessage: String? {
         didSet {
             errorClearTask?.cancel()
-            if errorMessage != nil {
-                errorClearTask = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(20))
-                    await MainActor.run { self?.errorMessage = nil }
-                }
+            errorClearGeneration &+= 1
+            let generation = errorClearGeneration
+            guard let message = errorMessage else { return }
+            let duration = errorDismissDuration
+            errorClearTask = Task { [weak self] in
+                // A cancelled sleep must return without clearing: the old
+                // `try?` swallowed the CancellationError and fell through to
+                // `errorMessage = nil`, which wiped the *newer* error the
+                // cancellation was reacting to (ISS-1 / AC-1-2).
+                do { try await Task.sleep(for: duration) } catch { return }
+                guard let self, self.errorClearGeneration == generation,
+                      self.errorMessage == message else { return }
+                self.errorMessage = nil
             }
         }
     }
+    /// How long a transient `errorMessage` stays on screen.
+    ///
+    /// A `static let` so the lifetime is defined in one place and no settings
+    /// key is added (settings schema stays unchanged). `errorDismissDuration`
+    /// is the per-instance copy a test can shorten.
+    static let errorAutoDismissDuration: Duration = .seconds(20)
+    /// Instance copy of `errorAutoDismissDuration`; production never changes
+    /// it, tests inject a short value so they do not sleep for 20 seconds.
+    var errorDismissDuration: Duration = MenuBarViewModel.errorAutoDismissDuration
     private var errorClearTask: Task<Void, Never>?
+    private var errorClearGeneration = 0
     @Published var chatOutput = ""
     /// Upper bound for `chatOutput`: a long agent reply would otherwise live
     /// for the whole app session as an ever-copied Swift String (plus a full
@@ -450,6 +529,18 @@ final class MenuBarViewModel: ObservableObject {
     @Published var cancellationInProgress = false
     @Published var cancellationStatus: String?
     @Published var settings: [String: Any] = [:]
+    /// True once `/api/v1/settings` has been read successfully at least once.
+    /// Pin / replica / per-model memory controls stay disabled until then: a
+    /// pin action built from an empty snapshot used to rewrite the whole
+    /// `profiles` array from nothing and drop every other residency setting
+    /// (ISS-7 / AC-7-4).
+    @Published private(set) var settingsLoaded = false
+    /// Non-nil when the coordinator had to restore defaults because its config
+    /// file could not be read (`settingsRecoveredFrom` in `/api/v1/status`).
+    /// Shown once — the recovery name is remembered in
+    /// `settingsRecoveryShownFor` — and cleared by
+    /// `dismissSettingsRecoveryNotice()` (ISS-4 / AC-4-4).
+    @Published var settingsRecoveryNotice: String?
     @Published var apiToken = ""
     @Published var lmStudioToken = ""
     @Published var secretStatus: String?
@@ -461,8 +552,19 @@ final class MenuBarViewModel: ObservableObject {
     @Published var guiLanguage = "en" {
         // Views read their strings through `LS(_:)`, which resolves against the
         // language recorded here, so the two must move together.
-        didSet { AppLanguage.current = guiLanguage }
+        didSet {
+            AppLanguage.current = guiLanguage
+            // Read-only mirror for the very first frame of the next launch: the
+            // settings fetch only completes after the coordinator answers, so
+            // without this the menu bar opened in English and then flipped
+            // (ISS-4 / AC-4-1). Writing it here keeps the mirror equal to what
+            // is actually displayed, and a server response still wins because
+            // `applyGUILanguage` assigns this same property (AC-4-5).
+            UserDefaults.standard.set(guiLanguage, forKey: Self.guiLanguageDefaultsKey)
+        }
     }
+    /// `UserDefaults` key holding the last interface language shown.
+    static let guiLanguageDefaultsKey = "guiLanguage"
     // MARK: - oMLX
     @Published var omlxEnabled = false
     @Published var omlxServerUrl = "http://127.0.0.1:8000"
@@ -486,6 +588,42 @@ final class MenuBarViewModel: ObservableObject {
     private var requestedCancellations: Set<String> = []
     private var localLoadInProgress = false
     private var monitoredRuntimeJobIDs: Set<String> = []
+    /// Recovery name whose banner has already been posted, so a persistent
+    /// `settingsRecoveredFrom` in every status poll does not re-show it.
+    private var settingsRecoveryShownFor: String?
+    /// Handle for the bounded settings-retry loop (at most one at a time).
+    private var settingsRetryTask: Task<Void, Never>?
+    /// Backoff after a failed first settings read: 3s / 10s / 30s, then stop
+    /// (WP-411). Bounded on purpose — an unbounded loop would hammer a
+    /// coordinator that is simply not installed.
+    static let settingsRetryDelays: [Duration] = [.seconds(3), .seconds(10), .seconds(30)]
+    /// Instance copy of `settingsRetryDelays` that a test can shorten.
+    var settingsRetryDelaySchedule: [Duration] = MenuBarViewModel.settingsRetryDelays
+    /// How many retries the loop has run (exposed for tests).
+    private(set) var settingsRetryAttempts = 0
+
+    /// Restores the last interface language before the first frame is drawn.
+    ///
+    /// `AppLanguage.current` is what every `LS(_:)` call resolves against; a
+    /// `didSet` observer does not fire for assignments made inside the
+    /// initializer, so it is set explicitly here. No network access: the point
+    /// is that the first frame is already right when the coordinator is slow or
+    /// absent (AC-4-1 / AC-4-3).
+    init() {
+        if let stored = UserDefaults.standard.string(forKey: Self.guiLanguageDefaultsKey),
+           AppLanguage.supported.contains(stored) {
+            guiLanguage = stored
+            AppLanguage.current = stored
+        }
+    }
+
+    /// Applies an interface language from either the coordinator (authoritative)
+    /// or a user action. `guiLanguage`'s observer keeps `AppLanguage.current`
+    /// and the `UserDefaults` mirror in step.
+    func applyGUILanguage(_ language: String) {
+        guard AppLanguage.supported.contains(language) else { return }
+        guiLanguage = language
+    }
 
     private func ui(_ english: String, _ japanese: String) -> String {
         guiLanguage == "ja" ? japanese : english
@@ -515,6 +653,11 @@ final class MenuBarViewModel: ObservableObject {
 
     var icon: String {
         if errorMessage != nil { return "exclamationmark.triangle" }
+        // A lost coordinator is persistent state, not an error the user can
+        // dismiss: a slashed-network glyph says so without repainting the
+        // icon red forever (the old behaviour re-armed the error text every
+        // poll, so the triangle never went away — ISS-1).
+        if connectionLost { return "wifi.slash" }
         if busy || activeRequestCount > 0 || queuedRequestCount > 0 { return "waveform" }
         if loadedName != nil { return "cpu.fill" }
         return serviceRunning ? "cpu" : "moon.zzz"
@@ -526,11 +669,60 @@ final class MenuBarViewModel: ObservableObject {
         return loadedName ?? (serviceRunning ? "MLXBar" : (guiLanguage == "ja" ? "停止" : "Stopped"))
     }
 
+    /// Localized line for the coordinator's resident-model preload state, with
+    /// whether it is a failure (rendered as a warning, not a transient error).
+    ///
+    /// Nothing is returned for "loaded" / "skipped": the model list already
+    /// tells that story, and a permanent "loaded" line would just add noise to
+    /// the popover. The reason prefers the machine code (so English stays
+    /// English) and falls back to the server's message for unknown codes.
+    var preloadStatusLine: (text: String, failed: Bool)? {
+        guard let preload else { return nil }
+        switch preload.state {
+        case "pending", "running":
+            return (LS("常駐モデルを読み込み中…"), false)
+        case "failed":
+            var reason = CoordinatorErrorText.resolve(
+                code: preload.code, serverMessage: preload.reason, language: guiLanguage)
+            // Table sentences end with a period and the template adds one back,
+            // so drop it here instead of printing "(reason: …limit.).".
+            if reason.hasSuffix(".") { reason.removeLast() }
+            return (String(format: LS("常駐モデルの読み込みに失敗しました（理由: %@）"), reason), true)
+        default:
+            return nil
+        }
+    }
+
+    /// Applies `status.settingsRecoveredFrom`, announcing the recovery at most
+    /// once per backup name.
+    ///
+    /// Split out of `refreshStatus` so the once-only behaviour is testable
+    /// without a live coordinator: the key stays in every status response for
+    /// the life of the process, and re-announcing it would make the banner
+    /// indistinguishable from a permanent red line (AC-4-4).
+    func applySettingsRecovery(_ recovered: String?) {
+        guard let recovered, !recovered.isEmpty,
+              settingsRecoveryShownFor != recovered else { return }
+        settingsRecoveryShownFor = recovered
+        settingsRecoveryNotice = String(
+            format: LS("設定ファイルを読み込めなかったため、初期値に戻しました（バックアップ: %@）"),
+            recovered)
+    }
+
+    func dismissSettingsRecoveryNotice() {
+        settingsRecoveryNotice = nil
+    }
+
     func start() async {
         guard !started else { return }
         started = true
         do { try await client.startService() } catch { errorMessage = presentError(error) }
         await refreshAll()
+        // The coordinator can be slower to start than the GUI. Rather than
+        // leaving the interface stuck on defaults until the user opens
+        // Settings (ISS-4), retry the settings read a bounded number of times
+        // in the background (3s / 10s / 30s, stop on success).
+        if !settingsLoaded { beginSettingsRetry() }
         await refreshSetupStatus()
         polling?.cancel()
         polling = Task { [weak self] in
@@ -541,6 +733,42 @@ final class MenuBarViewModel: ObservableObject {
                 await self.refreshStatus()
             }
         }
+    }
+
+    /// Starts the bounded settings-retry loop unless one is already running.
+    ///
+    /// `loader` and `delays` exist so a unit test can exercise the scheduling
+    /// (attempt count, stop-on-success, no unbounded loop) without a live
+    /// coordinator; the returned task lets a test await the loop's completion
+    /// instead of sleeping, which keeps it immune to timer coalescing.
+    /// Production always uses `refreshSettings` and `settingsRetryDelaySchedule`
+    /// and ignores the return value.
+    @discardableResult
+    func beginSettingsRetry(delays: [Duration]? = nil,
+                            loader: (() async -> Bool)? = nil) -> Task<Void, Never>? {
+        guard settingsRetryTask == nil else { return nil }
+        let schedule = delays ?? settingsRetryDelaySchedule
+        let task = Task { [weak self] in
+            for delay in schedule {
+                do { try await Task.sleep(for: delay) } catch {
+                    self?.settingsRetryTask = nil
+                    return
+                }
+                if Task.isCancelled { break }
+                guard let self else { return }
+                self.settingsRetryAttempts += 1
+                var loaded = false
+                if let loader {
+                    loaded = await loader()
+                } else {
+                    loaded = await self.refreshSettings()
+                }
+                if loaded { break }
+            }
+            self?.settingsRetryTask = nil
+        }
+        settingsRetryTask = task
+        return task
     }
 
     func refreshAll() async {
@@ -574,12 +802,14 @@ final class MenuBarViewModel: ObservableObject {
         do {
             guard let json = try await json("GET", "/api/v1/status") as? [String: Any] else { return }
             guard token == statusRequestToken else { return }
-            let wasRunning = serviceRunning
             setIfChanged(\.serviceRunning, true)
-            // A successful status poll must not erase a model/runtime error the
-            // user still needs to read. Only clear an earlier connection error
-            // when the service has actually recovered.
-            if !wasRunning { setIfChanged(\.errorMessage, nil) }
+            // Recovery belongs to the *connection* channel now. A successful
+            // poll clears `connectionLost` and deliberately leaves
+            // `errorMessage` alone: an unrelated transient error the user is
+            // still reading must not be erased by a background refresh
+            // (AC-1-4), and connection loss no longer lives in that channel at
+            // all (AC-1-1).
+            setIfChanged(\.connectionLost, false)
             setIfChanged(\.serviceStatus, json["service"] as? String == "running"
                 ? (guiLanguage == "ja" ? "サービス稼働中" : "Service running")
                 : (guiLanguage == "ja" ? "サービス停止" : "Service stopped"))
@@ -660,6 +890,11 @@ final class MenuBarViewModel: ObservableObject {
                 }
                 if (value["keepLoaded"] as? Bool) == true {
                     existing["keepLoaded"] = true
+                }
+                // Any replica carrying a saved profile pins the row: `profiles`
+                // is per model id, not per replica.
+                if (value["profilePinned"] as? Bool) == true {
+                    existing["profilePinned"] = true
                 }
                 if value["memoryManagedBy"] != nil {
                     existing["memoryManagedBy"] = value["memoryManagedBy"]
@@ -788,6 +1023,15 @@ final class MenuBarViewModel: ObservableObject {
                     setIfChanged(\.ragLastRetrievalText, nil)
                 }
             }
+            // v3.2.0 additive keys. Both are read defensively, so a coordinator
+            // that predates them simply leaves the corresponding state empty
+            // instead of failing the whole poll.
+            if let value = json["preload"] as? [String: Any] {
+                setIfChanged(\.preload, PreloadStatus(value))
+            } else {
+                setIfChanged(\.preload, nil)
+            }
+            applySettingsRecovery(json["settingsRecoveredFrom"] as? String)
             if let api = json["api"] as? [String: Any] {
                 setIfChanged(\.apiURL, api["url"] as? String ?? apiURL)
                 setIfChanged(\.localAPIURL, api["localUrl"] as? String ?? apiURL)
@@ -798,22 +1042,38 @@ final class MenuBarViewModel: ObservableObject {
             }
         } catch {
             guard token == statusRequestToken else { return }
+            // Persistent state, not a transient banner: the old code wrote
+            // `presentError` here on every poll, and the open menu polls once
+            // a second, so the red text came back less than a second after the
+            // 20-second timer cleared it (ISS-1). The log line is for
+            // diagnosis; the UI learns the same fact from `serviceStatus` and
+            // the icon.
+            if !connectionLost {
+                NSLog("MLXBar: status poll failed: %@", String(describing: error))
+            }
+            setIfChanged(\.connectionLost, true)
             setIfChanged(\.serviceRunning, false)
             setIfChanged(\.serviceStatus, guiLanguage == "ja" ? "サービス停止" : "Service stopped")
             setIfChanged(\.activeRequestCount, 0)
             setIfChanged(\.queuedRequestCount, 0); setIfChanged(\.oldestQueuedSeconds, 0)
             setIfChanged(\.liveGenerationTPS, nil)
-            setIfChanged(\.errorMessage, presentError(error))
         }
     }
 
-    func refreshModels() async {
-        errorMessage = nil
+    /// Model list refresh. Returns false when the fetch failed, so a *user*
+    /// action (rescan) can report it while the background refresh stays quiet:
+    /// a failed background refresh is already visible as `connectionLost`.
+    @discardableResult
+    func refreshModels() async -> Bool {
         do {
             guard let json = try await json("GET", "/api/v1/models") as? [String: Any],
-                  let data = json["data"] as? [[String: Any]] else { return }
+                  let data = json["data"] as? [[String: Any]] else { return true }
             models = data.compactMap(CatalogModel.init)
-        } catch { errorMessage = presentError(error) }
+            return true
+        } catch {
+            NSLog("MLXBar: model list refresh failed: %@", String(describing: error))
+            return false
+        }
     }
 
     // MARK: - oMLX
@@ -827,7 +1087,9 @@ final class MenuBarViewModel: ObservableObject {
                 omlxEnabled = omlx["enabled"] as? Bool ?? false
                 omlxServerUrl = omlx["serverUrl"] as? String ?? "http://127.0.0.1:8000"
             }
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: oMLX settings refresh failed: %@", String(describing: error))
+        }
     }
 
     func refreshOMLXStatus() async {
@@ -843,8 +1105,12 @@ final class MenuBarViewModel: ObservableObject {
             // provider corrected stays visible in the settings field.
             if let url = json["serverUrl"] as? String, !url.isEmpty { omlxServerUrl = url }
             omlxVersion = json["version"] as? String ?? ""
-            omlxError = json["error"] as? String
             let connected = json["connected"] as? Bool ?? false
+            // A successful connection clears the previous failure text: the
+            // server can keep echoing the last error after it is answering
+            // again, and a red label that outlives its cause is what made the
+            // oMLX page look permanently broken.
+            omlxError = connected ? nil : (json["error"] as? String)
             let modelsData = (json["models"] as? [[String: Any]]) ?? []
             // Routing lives in `models.omlx.modelRouting` (v2.10.0); the
             // v2.9.0 GUI read a flat `omlx.routing` the server never wrote.
@@ -959,7 +1225,9 @@ final class MenuBarViewModel: ObservableObject {
             if let token = try await json("GET", "/api/v1/settings/omlx-token") as? [String: Any] {
                 omlxApiKey = token["token"] as? String ?? ""
             }
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: oMLX API key refresh failed: %@", String(describing: error))
+        }
     }
 
     // MARK: - oMLX setup (v2.10.0) — install / start / stop from the Runtime page
@@ -967,7 +1235,9 @@ final class MenuBarViewModel: ObservableObject {
     func refreshOMLXSetupRequirements() async {
         do {
             omlxRequirements = try await json("GET", "/api/v1/omlx/setup/requirements") as? [String: Any] ?? [:]
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: oMLX setup requirements refresh failed: %@", String(describing: error))
+        }
     }
 
     func startOMLXSetup(_ action: String) async {
@@ -1027,7 +1297,15 @@ final class MenuBarViewModel: ObservableObject {
         await perform {
             let job = try await self.json("POST", "/api/v1/models/scan") as? [String: Any]
             if let job { _ = try await self.waitForJob(job) }
-            await self.refreshModels()
+            // The rescan is a user action, so a failed list refresh has to be
+            // reported rather than swallowed (refreshModels itself stays quiet
+            // because the polling loop calls it too).
+            let refreshed = await self.refreshModels()
+            if !refreshed {
+                throw ClientError.command(
+                    self.ui("The model list could not be refreshed.",
+                            "モデル一覧を更新できませんでした"))
+            }
         }
     }
 
@@ -1163,7 +1441,6 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshRuntimes() async {
-        errorMessage = nil
         do {
             guard let json = try await json("GET", "/api/v1/runtimes") as? [String: Any] else { return }
             runtimes = ["mlx-lm", "mlx-vlm"].compactMap { engine in
@@ -1180,7 +1457,9 @@ final class MenuBarViewModel: ObservableObject {
             for runtime in runtimes {
                 if let job = runtime.activeJob { attachRuntimeJob(runtime.id, job) }
             }
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: runtime list refresh failed: %@", String(describing: error))
+        }
     }
 
     func refreshRuntimeManager() async {
@@ -1292,14 +1571,33 @@ final class MenuBarViewModel: ObservableObject {
         }
     }
 
-    func refreshSettings() async {
+    /// Reads `/api/v1/settings` and mirrors the authoritative interface
+    /// language.
+    ///
+    /// Returns `false` when the read failed, which is what lets
+    /// `beginSettingsRetry()` back off and try again (WP-411) and lets a caller
+    /// tell "empty settings" apart from "not fetched yet". A failure is
+    /// deliberately not turned into `errorMessage`: this is a background read
+    /// against a coordinator that may simply still be starting (ISS-4), and the
+    /// retry loop is the remedy — a red banner that reappears is exactly what
+    /// ISS-1 is about.
+    @discardableResult
+    func refreshSettings() async -> Bool {
         do {
-            settings = try await json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
-            guiLanguage = ((settings["general"] as? [String: Any])?["language"] as? String) ?? "en"
+            let value = try await json("GET", "/api/v1/settings") as? [String: Any] ?? [:]
+            settings = value
+            settingsLoaded = true
+            // The server wins: if it says "en" the mirror goes back to "en"
+            // (AC-4-5). The observer on `guiLanguage` re-writes the
+            // UserDefaults mirror, so the two never diverge.
+            applyGUILanguage(((value["general"] as? [String: Any])?["language"] as? String) ?? "en")
             effectiveMaxTokens = loadedModelMaxTokens.map { min(configuredMaxTokens, $0) } ?? configuredMaxTokens
             await reconcileLaunchAtLogin()
+            return true
+        } catch {
+            NSLog("MLXBar: settings refresh failed: %@", String(describing: error))
+            return false
         }
-        catch { errorMessage = presentError(error) }
     }
 
     /// Applies `general.launchAtLogin` to the actual OS registration.
@@ -1326,8 +1624,10 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func setGUILanguage(_ language: String) async {
-        guard ["en", "ja"].contains(language) else { return }
-        guiLanguage = language
+        guard AppLanguage.supported.contains(language) else { return }
+        // Applies immediately (and refreshes the mirror) instead of waiting for
+        // the round-trip, so the picker never appears stuck.
+        applyGUILanguage(language)
         await setConfig("general.language", value: language)
     }
 
@@ -1643,20 +1943,29 @@ final class MenuBarViewModel: ObservableObject {
                               "モデルごとの上限は1〜512 GBで指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
+        // The ceiling only means something for a saved residency profile; the
+        // old code refused the same way before rewriting the array.
+        let profiles = (settings["models"] as? [String: Any])?["pool"] as? [String: Any]
+        let hasProfile = ((profiles?["profiles"] as? [[String: Any]]) ?? []).contains {
+            ($0["modelId"] as? String) == modelId && ($0["keepLoaded"] as? Bool) == true
+        }
+        guard hasProfile else {
+            errorMessage = ui("Pin the model as resident first",
+                              "先にモデルを常駐指定してください")
+            return
+        }
         await perform {
-            let pool = (self.settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
-            var profiles = (pool["profiles"] as? [[String: Any]]) ?? []
-            guard let index = profiles.firstIndex(where: { ($0["modelId"] as? String) == modelId }) else {
-                self.errorMessage = self.ui("Pin the model as resident first",
-                                            "先にモデルを常駐指定してください")
-                return
-            }
-            var updated = profiles[index]
-            updated["maxMemoryGB"] = maxGB
-            profiles[index] = updated
-            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
-                "profiles": profiles,
-            ]]])
+            // Per-model merge (v3.2.0): keepLoaded is re-stated (the endpoint
+            // requires it) and the rest of this profile's fields are preserved
+            // server-side, as are all other models' profiles.
+            _ = try await self.json(
+                "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
+                ["keepLoaded": true, "maxMemoryGB": maxGB])
             await self.refreshSettings()
         }
     }
@@ -1880,7 +2189,9 @@ final class MenuBarViewModel: ObservableObject {
             if let token = try await json("GET", "/api/v1/settings/rag-embedding-token") as? [String: Any] {
                 ragEmbeddingToken = token["token"] as? String ?? ""
             }
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: knowledge-base status refresh failed: %@", String(describing: error))
+        }
     }
 
     /// Contacts the embedding endpoint and reports reachability + dimension.
@@ -1970,7 +2281,9 @@ final class MenuBarViewModel: ObservableObject {
                 "/api/v1/rag/collections/\(pathComponent(collection))/documents") as? [String: Any],
                   let data = json["data"] as? [[String: Any]] else { return }
             ragDocuments = data.compactMap(RagDocumentInfo.init)
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: RAG document refresh failed: %@", String(describing: error))
+        }
     }
 
     func addRagDocument(collection: String, title: String, text: String) async {
@@ -2026,31 +2339,44 @@ final class MenuBarViewModel: ObservableObject {
     /// Add or remove a model from the pool's keep-loaded profile list.  The
     /// preload at the next service start reads this list; an explicit load is
     /// still needed to make it resident right now.
+    /// Add or remove a model from the pool's keep-loaded profile list.
+    ///
+    /// v3.2.0 sends the *per-model* endpoint instead of rewriting the whole
+    /// `profiles` array from the GUI's snapshot. The rewrite lost every other
+    /// residency setting whenever the snapshot was empty or stale (ISS-7 /
+    /// AC-7-4), and it could not express "remove just this model" at all. The
+    /// server merges by `modelId`; `keepLoaded: false` removes the entry.
     func setModelPin(_ modelId: String, keepLoaded: Bool) async {
-        let pool = (settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
-        let existing = (pool["profiles"] as? [[String: Any]] ?? [])
-            .first { ($0["modelId"] as? String) == modelId }
-        var profiles = (pool["profiles"] as? [[String: Any]] ?? [])
-            .filter { ($0["modelId"] as? String) != modelId }
-        if keepLoaded {
-            var profile: [String: Any] = ["modelId": modelId, "keepLoaded": true]
-            if let replicas = (existing?["replicas"] as? NSNumber)?.intValue, replicas > 1 {
-                profile["replicas"] = replicas
-            }
-            profiles.append(profile)
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
         }
         await perform {
-            _ = try await self.json("PUT", "/api/v1/settings",
-                                    ["models": ["pool": ["profiles": profiles]]])
-            await self.refreshSettings()
+            _ = try await self.json(
+                "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
+                ["keepLoaded": keepLoaded])
+            var loadError: Error?
             if keepLoaded {
                 // Make it resident now too, not just at the next service start.
-                // Model loads legitimately take minutes, so use the load timeout.
-                _ = try? await self.json(
-                    "POST", "/api/v1/models/\(self.pathComponent(modelId))/load",
-                    ["engine": "auto"], timeoutSeconds: CoordinatorClient.Timeout.modelLoad)
-                await self.refreshStatus()
+                // Model loads legitimately take minutes, so use the load
+                // timeout. No `try?` here: a pin whose load failed used to be
+                // silent, leaving the user with a pinned model that is not
+                // running and no explanation (AC-7-5).
+                do {
+                    _ = try await self.json(
+                        "POST", "/api/v1/models/\(self.pathComponent(modelId))/load",
+                        ["engine": "auto"], timeoutSeconds: CoordinatorClient.Timeout.modelLoad)
+                } catch {
+                    loadError = error
+                }
             }
+            await self.refreshSettings()
+            await self.refreshStatus()
+            // Re-thrown so `perform` puts the localized reason in
+            // `errorMessage`; the settings/status refresh above still ran, so
+            // the pin itself shows as applied.
+            if let loadError { throw loadError }
         }
     }
 
@@ -2062,16 +2388,17 @@ final class MenuBarViewModel: ObservableObject {
             errorMessage = ui("Replicas must be between 1 and 8", "並列数は1〜8で指定してください")
             return
         }
-        let pool = (settings["models"] as? [String: Any])?["pool"] as? [String: Any] ?? [:]
-        var profiles = (pool["profiles"] as? [[String: Any]] ?? [])
-        if let index = profiles.firstIndex(where: { ($0["modelId"] as? String) == modelId }) {
-            profiles[index]["replicas"] = replicas
-        } else {
-            profiles.append(["modelId": modelId, "keepLoaded": true, "replicas": replicas])
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
         }
         await perform {
-            _ = try await self.json("PUT", "/api/v1/settings",
-                                    ["models": ["pool": ["profiles": profiles]]])
+            // Per-model merge (v3.2.0): only this model's entry is touched, so
+            // a stale snapshot cannot drop another model's residency settings.
+            _ = try await self.json(
+                "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
+                ["keepLoaded": true, "replicas": replicas])
             await self.refreshSettings()
         }
     }
@@ -2102,7 +2429,6 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshSecrets() async {
-        errorMessage = nil
         do {
             if let api = try await json("GET", "/api/v1/settings/api-token") as? [String: Any] {
                 apiToken = api["token"] as? String ?? ""
@@ -2110,7 +2436,9 @@ final class MenuBarViewModel: ObservableObject {
             if let lm = try await json("GET", "/api/v1/settings/lm-studio-token") as? [String: Any] {
                 lmStudioToken = lm["token"] as? String ?? ""
             }
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            NSLog("MLXBar: secret refresh failed: %@", String(describing: error))
+        }
     }
 
     func refreshPromptCache() async {
@@ -2196,14 +2524,18 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func refreshRecentLogs() async {
-        errorMessage = nil
         do {
             guard let result = try await json("GET", "/api/v1/logs?limit=200") as? [String: Any] else { return }
             recentLogs = result["data"] as? [[String: Any]] ?? []
             logStatus = recentLogs.isEmpty
                 ? ui("No API access has been recorded", "記録されたAPIアクセスはありません")
                 : ui("Showing the latest \(recentLogs.count) entries (2,000 retained)", "最新\(recentLogs.count)件を表示中（最大2,000件保存）")
-        } catch { errorMessage = presentError(error) }
+        } catch {
+            // Page-scoped status line rather than the transient banner: this is
+            // a refresh, and the log pane is the right place for its own
+            // failure (errorMessage is reserved for user actions).
+            logStatus = presentError(error)
+        }
     }
 
     func clearRecentLogs() async {
