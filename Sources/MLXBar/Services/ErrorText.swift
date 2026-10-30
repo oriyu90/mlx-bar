@@ -170,6 +170,67 @@ enum CoordinatorErrorText {
         "OMLX_COMMAND_FAILED": (
             "oMLXのコマンドが失敗しました",
             "The oMLX command failed."),
+        // v3.2.0: memory admission split (ISS-6), bundled-loader / format /
+        // tokenizer classification (ISS-5), and the vision-image warning
+        // (ISS-2). These codes are part of the E1/E2 interface contract, so they
+        // are registered here even though some are currently only emitted by
+        // the coordinator: an unknown code would otherwise fall through to the
+        // server's Japanese message in an English interface (AC-5-6).
+        "MEMORY_HEADROOM_INSUFFICIENT": (
+            "メモリの余白が不足しています。常駐モデルを減らすか、モデルのメモリ上限を調整してください",
+            "There is not enough memory headroom. Unload a resident model or adjust the model's memory limit."),
+        "MEMORY_BUDGET_TOTAL": (
+            "モデル用に確保した総メモリ予算を超えています。常駐設定を見直してください",
+            "The total memory budget for models is exceeded. Review the residency settings."),
+        "MEMORY_POOL_EXHAUSTED": (
+            "モデルを置ける空きスロットがありません。常駐モデルを減らしてください",
+            "No resident model slot is free. Unload a resident model."),
+        "MEMORY_POSTLOAD_EXCEEDED": (
+            "ロード後の実測メモリが上限を超えたため、モデルを解放しました",
+            "Measured memory after loading exceeded the limit, so the model was unloaded."),
+        "MODEL_NEEDS_BUNDLED_LOADER": (
+            "このモデルは同梱ローダが必要です。対応版で読み込めます",
+            "This model requires a bundled loader, available in a later version."),
+        "MODEL_FORMAT_UNSUPPORTED": (
+            "このモデルの形式には対応していません",
+            "This model's format is not supported."),
+        "MODEL_QUANT_UNSUPPORTED": (
+            "このモデルの量子化形式には対応していません",
+            "This model's quantization format is not supported."),
+        "MODEL_TOKENIZER_MISSING": (
+            "このモデルにはトークナイザーが含まれていません",
+            "This model does not include a tokenizer."),
+        "VISION_IMAGE_DROPPED": (
+            "このランタイムでは画像入力が使われないため、添付画像は破棄されます",
+            "This runtime does not accept images, so attached images are discarded."),
+        // v3.2.0 (WP-R1): request-validation codes the API already returned but
+        // that were never registered here, so an English interface showed the
+        // server's Japanese `message` verbatim (AC-5-6). `INVALID_PROFILE` is
+        // new in v3.2.0 (per-model residency-profile merge); the rest predate
+        // it (v2.6.0-v2.10.0). `Tests/test_v3_2_0_error_contract.py` now derives
+        // this list from `Coordinator/mlxbar/api/*.py` instead of a hand-kept
+        // array, so the next added code fails that test until it is registered.
+        "INVALID_PROFILE": (
+            "常駐プロフィールの値が正しくありません。モデルID・keepLoaded・replicas（1〜8）・maxMemoryGB（1〜512）を確認してください",
+            "The residency profile values are not valid. Check the model ID, keepLoaded, replicas (1-8), and maxMemoryGB (1-512)."),
+        "INVALID_PIN": (
+            "pinはtrue/falseで指定してください",
+            "pin must be true or false."),
+        "INVALID_PRESET_MODE": (
+            "modeはlight/fullで指定してください",
+            "mode must be light or full."),
+        "INVALID_SETUP": (
+            "初期設定の値が正しくありません。モデルフォルダ・常駐数（1〜8）・プリセットを確認してください",
+            "The setup values are not valid. Check the models folder, the resident-model count (1-8), and the preset."),
+        "INVALID_IMPORT": (
+            "インポートする設定データが正しくありません",
+            "The settings data being imported is not valid."),
+        "MODEL_NOT_ROUTED": (
+            "このモデルはoMLXにルーティングされていません",
+            "This model is not routed to oMLX."),
+        "RESPONSE_FORMAT_INVALID": (
+            "生成結果がresponse_formatに一致しませんでした",
+            "The generated output did not match response_format."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").
