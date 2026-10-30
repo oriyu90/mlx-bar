@@ -833,6 +833,11 @@ async def put_settings(request: Request, body: dict):
     old_api = deepcopy(app.settings.data["api"])
     old_security = deepcopy(app.settings.data["security"])
     old_profiles = _profile_pin_map(app.settings.data)
+    # v3.2.3 (WP-006): a listener switch that fails used to roll back only
+    # api/security, leaving every other key from the same body applied while
+    # the caller saw a 409. Snapshot the whole document so a failed PUT is
+    # all-or-nothing.
+    old_data = deepcopy(app.settings.data)
     try:
         pending = app.settings.update(body)
     except ValueError as exc:
@@ -844,7 +849,9 @@ async def put_settings(request: Request, body: dict):
             await app.listener.switch(new_api["host"], new_api["port"])
             app.public_listener_error = None
         except Exception as exc:
-            app.settings.update({"api": old_api, "security": old_security})
+            app.settings.data = old_data
+            with contextlib.suppress(Exception):
+                app.settings._atomic_write(old_data)
             raise HTTPException(409, detail={"code": "LISTENER_SWITCH_FAILED", "message": str(exc)})
     if "models" in body:
         _release_unpinned_sessions(app, old_profiles)

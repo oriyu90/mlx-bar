@@ -60,6 +60,48 @@ def candidate_directories(root: Path):
             dirs[:] = []
 
 
+def directory_weight_bytes(path: Path) -> int:
+    """On-disk weight bytes for one model directory, two levels deep.
+
+    A sharded checkpoint keeps its `.safetensors` parts either beside
+    `config.json` or in a `weights/`-style subdirectory, and an HF snapshot
+    directory holds symlinks to blobs one level down. Summing only the top
+    level under-reported those models to a few KB, which the admission math
+    then treated as a nearly free model (F-01).
+
+    0 means "could not measure": the caller must treat that as unknown, not
+    as an empty model.
+    """
+    total = 0
+    measured = False
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+                measured = True
+                continue
+        except OSError:
+            continue
+        if not entry.is_dir():
+            continue
+        try:
+            children = list(entry.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                if child.is_file():
+                    total += child.stat().st_size
+                    measured = True
+            except OSError:
+                continue
+    return total if measured else 0
+
+
 def scan_root(root: Path, source: str) -> list[dict]:
     if not root.exists() or not root.is_dir():
         return []
@@ -67,10 +109,7 @@ def scan_root(root: Path, source: str) -> list[dict]:
     for path in candidate_directories(root):
         real = path.resolve()
         info = classify(real)
-        try:
-            size = sum(p.stat().st_size for p in real.iterdir() if p.is_file())
-        except OSError:
-            size = 0
+        size = directory_weight_bytes(real)
         result.append({
             "id": normalized_id(source, str(real)), "source": source, "name": real.name,
             "path": str(real), "provider_key": None, "size_bytes": size, **info,

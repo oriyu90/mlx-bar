@@ -38,6 +38,21 @@ ANONYMOUS_WEIGHT_RATIO = 0.10
 # ceiling from physical memory instead (see _per_model_limit).
 DEFAULT_PER_MODEL_MAX_GB = 32.0
 DEFAULT_PER_MODEL_PHYSICAL_RATIO = 0.6
+# v3.2.3 (WP-005): a catalog entry with no weight size is *unknown*, not
+# small. The scanner reports 0 when it cannot stat the files (or when an
+# LM Studio API entry was merged without a local path), and treating that 0
+# as "zero bytes of weights" let an unloadable 40 GiB model pass admission
+# with the 512 MiB process floor. Charge the unknown case conservatively.
+DEFAULT_UNKNOWN_WEIGHT_BYTES = 8 * GIB
+# v3.3.0 (WP-010): crash-loop breaker. A WorkerSupervisor lives for one load,
+# so the memory of "this model keeps dying" has to live in the pool, keyed by
+# model id -- otherwise every retry starts with a clean slate and the loop the
+# breaker exists to stop is invisible.
+CRASH_LOOP_WINDOW_SECONDS = 300.0
+CRASH_LOOP_THRESHOLD = 2
+# Replica top-up backoff (F-13): 30s, 60s, 120s ... capped at 10 minutes.
+REPLICA_RETRY_BASE_SECONDS = 30.0
+REPLICA_RETRY_MAX_SECONDS = 600.0
 
 
 class _LaneAbandoned(Exception):
@@ -151,6 +166,10 @@ class ModelPoolSupervisor:
         # only living in a log line. Cleared once the model reaches full width
         # or leaves the pool.
         self._replica_admission_failures: dict[str, dict] = {}
+        # model_id -> monotonic death timestamps inside the breaker window.
+        self._model_crashes: dict[str, list[float]] = {}
+        # model_id -> {attempts, nextAt} for replica admission retries.
+        self._replica_retry: dict[str, dict] = {}
         self._reaper_task: asyncio.Task | None = None
         self.maintenance_engines: set[str] = set()
         # Process topology is latched for this coordinator lifetime. Applying
@@ -434,7 +453,15 @@ class ModelPoolSupervisor:
             return int(float(configured) * GIB)
         settings = self._pool_settings()
         value = settings.get("defaultPerModelMaxGB")
-        if value is not None and abs(float(value) - DEFAULT_PER_MODEL_MAX_GB) > 1e-9:
+        # v3.2.3 (WP-009): `defaultPerModelMaxGBSet` is what makes the value
+        # explicit. Before it existed, a stored document always contained the
+        # shipped 32 (the store persists a full merge), so "user chose 32"
+        # and "user never chose" were the same bytes and the explicit ceiling
+        # was dropped. Absent flag (old config) keeps the historical
+        # behaviour: a non-default value is still honoured.
+        explicit = bool(settings.get("defaultPerModelMaxGBSet", False))
+        if value is not None and (explicit
+                                  or abs(float(value) - DEFAULT_PER_MODEL_MAX_GB) > 1e-9):
             return int(float(value) * GIB)
         physical = self._physical_memory()
         if physical > 0:
@@ -472,8 +499,14 @@ class ModelPoolSupervisor:
 
     @staticmethod
     def _weights_bytes(model: dict) -> int:
-        """On-disk weight charge: mmapped, so reclaimable under pressure."""
-        return max(0, int(model.get("size_bytes", 0) or 0))
+        """On-disk weight charge: mmapped, so reclaimable under pressure.
+
+        v3.2.3 (WP-005): `size_bytes <= 0` means the catalog could not measure
+        the weights, not that they are free. Substituting a conservative
+        constant keeps an unknown model out of the "fits easily" branch.
+        """
+        size = int(model.get("size_bytes", 0) or 0)
+        return size if size > 0 else DEFAULT_UNKNOWN_WEIGHT_BYTES
 
     @classmethod
     def _anonymous_estimate(cls, model: dict) -> int:
@@ -720,9 +753,28 @@ class ModelPoolSupervisor:
         # reclaimable file-backed pages), so a 47 GiB estimate for a 35 GiB
         # model no longer fails on a machine that has 52 GiB free.
         reclaimable = sum(victim.reservation_bytes for victim in evict)
-        if available > 0:
-            anonymous = self._anonymous_estimate(model)
-            effective = available + reclaimable
+        anonymous = self._anonymous_estimate(model)
+        effective = available + reclaimable
+        if available <= 0:
+            # v3.2.3 (WP-005): `available == 0` used to skip the headroom
+            # check entirely, so a failing `vm_stat` (or an unreadable
+            # pressure verdict) silently disabled the last admission guard.
+            # Refuse instead: a machine with no reclaimable memory and a
+            # machine we cannot measure both have to be treated as unsafe.
+            LOGGER.warning(
+                "MEMORY_HEADROOM_INSUFFICIENT reason=unmeasured model=%s "
+                "requested=%.2fGB weights=%.2fGB anonymous=%.2fGB reserve=%.2fGB "
+                "mode=%s",
+                model.get("id") or model.get("name"), estimate / GIB,
+                self._weights_bytes(model) / GIB, anonymous / GIB,
+                reserve / GIB, self._admission_mode())
+            raise MLXBarError(
+                "MEMORY_HEADROOM_INSUFFICIENT",
+                "空きメモリを計測できないため、安全側でロードを中止しました"
+                "（計測不能時は余白ガードを無効化しません）。"
+                "しばらく待って再試行するか、他のアプリを終了してください",
+                503, True)
+        else:
             if anonymous + reserve > effective:
                 breakdown = self._memory_breakdown(
                     model, available=available, reserve=reserve,
@@ -778,6 +830,34 @@ class ModelPoolSupervisor:
             slot.state = "evicting"
             await self._evict_slot(slot)
 
+    def _recent_model_crashes(self, model_id: str,
+                              now: float | None = None) -> list[float]:
+        now = time.monotonic() if now is None else now
+        recent = [at for at in self._model_crashes.get(model_id, [])
+                  if now - at <= CRASH_LOOP_WINDOW_SECONDS]
+        if recent:
+            self._model_crashes[model_id] = recent
+        else:
+            self._model_crashes.pop(model_id, None)
+        return recent
+
+    def _record_model_crash(self, model_id: str, reason: str) -> None:
+        now = time.monotonic()
+        self._model_crashes.setdefault(model_id, []).append(now)
+        recent = self._recent_model_crashes(model_id, now)
+        LOGGER.warning("model crash recorded model=%s reason=%s recent=%d window=%.0fs",
+                       model_id, reason, len(recent), CRASH_LOOP_WINDOW_SECONDS)
+
+    def model_crash_loop(self, model_id: str) -> bool:
+        return len(self._recent_model_crashes(model_id)) >= CRASH_LOOP_THRESHOLD
+
+    def clear_model_crash(self, model_id: str | None = None) -> None:
+        """Explicit user action (unload / pin) releases the breaker."""
+        if model_id is None:
+            self._model_crashes.clear()
+        else:
+            self._model_crashes.pop(model_id, None)
+
     async def load(self, model: dict, engine: str | None = None, *, pin: bool = True) -> dict:
         if not self.enabled:
             return await self._legacy.load(model, engine)
@@ -789,6 +869,14 @@ class ModelPoolSupervisor:
         # native engine boundary. Anything else is an explicit choice
         # (management body engine / CLI --engine / a resolved replica value)
         # and is honored strictly.
+        if self.model_crash_loop(model_id):
+            raise MLXBarError(
+                "MODEL_CRASH_LOOP",
+                "このモデルは短時間に繰り返しクラッシュしたため、自動での再ロードを停止しました"
+                f"（{int(CRASH_LOOP_WINDOW_SECONDS)}秒以内に"
+                f"{len(self._recent_model_crashes(model_id))}回）。"
+                "モデルをアンロードするか、ピン留めを変更してから再試行してください",
+                503, False)
         explicit = bool(engine and engine != "auto")
         chosen = engine or model.get("engine")
         if chosen in self.maintenance_engines:
@@ -989,6 +1077,9 @@ class ModelPoolSupervisor:
                     future.set_result(result)
                 return result
             except BaseException as exc:
+                code = getattr(exc, "code", "")
+                if code in {"WORKER_CRASHED", "WORKER_STALLED"}:
+                    self._record_model_crash(model_id, str(code))
                 await existing.worker.shutdown()
                 async with self._pool_lock:
                     if self._slots.get(slot_key) is existing:
@@ -1116,6 +1207,8 @@ class ModelPoolSupervisor:
             for slot in slots:
                 slot.state = "evicting"
                 await self._evict_slot(slot)
+            # v3.3.0 (WP-010): an explicit unload releases the crash breaker.
+            self.clear_model_crash()
             external = int(bool(self._legacy.loaded))
             if self._legacy.loaded:
                 await self._legacy.unload()
@@ -1176,6 +1269,7 @@ class ModelPoolSupervisor:
                 slot.state = "evicting"
                 slot.session_pinned = False
                 await self._evict_slot(slot)
+            self.clear_model_crash(model_id)
             return {"state": "unloaded", "count": len(slots)}
 
     async def unload_engine(self, engine: str) -> dict:
@@ -2179,6 +2273,9 @@ class ModelPoolSupervisor:
             ready = [s for s in replicas if s.state == "ready"]
             if len(ready) >= desired or any(s.state == "loading" for s in replicas):
                 continue
+            retry = self._replica_retry.get(model_id)
+            if retry and time.monotonic() < float(retry.get("nextAt", 0)):
+                continue
             present = {s.replica_index for s in replicas}
             model = dict(base.model)
             for index in (i for i in range(desired) if i not in present):
@@ -2189,15 +2286,29 @@ class ModelPoolSupervisor:
                     await self._load_replica(model, model.get("engine"), model_id, index,
                                              pin=base.session_pinned, explicit=False)
                 except MLXBarError as exc:
+                    attempts = int((self._replica_retry.get(model_id) or {}
+                                    ).get("attempts", 0)) + 1
+                    delay = min(REPLICA_RETRY_MAX_SECONDS,
+                                REPLICA_RETRY_BASE_SECONDS * (2 ** (attempts - 1)))
+                    self._replica_retry[model_id] = {
+                        "attempts": attempts,
+                        "nextAt": time.monotonic() + delay,
+                        "delaySeconds": delay,
+                    }
                     self._replica_admission_failures[model_id] = {
                         "desired": desired,
                         "ready": len([s for s in self._replica_slots(model_id)
                                       if s.state == "ready"]),
                         "code": exc.code, "message": str(exc), "at": time.time(),
+                        "attempts": attempts, "nextRetrySeconds": delay,
                     }
+                    LOGGER.info(
+                        "Replica top-up for %s deferred %.0fs (attempt %d, code=%s)",
+                        model_id, delay, attempts, exc.code)
                     break
             else:
                 self._replica_admission_failures.pop(model_id, None)
+                self._replica_retry.pop(model_id, None)
 
     def _reap_pool_orphans(self) -> None:
         control = self.root / "control"

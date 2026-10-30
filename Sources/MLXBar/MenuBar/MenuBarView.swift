@@ -73,7 +73,10 @@ struct MenuBarView: View {
             }
 
             if model.loadedName != nil {
-                Text("Max token \(MenuBarViewModel.tokenCount(model.effectiveMaxTokens))")
+                // v3.3.0 (WP-012 / F-22): this line was a raw English literal in
+                // both languages. It now uses the settings page's term so the
+                // popover and Settings name the same value the same way.
+                Text("\(LS("Max token上限")) \(MenuBarViewModel.tokenCount(model.effectiveMaxTokens))")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

@@ -15,8 +15,10 @@ import Foundation
 /// When a new `MLXBarError` code is added on the Python side, add it here too
 /// (see `mlx-bar.md`).
 enum CoordinatorErrorText {
-    /// `code` → (Japanese, English). Keep in sync with `Coordinator/mlxbar`
-    /// (`errors.py`, `api/*.py`) and `Workers/common/server.py`.
+    /// `code` → (Japanese, English). Keep in sync with `Coordinator/mlxbar/**`
+    /// (all of it: `errors.py`, `api/`, `workers/`, `rag/`, `runtimes/`, …) and
+    /// `Workers/**` (`common/server.py` and the per-engine adapters), which is
+    /// exactly what `Tests/test_v3_2_0_error_contract.py` scans.
     static let table: [String: (ja: String, en: String)] = [
         "AUTHENTICATION_FAILED": (
             "APIキーが正しくありません。接続先の設定を確認してください",
@@ -207,9 +209,10 @@ enum CoordinatorErrorText {
         // that were never registered here, so an English interface showed the
         // server's Japanese `message` verbatim (AC-5-6). `INVALID_PROFILE` is
         // new in v3.2.0 (per-model residency-profile merge); the rest predate
-        // it (v2.6.0-v2.10.0). `Tests/test_v3_2_0_error_contract.py` now derives
-        // this list from `Coordinator/mlxbar/api/*.py` instead of a hand-kept
-        // array, so the next added code fails that test until it is registered.
+        // it (v2.6.0-v2.10.0). `Tests/test_v3_2_0_error_contract.py` derives the
+        // expected set from the Python sources themselves (`Coordinator/mlxbar/**`
+        // and `Workers/**` since v3.2.3) instead of a hand-kept array, so the
+        // next added code fails that test until it is registered here.
         "INVALID_PROFILE": (
             "常駐プロフィールの値が正しくありません。モデルID・keepLoaded・replicas（1〜8）・maxMemoryGB（1〜512）を確認してください",
             "The residency profile values are not valid. Check the model ID, keepLoaded, replicas (1-8), and maxMemoryGB (1-512)."),
@@ -236,6 +239,128 @@ enum CoordinatorErrorText {
         "MODEL_WEIGHTS_INCOMPLETE": (
             "モデルの重みファイルが不足しています。ダウンロードが不完全か、配置が変わっている可能性があります",
             "Model weight files are missing. The download may be incomplete or files may have moved."),
+        // v3.2.3 (WP-003 / F-09): the codes the coordinator, its worker stack,
+        // the RAG store, the runtime updater and the LM Studio bridge emit that
+        // this table did not carry. The sync test used to scan `api/*.py` only,
+        // so these fell through to the server's Japanese `message` in an
+        // English interface with a green suite. `UNKNOWN_METHOD` is
+        // deliberately absent: it is a JSON-RPC dispatch detail with no
+        // user-visible path, so the contract test lists it in `INTERNAL_CODES`.
+        "COUNT_TOKENS_UNAVAILABLE": (
+            "このランタイムはトークン数の計測に対応していません",
+            "This runtime cannot count tokens."),
+        "ENGINE_MISMATCH": (
+            "このモデルは選択したエンジンでは実行できません。oMLXなど別のエンジンに割り当てられています",
+            "This model cannot run on the selected engine. It is assigned to another engine, such as oMLX."),
+        "GENERATION_TIMEOUT": (
+            "生成が安全上限の時間を超えたため停止しました",
+            "Generation was stopped because it exceeded the safety time limit."),
+        "INSUFFICIENT_STORAGE": (
+            "ランタイムの更新には1GB以上の空き容量が必要です",
+            "Updating the runtime needs at least 1 GB of free disk space."),
+        "INVALID_GIT_REF": (
+            "git-refはcommit SHAで指定してください",
+            "The git ref must be a commit SHA."),
+        "INVALID_HOST": (
+            "待ち受けアドレスは 127.0.0.1 または 0.0.0.0 を指定してください",
+            "The listen address must be 127.0.0.1 or 0.0.0.0."),
+        "INVALID_PORT": (
+            "ポートは1024〜65535の間で指定してください",
+            "The port must be between 1024 and 65535."),
+        "INVALID_VERSION": (
+            "バージョンの形式が正しくありません",
+            "The version string is not in a valid format."),
+        "JOB_CANCELLED": (
+            "処理を中止しました",
+            "The job was cancelled."),
+        "JOB_INTERRUPTED": (
+            "サービス再起動により処理が中断されました",
+            "The job was interrupted by a service restart."),
+        "LMSTUDIO_LOAD_FAILED": (
+            "LM Studioでモデルをロードできませんでした",
+            "LM Studio could not load the model."),
+        "LMSTUDIO_REQUEST_FAILED": (
+            "LM Studioへの生成リクエストが失敗しました",
+            "The generation request to LM Studio failed."),
+        "LMSTUDIO_UNAVAILABLE": (
+            "LM Studioに接続できません。起動状態とURL・APIキーの設定を確認してください",
+            "Could not reach LM Studio. Check that it is running and that the URL and API key are right."),
+        "LMSTUDIO_UNLOAD_FAILED": (
+            "LM Studioのモデルを解放できませんでした",
+            "The model could not be unloaded from LM Studio."),
+        "MODEL_LOAD_TIMEOUT": (
+            "モデルのロードが制限時間内に完了しませんでした",
+            "Loading the model did not finish within the time limit."),
+        "PORT_IN_USE": (
+            "指定したポートは既に使用されています。別のポートを指定してください",
+            "That port is already in use. Choose a different port."),
+        "RAG_COLLECTION_EXISTS": (
+            "同じ名前のコレクションが既に存在します",
+            "A collection with that name already exists."),
+        "RAG_COLLECTION_FULL": (
+            "コレクションのチャンク上限に達しました。不要なドキュメントを削除するか、上限を引き上げてください",
+            "The collection reached its chunk limit. Delete documents you no longer need or raise the limit."),
+        "RAG_COLLECTION_NOT_FOUND": (
+            "指定したコレクションが見つかりません",
+            "That collection was not found."),
+        "RAG_DISABLED": (
+            "ナレッジベース機能が無効です。設定 > 知識ベース で有効にしてください",
+            "The knowledge base is disabled. Enable it in Settings > Knowledge Base."),
+        "RAG_DOCUMENT_NOT_FOUND": (
+            "指定したドキュメントが見つかりません",
+            "That document was not found."),
+        "RAG_DOCUMENT_TOO_LARGE": (
+            "ドキュメントが大きすぎます。分割して取り込んでください",
+            "The document is too large. Split it and ingest the parts."),
+        "RAG_EMBEDDING_DIM_MISMATCH": (
+            "埋め込みベクトルの次元がコレクションと一致しません。埋め込みモデルを変更した場合は、コレクションを作り直してください",
+            "The embedding dimension does not match the collection. If you changed the embedding model, recreate the collection."),
+        "RAG_EMBEDDING_NOT_CONFIGURED": (
+            "埋め込みエンドポイントが設定されていません。URLとモデル名を設定してください",
+            "The embedding endpoint is not configured. Set its URL and model name."),
+        "RAG_EMBEDDING_UNAVAILABLE": (
+            "埋め込みエンドポイントを利用できません。起動状態とURLを確認してください",
+            "The embedding endpoint is unavailable. Check that it is running and the URL is right."),
+        "RAG_EMPTY_DOCUMENT": (
+            "取り込む本文がありません。テキストまたはファイルを指定してください",
+            "There is no text to ingest. Provide text or a file."),
+        "RAG_EMPTY_QUERY": (
+            "検索クエリが空です",
+            "The search query is empty."),
+        "RAG_FILE_NOT_FOUND": (
+            "取り込むファイルが見つかりません",
+            "The file to ingest was not found."),
+        "RAG_INVALID_NAME": (
+            "コレクション名は英数字で始まり、英数字・ドット・ハイフン・アンダースコアのみ、64文字以内で指定してください",
+            "A collection name must start with a letter or digit and contain only letters, digits, dots, hyphens, and underscores, up to 64 characters."),
+        "ROLLBACK_FAILED": (
+            "更新に失敗し、元のランタイムへの復元にも失敗しました",
+            "The update failed and rolling back to the previous runtime also failed."),
+        "UPDATE_CHECK_FAILED": (
+            "最新版を確認できませんでした。ネットワーク接続を確認してください",
+            "Could not check for the latest version. Check your network connection."),
+        "UPDATE_FAILED": (
+            "ランタイムの更新に失敗しました",
+            "The runtime update failed."),
+        "UPDATE_TIMEOUT": (
+            "更新処理が制限時間内に完了しなかったため中止しました",
+            "The update did not finish within the time limit and was stopped."),
+        "WORKER_CRASHED": (
+            "モデルWorkerが停止しました。もう一度お試しください",
+            "The model worker stopped. Try again."),
+        "WORKER_STALLED": (
+            "モデルWorkerが応答しないため再起動しました",
+            "The model worker stopped responding and was restarted."),
+        // v3.2.3 (WP-010 / WP-004): new codes. `MODEL_CRASH_LOOP` is refused by
+        // the supervisor and the pool; `MODEL_LOAD_DEGRADED` is the warning the
+        // supervisor attaches when the catalog asked for one engine (or path)
+        // and another one served the model.
+        "MODEL_CRASH_LOOP": (
+            "このモデルは300秒以内に繰り返しクラッシュしたため、自動での再ロードを停止しました。モデルをアンロードするか、ピン留めを変更してから再試行してください",
+            "Automatic reload was stopped because this model crashed repeatedly within 300 seconds. Unload the model or change its pin, then try again."),
+        "MODEL_LOAD_DEGRADED": (
+            "カタログと異なる経路で読み込みました。対応機能や品質が変わる可能性があります",
+            "Loaded through a different path than the catalog entry. Capabilities or quality may differ."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

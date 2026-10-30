@@ -21,6 +21,13 @@ from ..catalog.classifier import classify as _classify_catalog_model
 from ..catalog.classifier import detect_engine
 from ..errors import MLXBarError
 
+# v3.3.0 (WP-010): a model that dies twice inside this window is not
+# crashing transiently, it is crashing *reliably*. Reloading it is then a
+# request -> minutes of loading -> death loop, so the third attempt is
+# refused with MODEL_CRASH_LOOP until the user unloads/pins or the window
+# expires. Constants, not settings: this is a safety device, not a knob.
+CRASH_LOOP_WINDOW_SECONDS = 300.0
+CRASH_LOOP_THRESHOLD = 2
 WORKER_MODULES = {"mlx-lm": "mlx_lm_worker.adapter", "mlx-vlm": "mlx_vlm_worker.adapter"}
 WORKER_LOG_MAX_BYTES = 1_048_576
 WORKER_STARTUP_DETAIL_BYTES = 4000
@@ -303,6 +310,10 @@ class WorkerSupervisor:
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join([*self._worker_import_paths(), env.get("PYTHONPATH", "")])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # v3.3.0 (WP-014): the worker gets its parent's pid so it can notice a
+        # coordinator that was SIGKILLed (no TERM handler runs) instead of
+        # sitting on its model forever with nobody to serve.
+        env["MLXBAR_PARENT_PID"] = str(os.getpid())
         cache_settings = self.settings.data.get("promptCache", {})
         env["MLXBAR_PROMPT_CACHE_ROOT"] = str(self.root / "prompt-cache" / engine)
         env["MLXBAR_PROMPT_CACHE_DISK_ENABLED"] = (
@@ -375,6 +386,7 @@ class WorkerSupervisor:
         for _ in range(50):
             if self.process.returncode is not None:
                 detail = self._read_log_tail(log_path)
+                self._record_crash("worker exited during startup")
                 await self._stop_worker()
                 raise MLXBarError("WORKER_CRASHED", f"ワーカーを起動できません: {detail}", 503)
             if self.socket_path.exists():
@@ -385,6 +397,7 @@ class WorkerSupervisor:
                 except Exception:
                     pass
             await asyncio.sleep(0.1)
+        self._record_crash("worker startup timed out")
         await self._stop_worker()
         raise MLXBarError("WORKER_CRASHED", "ワーカーの起動がタイムアウトしました", 503)
 
@@ -424,6 +437,46 @@ class WorkerSupervisor:
             except Exception:
                 pass
         raise MLXBarError("RUNTIME_NOT_INSTALLED", f"{engine}ランタイムを先にインストールしてください", 409)
+
+    def _prune_crashes(self, now: float | None = None) -> list[float]:
+        """Keep only the deaths inside the breaker window."""
+        now = time.monotonic() if now is None else now
+        self.crashes = [at for at in self.crashes
+                        if now - at <= CRASH_LOOP_WINDOW_SECONDS]
+        return self.crashes
+
+    def _record_crash(self, reason: str) -> None:
+        """Remember that this model's worker died (WP-010 / F-03).
+
+        `self.crashes` existed since v2.x but was never written, so a model
+        whose load reliably killed the worker could be retried forever.
+        """
+        now = time.monotonic()
+        self.crashes.append(now)
+        self._prune_crashes(now)
+        LOGGER.warning(
+            "worker crash recorded model=%s reason=%s recent=%d window=%.0fs",
+            (self.loaded or {}).get("id") or (self.loading or {}).get("id"),
+            reason, len(self.crashes), CRASH_LOOP_WINDOW_SECONDS)
+
+    def crash_loop_active(self) -> bool:
+        return len(self._prune_crashes()) >= CRASH_LOOP_THRESHOLD
+
+    def clear_crash_history(self) -> None:
+        self.crashes = []
+
+    def _crash_loop_active_for(self, model: dict) -> bool:
+        """True when *this* model has exhausted its retry budget.
+
+        The supervisor owns exactly one model's worker process, so the crash
+        list is already per model; the identity check only guards a supervisor
+        that was re-pointed at a different model.
+        """
+        loaded_id = str((self.loaded or {}).get("id") or "")
+        target = str(model.get("id") or "")
+        if loaded_id and target and loaded_id != target:
+            return False
+        return self.crash_loop_active()
 
     async def _stop_worker(self) -> None:
         if self.process and self.process.returncode is None:
@@ -498,12 +551,24 @@ class WorkerSupervisor:
             if chosen != "lm-studio":
                 raise MLXBarError("MODEL_INCOMPATIBLE", "利用可能なエンジンがありません", 409)
         async with self.lock:
+            if self._crash_loop_active_for(model):
+                raise MLXBarError(
+                    "MODEL_CRASH_LOOP",
+                    "このモデルは短時間に繰り返しクラッシュしたため、自動での再ロードを停止しました"
+                    f"（{int(CRASH_LOOP_WINDOW_SECONDS)}秒以内に{len(self._prune_crashes())}回）。"
+                    "モデルをアンロードするか、ピン留めを解除してから再試行してください",
+                    503, False)
             if (self.loaded and self.loaded.get("id") == model.get("id")
                     and self.loaded.get("engine") == chosen):
                 return self.loaded
             self.loading = {"id": model.get("id"), "name": model.get("name"), "engine": chosen,
                             "phase": "準備中", "startedAt": time.time()}
             timeout = self.settings.data["generation"]["loadTimeoutSeconds"]
+            # v3.2.3 (WP-004): remember what the catalog asked for and which
+            # engines were tried, so a silent degradation can be surfaced on
+            # the loaded model instead of being inferred from logs later.
+            original_engine = model.get("engine")
+            attempts: list[dict] = []
             try:
                 if self.loaded:
                     self.loading["phase"] = "現在のモデルをアンロード中"
@@ -514,6 +579,7 @@ class WorkerSupervisor:
                     self.loaded = {**model, "engine": chosen, "state": "loaded",
                                    "provider_instance_id": provider.get("instance_id"),
                                    "capabilities": {"modelMaxTokens": model_max_tokens}}
+                    self._attach_degradation(model, chosen, attempts, original_engine)
                     return self.loaded
                 candidates = [chosen]
                 if not explicit:
@@ -537,7 +603,6 @@ class WorkerSupervisor:
                             model.get("id") or model.get("name"),
                             capabilities.get("vision"), runtime_fit.get("mlx-lm"))
                 last_error: MLXBarError | None = None
-                attempts: list[dict] = []
                 for candidate in candidates:
                     chosen = candidate
                     self.loading["engine"] = chosen
@@ -547,8 +612,15 @@ class WorkerSupervisor:
                     try:
                         await self._start_worker(chosen)
                         self.loading["phase"] = "モデルデータを読み込み中"
+                        # v3.2.3 (WP-007): the GUI now exposes
+                        # security.trustRemoteCodeDefault, so it has to reach
+                        # the loader. Default stays False (no behaviour change
+                        # for anyone who never opted in); the mlx-lm adapter
+                        # still retries once with remote code on its own.
                         result = await self._call("load", {"path": model.get("path"),
-                                                            "trust_remote_code": False,
+                                                            "trust_remote_code": bool(
+                                                                self.settings.data.get("security", {}
+                                                                                        ).get("trustRemoteCodeDefault", False)),
                                                             "allow_vlm": explicit}, timeout=timeout)
                         break
                     except MLXBarError as exc:
@@ -580,6 +652,7 @@ class WorkerSupervisor:
                     self.loaded = {**model, "engine": chosen, "state": "loaded",
                                    "provider_instance_id": provider.get("instance_id"),
                                    "capabilities": {"modelMaxTokens": model_max_tokens}}
+                    self._attach_degradation(model, chosen, attempts, original_engine)
                     return self.loaded
             except (httpx.TimeoutException, TimeoutError) as exc:
                 await self._stop_worker()
@@ -610,7 +683,48 @@ class WorkerSupervisor:
                     LOGGER.warning(
                         "Explicit mlx-lm load of vision-capable %s: image inputs will be dropped",
                         model.get("id") or model.get("name"))
+            self._attach_degradation(model, chosen, attempts, original_engine)
             return self.loaded
+
+    def _attach_degradation(self, model: dict, chosen: str,
+                            attempts: list[dict], original_engine: str | None) -> None:
+        """Surface a degraded load on the model's warnings (WP-004 / K1).
+
+        A model that loaded, but on a different engine than the catalog asked
+        for (or after an engine attempt failed), used to look identical to a
+        clean load. The degradation warning is what turns "it works but not
+        the way it was configured" into something the status payload and the
+        menu bar can show, without adding a second error code.
+        """
+        if not self.loaded:
+            return
+        reasons: list[str] = []
+        if original_engine and chosen and chosen != original_engine:
+            reasons.append(f"catalog={original_engine} loaded={chosen}")
+        failed = [item.get("engine") for item in attempts]
+        if failed and any(engine != chosen for engine in failed):
+            reasons.append("failed=" + ",".join(str(engine) for engine in failed))
+        if not reasons:
+            return
+        warnings = list(self.loaded.get("warnings") or [])
+        if any(item.get("code") == "MODEL_LOAD_DEGRADED" for item in warnings):
+            return
+        detail = "/".join(reasons)
+        warnings.append({
+            "code": "MODEL_LOAD_DEGRADED",
+            "message": "カタログと異なる経路で読み込みました"
+                       f"（{detail}）。対応機能や品質が変わる可能性があります",
+            "messageEn": "Loaded through a different path than the catalog entry "
+                         f"({detail}). Capabilities or quality may differ.",
+            "engine": chosen,
+            "reasons": reasons,
+        })
+        self.loaded["warnings"] = warnings
+        evidence = dict(self.loaded.get("evidence") or {})
+        evidence["degraded"] = reasons
+        self.loaded["evidence"] = evidence
+        LOGGER.warning("Model %s loaded degraded: %s",
+                       model.get("id") or model.get("name"), detail)
 
     async def unload(self) -> dict:
         if not self.loaded:
@@ -804,6 +918,7 @@ class WorkerSupervisor:
                                     # like a transport break so the next request
                                     # starts cold instead of reading garbage.
                                     if engine != "lm-studio":
+                                        self._record_crash("unparsable worker line")
                                         await self._stop_worker()
                                         self.loaded = None
                                     raise MLXBarError("WORKER_CRASHED",
@@ -816,6 +931,7 @@ class WorkerSupervisor:
             # No token and no heartbeat for the idle budget: the worker itself
             # is wedged, so only killing the process recovers it.
             if engine != "lm-studio":
+                self._record_crash("worker stalled")
                 await self._stop_worker()
                 self.loaded = None
             raise MLXBarError("WORKER_STALLED",
@@ -828,6 +944,7 @@ class WorkerSupervisor:
                               f"生成が安全上限の{total_timeout}秒を超えたため停止しました", 504, True) from exc
         except httpx.HTTPError as exc:
             if engine != "lm-studio":
+                self._record_crash("worker connection lost")
                 await self._stop_worker()
                 self.loaded = None
             raise MLXBarError("WORKER_CRASHED", f"モデルWorkerとの通信が切断されました: {exc}", 503, True) from exc

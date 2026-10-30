@@ -269,17 +269,23 @@ struct ModelWarning: Hashable {
 
     /// Display text in `language` ("ja" or "en").
     ///
-    /// The server field for the current language comes first: it is more
-    /// specific than the general `ErrorText` entry (that one says "this
-    /// runtime" where the server names `mlx-lm`). Only a missing or empty
-    /// server field falls back to the error-text table — and, for a code the
-    /// table does not know, to the server's message and then the code.
+    /// v3.2.3 (WP-004 / F-10): the `ErrorText` table comes first. It is the only
+    /// source guaranteed to carry both languages, so an English interface can
+    /// never show the coordinator's Japanese `message` — which is what happened
+    /// whenever a warning arrived without `messageEn` (the old order preferred
+    /// the server field whenever it was non-empty). Codes the table does not
+    /// know keep the server's `message`/`messageEn`, then the code itself.
     func text(language: String) -> String {
-        let serverText = language == "en" ? (messageEn ?? "") : message
-        if !serverText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return serverText
+        if let entry = CoordinatorErrorText.table[code] {
+            return language == "en" ? entry.en : entry.ja
         }
-        return CoordinatorErrorText.resolve(code: code, serverMessage: message, language: language)
+        // Unknown code: the language-specific field, then `message` (which may
+        // be all an older coordinator sent), then `resolve`'s code/generic text.
+        let localized = language == "en" ? messageEn : message
+        let preferred = (localized ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? message
+            : localized
+        return CoordinatorErrorText.resolve(code: code, serverMessage: preferred, language: language)
     }
 
     /// SF Symbol for this warning: a dropped image has its own glyph, and any
@@ -1876,6 +1882,11 @@ final class MenuBarViewModel: ObservableObject {
                               "画像最大バイト数は1〜2,147,483,648で指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
                 "maxPromptCharacters": maxPromptChars, "maxImages": maxImages,
@@ -1892,6 +1903,11 @@ final class MenuBarViewModel: ObservableObject {
               10...7200 ~= total, 1...30 ~= cancelGrace else {
             errorMessage = ui("One or more timeouts are outside the supported range",
                               "タイムアウトに範囲外の値があります")
+            return
+        }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
             return
         }
         await perform {
@@ -1928,6 +1944,11 @@ final class MenuBarViewModel: ObservableObject {
                               "wired上限比率はメモリ上限比率を超えられません")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
                 "memoryLimitRatio": memory, "wiredLimitRatio": wired,
@@ -1949,6 +1970,11 @@ final class MenuBarViewModel: ObservableObject {
         guard 1...1024 ~= maxConnections else {
             errorMessage = ui("Maximum connections must be between 1 and 1,024",
                               "最大同時接続数は1〜1,024で指定してください")
+            return
+        }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
             return
         }
         await perform {
@@ -1978,6 +2004,11 @@ final class MenuBarViewModel: ObservableObject {
             errorMessage = ui("Maximum wait must be between 10 and 7,200 seconds", "最大待ち時間は10〜7,200秒で指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", [
                 "generation": ["maxQueuedRequests": maximum, "queueTimeoutSeconds": timeout]
@@ -1985,6 +2016,11 @@ final class MenuBarViewModel: ObservableObject {
             await self.refreshSettings()
         }
     }
+
+    /// The coordinator's shipped `models.pool.defaultPerModelMaxGB` value, used
+    /// only to tell a choice made on the residency form apart from the default
+    /// that form starts on (WP-009 / AC-SET-3).
+    static let shippedDefaultPerModelMaxGB = 32
 
     func setModelPoolSettings(enabled: Bool, maximum: Int, ttl: Int,
                               perModelGB: Int, totalRatio: Double, reserveGB: Int,
@@ -1996,8 +2032,13 @@ final class MenuBarViewModel: ObservableObject {
                               "モデル常駐設定に範囲外の値があります")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
-            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
+            var pool: [String: Any] = [
                 "enabled": enabled,
                 "maxResidentModels": maximum,
                 "idleTTLSeconds": ttl,
@@ -2006,7 +2047,18 @@ final class MenuBarViewModel: ObservableObject {
                 "minimumSystemReserveGB": reserveGB,
                 "generationConcurrency": generationConcurrency,
                 "maxReplicasPerModel": maxReplicas,
-            ]]])
+            ]
+            // WP-009: the coordinator only honours `defaultPerModelMaxGB` when
+            // `defaultPerModelMaxGBSet` is true, so a non-default ceiling chosen
+            // on this form has to carry the flag or applying the form would
+            // silently stop enforcing it. The shipped 32 stays unmarked on
+            // purpose: it is the value the form shows when nothing was chosen,
+            // and marking it would turn "left at the default" into an explicit
+            // 32 GB ceiling.
+            if perModelGB != Self.shippedDefaultPerModelMaxGB {
+                pool["defaultPerModelMaxGBSet"] = true
+            }
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": pool]])
             await self.refreshSettings()
         }
     }
@@ -2020,10 +2072,40 @@ final class MenuBarViewModel: ObservableObject {
                               "ヘッドルームは0（自動）または0.25〜32 GBで指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["models": ["pool": [
                 "perGenerationHeadroomGB": gb,
             ]]])
+            await self.refreshSettings()
+        }
+    }
+
+    /// Writes the per-model resident ceiling as an explicitly chosen value
+    /// (v3.2.3, WP-009 / AC-SET-3).
+    ///
+    /// `defaultPerModelMaxGBSet` is what tells the coordinator "the user chose
+    /// 32 GB" apart from "the default happens to be 32 GB". Without it an
+    /// explicit 32 is indistinguishable from the unset key, and the pool falls
+    /// back to its physical-memory derivation instead of enforcing the value.
+    /// Two single-key patches, in this order on purpose: a value that lands
+    /// without the flag is inert, whereas a flag that lands without its value
+    /// would make a stale default authoritative.
+    func setDefaultPerModelMaxGB(_ gb: Int) async {
+        guard 1...512 ~= gb else {
+            errorMessage = ui("Per-model memory must be between 1 and 512 GB",
+                              "モデルごとの上限は1〜512 GBで指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    self.nestedPatch("models.pool.defaultPerModelMaxGB", gb))
+            _ = try await self.json("PUT", "/api/v1/settings",
+                                    self.nestedPatch("models.pool.defaultPerModelMaxGBSet", true))
             await self.refreshSettings()
         }
     }
@@ -2071,6 +2153,11 @@ final class MenuBarViewModel: ObservableObject {
                               "コンテキスト圧縮の設定値が範囲外です")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["contextCompression": [
                 "enabled": enabled,
@@ -2098,6 +2185,11 @@ final class MenuBarViewModel: ObservableObject {
                               "アダプティブメモリの設定値が範囲外です")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["experimental": ["adaptiveMemory": [
                 "enabled": enabled,
@@ -2122,6 +2214,11 @@ final class MenuBarViewModel: ObservableObject {
                               "Paged KVディスクキャッシュは1〜100 GBで指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["experimental": ["pagedKVCache": [
                 "enabled": enabled, "diskEnabled": diskEnabled,
@@ -2138,6 +2235,11 @@ final class MenuBarViewModel: ObservableObject {
         guard ["bf16", "8bit", "4bit"].contains(mode) else {
             errorMessage = ui("KV cache mode must be bf16, 8bit or 4bit",
                               "KVキャッシュのモードはbf16/8bit/4bitで指定してください")
+            return
+        }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
             return
         }
         await perform {
@@ -2328,6 +2430,11 @@ final class MenuBarViewModel: ObservableObject {
                               "知識ベースの設定に範囲外の値があります")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["rag": [
                 "enabled": enabled,
@@ -2507,6 +2614,11 @@ final class MenuBarViewModel: ObservableObject {
         guard 1...32768 ~= repetitionContextSize else {
             errorMessage = ui("Penalty context must be between 1 and 32,768 tokens", "ペナルティ対象範囲は1〜32,768 tokensで指定してください"); return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["generation": [
                 "defaultTemperature": temperature,
@@ -2549,6 +2661,11 @@ final class MenuBarViewModel: ObservableObject {
                               "ディスクキャッシュは1〜100 GBで指定してください")
             return
         }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("PUT", "/api/v1/settings", ["promptCache": [
                 "diskEnabled": enabled, "diskMaxGB": maximumGB,
@@ -2583,6 +2700,11 @@ final class MenuBarViewModel: ObservableObject {
         guard (0...4096).contains(writeBudgetGB) else {
             errorMessage = ui("Write budget must be between 0 and 4,096 GB",
                               "書き込み予算は0〜4,096 GBで指定してください")
+            return
+        }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
             return
         }
         await perform {
@@ -2688,6 +2810,11 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func setPort(_ port: Int) async {
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             _ = try await self.json("POST", "/api/v1/settings/api-listener/test", ["port": port])
             _ = try await self.json("PUT", "/api/v1/settings", ["api": ["port": port]])
@@ -2696,6 +2823,11 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func setLANAccess(_ enabled: Bool) async {
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
         await perform {
             let patch: [String: Any] = [
                 "api": ["host": enabled ? "0.0.0.0" : "127.0.0.1", "requireToken": true],
@@ -2739,17 +2871,54 @@ final class MenuBarViewModel: ObservableObject {
         }
     }
 
+    /// Adds a model folder without rewriting `models.roots` from a snapshot.
+    ///
+    /// The update replaces the whole array, so it may only ever be built from a
+    /// *fresh* read. Sending the array from this GUI's snapshot dropped folders
+    /// added elsewhere (CLI, another window) whenever that snapshot was stale,
+    /// and an empty snapshot erased every folder the user had (ISS-8 /
+    /// AC-GUI-1, AC-SET-2). Refresh first, then add one entry; when the refresh
+    /// fails there is no authoritative array to build on, so the operation is
+    /// refused instead of falling back to the snapshot.
     func addModelFolder(_ url: URL) async {
-        var roots = ((settings["models"] as? [String: Any])?["roots"] as? [String]) ?? []
-        if !roots.contains(url.path) { roots.append(url.path) }
-        await perform { _ = try await self.json("PUT", "/api/v1/settings", ["models": ["roots": roots]]); await self.scan() }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
+        await perform {
+            var roots = try await self.freshModelRoots()
+            if !roots.contains(url.path) { roots.append(url.path) }
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["roots": roots]])
+            await self.scan()
+        }
     }
 
     func removeModelFolder(_ path: String) async {
-        var roots = ((settings["models"] as? [String: Any])?["roots"] as? [String]) ?? []
-        roots.removeAll { $0 == path }
-        await setConfig("models.roots", value: roots)
-        await scan()
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
+        await perform {
+            let current = try await self.freshModelRoots()
+            let roots = current.filter { $0 != path }
+            _ = try await self.json("PUT", "/api/v1/settings", ["models": ["roots": roots]])
+            await self.scan()
+        }
+    }
+
+    /// `models.roots` as the coordinator has it right now.
+    ///
+    /// Throws rather than returning the local snapshot: a stale array is the
+    /// overwrite `addModelFolder`/`removeModelFolder` exist to avoid.
+    private func freshModelRoots() async throws -> [String] {
+        guard await refreshSettings() else {
+            throw ClientError.command(
+                ui("Could not read the current model folders. Try again in a moment.",
+                   "現在のモデルフォルダを読み込めませんでした。少し待ってからもう一度お試しください"))
+        }
+        return ((settings["models"] as? [String: Any])?["roots"] as? [String]) ?? []
     }
 
     func copyAPIURL() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(apiURL, forType: .string) }

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
 import shutil
+import tempfile
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,12 @@ DEFAULTS: dict[str, Any] = {
             "totalMemoryRatio": 0.75,
             "minimumSystemReserveGB": 4,
             "defaultPerModelMaxGB": 32,
+            # v3.2.3 (WP-009): SettingsStore persists a fully merged document,
+            # so an explicit 32 was indistinguishable from "never set" and the
+            # value was ignored (the ceiling fell back to 60% of RAM). This
+            # flag records the user's intent; only `true` makes
+            # `defaultPerModelMaxGB` authoritative.
+            "defaultPerModelMaxGBSet": False,
             # v3.2.0 (ISS-6): how the admission estimate charges a model's
             # weights for the per-model cap and the global budget. "strict"
             # keeps the historical 1.35x of the on-disk size; "balanced" uses
@@ -265,6 +273,115 @@ def deep_merge(defaults: dict, stored: dict) -> dict:
     return result
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Make a completed rename durable (no-op where unsupported)."""
+    descriptor = None
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _leaf_paths(node: Any, prefix: tuple[str, ...] = ()):
+    """Yield the dotted path of every non-dict leaf, parents before children."""
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        path = prefix + (key,)
+        if isinstance(value, dict) and value:
+            yield from _leaf_paths(value, path)
+        else:
+            yield path
+
+
+def _default_at(path: tuple[str, ...]) -> tuple[bool, Any]:
+    node: Any = DEFAULTS
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False, None
+        node = node[key]
+    return True, node
+
+
+def _set_at(document: dict, path: tuple[str, ...], value: Any) -> bool:
+    node: Any = document
+    for key in path[:-1]:
+        node = node.get(key) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            return False
+    if not isinstance(node, dict) or path[-1] not in node:
+        return False
+    node[path[-1]] = value
+    return True
+
+
+def _unknown_setting_paths(value: Any, defaults: Any,
+                           prefix: tuple[str, ...] = ()) -> list[str]:
+    """Dotted paths present in `value` that the schema does not define.
+
+    A list (``models.roots``, ``models.pool.profiles``) is a leaf: its
+    contents are free-form and are validated by their own rules.
+    """
+    unknown: list[str] = []
+    if not isinstance(value, dict) or not isinstance(defaults, dict):
+        return unknown
+    for key, item in value.items():
+        path = prefix + (key,)
+        if key not in defaults:
+            unknown.append(".".join(path))
+            continue
+        if isinstance(item, dict) and isinstance(defaults[key], dict):
+            unknown.extend(_unknown_setting_paths(item, defaults[key], path))
+    return unknown
+
+
+def _unknown_subtree(value: Any, defaults: Any) -> dict:
+    """The part of `value` the schema does not define, as a mergeable dict."""
+    if not isinstance(value, dict) or not isinstance(defaults, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key not in defaults:
+            result[key] = deepcopy(item)
+        elif isinstance(item, dict) and isinstance(defaults[key], dict):
+            nested = _unknown_subtree(item, defaults[key])
+            if nested:
+                result[key] = nested
+    return result
+
+
+def _overlay_unknown(document: dict, unknown: dict) -> dict:
+    """Re-attach preserved unknown keys where `document` has nothing."""
+    if not unknown:
+        return document
+    for key, item in unknown.items():
+        if key not in document:
+            document[key] = deepcopy(item)
+        elif isinstance(item, dict) and isinstance(document.get(key), dict):
+            _overlay_unknown(document[key], item)
+    return document
+
+
+def _strip_unknown(value: Any, defaults: Any) -> Any:
+    """Return `value` with every key the schema does not define removed."""
+    if not isinstance(value, dict) or not isinstance(defaults, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key not in defaults:
+            continue
+        if isinstance(item, dict) and isinstance(defaults[key], dict):
+            result[key] = _strip_unknown(item, defaults[key])
+        else:
+            result[key] = item
+    return result
+
+
 class SettingsStore:
     def __init__(self, root: Path | None = None):
         self.root = root or app_support_dir()
@@ -277,6 +394,17 @@ class SettingsStore:
         (self.root / "control").mkdir(mode=0o700, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
         self.recovered_from: str | None = None
+        # v3.2.3 (WP-008): leaf settings that were reset to their default
+        # because the stored value failed validation. Empty on a healthy read.
+        self.recovered_keys: list[str] = []
+        # v3.3.0 (WP-011): set when config.json was written by a newer schema.
+        # Such a file is read (known keys only) but never rewritten, so a
+        # downgrade cannot truncate a newer document.
+        self.forward_compatible = False
+        self.unknown_keys: list[str] = []
+        # Keys this build does not know, kept so a save from an older build
+        # does not delete what a newer one wrote.
+        self.preserved_unknown: dict = {}
         # True only when config.json did not exist and was just created with
         # defaults: a genuinely fresh install. Updates (existing file),
         # invalid-config recovery, and --home test setups that reuse a
@@ -295,12 +423,38 @@ class SettingsStore:
             return data
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or raw.get("schemaVersion", 1) > 1:
-                raise ValueError("unsupported settings schema")
-            data = deep_merge(DEFAULTS, raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # Unreadable/undecodable: nothing can be salvaged key by key.
+            return self._recover_whole_file()
+        if not isinstance(raw, dict):
+            return self._recover_whole_file()
+        # v3.3.0 (WP-011): a newer schemaVersion is not corruption. Read the
+        # keys this build knows, keep everything else out of memory, and do
+        # not write the file back -- a downgrade must not delete settings the
+        # newer build added.
+        self.forward_compatible = int(raw.get("schemaVersion", 1) or 1) > 1
+        self.unknown_keys = _unknown_setting_paths(raw, DEFAULTS)
+        if self.unknown_keys:
+            self.preserved_unknown = _unknown_subtree(raw, DEFAULTS)
+        stored = _strip_unknown(raw, DEFAULTS)
+        if self.forward_compatible:
+            stored["schemaVersion"] = DEFAULTS["schemaVersion"]
+        data = deep_merge(DEFAULTS, stored)
+        try:
             self._validate(data)
             return data
-        except Exception:
+        except ValueError:
+            # v3.2.3 (WP-008): one out-of-range value used to discard every
+            # setting -- LAN access, port, token limits included. Reset only
+            # the keys that actually fail (see _recover_keys) and report them.
+            recovered, keys = self._recover_keys(data)
+            if keys:
+                self.recovered_keys = keys
+                return recovered
+            return self._recover_whole_file()
+
+    def _recover_whole_file(self) -> dict:
+        with contextlib.suppress(OSError):
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             backup = self.root / f"config.invalid-{stamp}.json"
             shutil.copy2(self.path, backup)
@@ -308,18 +462,95 @@ class SettingsStore:
             # port, token limits. Record it so status can say so instead of
             # leaving the user to discover it through changed behaviour.
             self.recovered_from = backup.name
-            data = deepcopy(DEFAULTS)
-            self._atomic_write(data)
-            return data
+        data = deepcopy(DEFAULTS)
+        self._atomic_write(data)
+        return data
+
+    def _recover_keys(self, data: dict) -> tuple[dict, list[str]]:
+        """Reset the minimum set of leaves that makes the document valid.
+
+        Two strategies, cheapest first. (1) Probe one leaf at a time: if
+        resetting exactly that leaf makes the document valid, it is the sole
+        culprit. (2) When several keys are bad, no single reset is enough, so
+        use the validator's own message -- every rule names the key it
+        rejected -- pick the deepest named leaf, reset it, and re-validate.
+
+        Returns ``(document, recovered_paths)``; an empty list means nothing
+        could be salvaged and the caller must do the whole-file recovery.
+        """
+        recovered: list[str] = []
+        candidate = data
+        for _ in range(32):
+            try:
+                self._validate(candidate)
+                return candidate, recovered
+            except ValueError as exc:
+                message = str(exc)
+            for path in _leaf_paths(candidate):
+                default_present, default_value = _default_at(path)
+                if not default_present:
+                    continue
+                probe = deepcopy(candidate)
+                if not _set_at(probe, path, deepcopy(default_value)):
+                    continue
+                try:
+                    self._validate(probe)
+                except ValueError:
+                    continue
+                candidate = probe
+                recovered.append(".".join(path))
+                break
+            else:
+                named = [path for path in _leaf_paths(candidate)
+                         if path[-1] in message or ".".join(path) in message]
+                if not named:
+                    return data, []
+                path = max(named, key=len)
+                default_present, default_value = _default_at(path)
+                if not default_present:
+                    return data, []
+                probe = deepcopy(candidate)
+                if not _set_at(probe, path, deepcopy(default_value)):
+                    return data, []
+                candidate = probe
+                recovered.append(".".join(path))
+        return data, []
 
     def _atomic_write(self, data: dict) -> None:
-        temp = self.path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp, 0o600)
-        temp.replace(self.path)
+        """Write config.json durably and atomically.
+
+        v3.2.3 (WP-008): the temp name was fixed (`.tmp`), so two writers -- or
+        a crash mid-write -- could interleave into the same file, and nothing
+        was fsynced, so a power loss could leave a zero-length config. A
+        unique temp file per write removes the collision; fsync on the file
+        and on the directory makes the rename durable.
+        """
+        unknown = getattr(self, "preserved_unknown", None)
+        if unknown:
+            # v3.3.0 (WP-011): a save must not delete keys a newer build added.
+            data = _overlay_unknown(deepcopy(data), unknown)
+        payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=self.path.parent,
+            prefix=".config-", suffix=".tmp", delete=False)
+        try:
+            with handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(handle.name, 0o600)
+            os.replace(handle.name, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(handle.name)
+            raise
+        _fsync_directory(self.path.parent)
 
     @staticmethod
     def _validate(data: dict) -> None:
+        unknown = _unknown_setting_paths(data, DEFAULTS)
+        if unknown:
+            raise ValueError("unknown setting: " + ", ".join(sorted(unknown)[:5]))
         api = data["api"]
         host = api.get("host")
         allow_lan = data.get("security", {}).get("allowLan", False)
@@ -377,6 +608,9 @@ class SettingsStore:
         pool = data.get("models", {}).get("pool", {})
         if not isinstance(pool.get("enabled", True), bool):
             raise ValueError("models.pool.enabled must be boolean")
+        # v3.2.3 (WP-009): additive intent flag for defaultPerModelMaxGB.
+        if not isinstance(pool.get("defaultPerModelMaxGBSet", False), bool):
+            raise ValueError("models.pool.defaultPerModelMaxGBSet must be boolean")
         pool_integer_ranges = {
             "maxResidentModels": (1, 8),
             "idleTTLSeconds": (30, 86400),
@@ -636,6 +870,12 @@ class SettingsStore:
             raise ValueError("generation.wiredLimitRatio must not exceed generation.memoryLimitRatio")
 
     def update(self, patch: dict) -> dict:
+        # v3.3.0 (WP-011): a typo must fail loudly (422 at the API) instead of
+        # being merged and persisted as a new key that no reader ever uses.
+        if isinstance(patch, dict):
+            unknown = _unknown_setting_paths(patch, DEFAULTS)
+            if unknown:
+                raise ValueError("unknown setting: " + ", ".join(sorted(unknown)[:5]))
         merged = deep_merge(self.data, patch)
         self._validate(merged)
         self._atomic_write(merged)
@@ -651,10 +891,27 @@ class SettingsStore:
 
     @staticmethod
     def _write_secret(path: Path, value: str) -> None:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(value, encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
+        """Durably replace a token file (v3.2.3 / WP-008).
+
+        Same fixed-temp-name and missing-fsync problems as `_atomic_write`.
+        Tokens are small, so the fsync cost is irrelevant next to losing the
+        token and locking every client out.
+        """
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}-", suffix=".tmp", delete=False)
+        try:
+            with handle:
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(handle.name, 0o600)
+            os.replace(handle.name, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(handle.name)
+            raise
+        _fsync_directory(path.parent)
 
     @property
     def api_token(self) -> str:

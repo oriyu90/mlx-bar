@@ -1,5 +1,17 @@
 import SwiftUI
 
+/// Formats one byte count with the unit base that matches the quantity.
+///
+/// v3.3.0 (WP-012 / F-21): disk amounts are decimal (`.file`, 10^3) and memory
+/// amounts binary (`.memory`, 2^30). Every call site in this file goes through
+/// this one helper so a single screen never mixes two formatters. The default
+/// stays `.file` because most counters here are cache/disk sizes.
+private func bytes(_ value: Any?,
+                   countStyle: ByteCountFormatter.CountStyle = .file) -> String {
+    let number = (value as? NSNumber)?.int64Value ?? 0
+    return ByteCountFormatter.string(fromByteCount: number, countStyle: countStyle)
+}
+
 struct MLXBarSettingsView: View {
     @ObservedObject var model: MenuBarViewModel
     @State private var selection = "APIサーバー"
@@ -68,11 +80,6 @@ struct PromptCacheSettingsView: View {
         model.settings["promptCache"] as? [String: Any] ?? [:]
     }
 
-    private func bytes(_ value: Any?) -> String {
-        let number = (value as? NSNumber)?.int64Value ?? 0
-        return ByteCountFormatter.string(fromByteCount: number, countStyle: .file)
-    }
-
     private func pagedCapability(_ status: [String: Any]) -> String {
         guard (status["configured"] as? Bool) == true else { return LS("モデル未ロード") }
         if (status["eligible"] as? Bool) == true { return LS("対応") }
@@ -91,6 +98,20 @@ struct PromptCacheSettingsView: View {
         case "circuit_open": return LS("安全装置が作動したためWorker再起動まで無効です")
         default: return reason
         }
+    }
+
+    /// `kvQuant.fallbackReason` is a developer key the worker builds as
+    /// `first_evaluation:<ExceptionName>`; shown raw, an English interface
+    /// displays that `snake_case:Detail` text verbatim (F-20 / AC-DISP-3). Same
+    /// shape as `pagedReason` above, but the fallback is a localized sentence
+    /// rather than the raw key: any reason added later still reads as English.
+    private func kvFallbackReason(_ reason: String) -> String {
+        let prefix = "first_evaluation:"
+        if reason.hasPrefix(prefix) {
+            let failure = String(reason.dropFirst(prefix.count))
+            return "\(LS("初回評価で量子化KVを使えなかったため、bf16で継続します")) (\(failure))"
+        }
+        return LS("量子化KVを使えないため、bf16で継続します")
     }
 
     private func kvQuantModeText(_ mode: String) -> String {
@@ -166,7 +187,7 @@ struct PromptCacheSettingsView: View {
                                value: pagedCapability(paged))
                 LabeledContent(LS("現在の動作"),
                                value: (paged["enabled"] as? Bool) == true ? LS("有効") : LS("無効"))
-                LabeledContent(LS("Paged SSD使用量"), value: bytes(paged["diskBytes"]))
+                LabeledContent(LS("Paged SSD使用量"), value: bytes(paged["diskBytes"], countStyle: .file))
                 LabeledContent(LS("保存ブロック"),
                                value: "\((paged["diskBlocks"] as? NSNumber)?.intValue ?? 0)")
                 LabeledContent(LS("キャッシュヒット"),
@@ -210,7 +231,7 @@ struct PromptCacheSettingsView: View {
                                        ? (kv["mode"] as? String ?? kvQuantMode)
                                        : LS("bf16（無効）")))
                 if let reason = kv["fallbackReason"] as? String {
-                    Text("\(LS("無効理由")): \(reason)")
+                    Text("\(LS("無効理由")): \(kvFallbackReason(reason))")
                         .font(.caption).foregroundStyle(.orange)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -226,7 +247,7 @@ struct PromptCacheSettingsView: View {
             Section(LS("キャッシュ状態")) {
                 LabeledContent(LS("メモリー"), value: (model.promptCacheStatus["memory"] as? Bool) == true ? LS("有効") : LS("無効"))
                 LabeledContent(LS("ディスク"), value: (model.promptCacheStatus["disk"] as? Bool) == true ? LS("有効") : LS("無効"))
-                LabeledContent(LS("ディスク使用量"), value: bytes(model.promptCacheStatus["disk_bytes"]))
+                LabeledContent(LS("ディスク使用量"), value: bytes(model.promptCacheStatus["disk_bytes"], countStyle: .file))
                 LabeledContent(LS("ディスクヒット"), value: "\((model.promptCacheStatus["disk_hits"] as? NSNumber)?.intValue ?? 0)")
                 if let reason = model.promptCacheStatus["disabledReason"] as? String {
                     Text("\(LS("無効理由")): \(reason)").font(.caption).foregroundStyle(.orange)
@@ -817,8 +838,28 @@ struct ModelSourceSettingsView: View {
     @State private var pinnedModelIds: Set<String> = []
     @State private var pinnedModelReplicas: [String: Int] = [:]
     @State private var pinnedModelMaxGB: [String: Int] = [:]
+    /// Draft for the explicit per-model ceiling (WP-009). Kept apart from
+    /// `perModelMaxGB` so the residency form and the explicit-limit control
+    /// each save exactly the value they display.
+    @State private var explicitPerModelMaxGB = 32
     var roots: [String] { ((model.settings["models"] as? [String: Any])?["roots"] as? [String]) ?? [] }
     var automaticallyLoadsForAPI: Bool { ((model.settings["models"] as? [String: Any])?["autoLoadOnAPIRequest"] as? Bool) ?? true }
+    /// v3.2.0 keys that had no UI at all (F-07 / F-25). Read straight from the
+    /// settings snapshot; each control writes its own single key.
+    private var bundledLoadersAllowed: Bool {
+        ((model.settings["models"] as? [String: Any])?["bundledLoaders"] as? Bool) ?? false
+    }
+    private var memoryAdmission: String {
+        (((model.settings["models"] as? [String: Any])?["pool"] as? [String: Any])?["memoryAdmission"] as? String)
+            ?? "strict"
+    }
+    private var trustRemoteCodeDefault: Bool {
+        (model.settings["security"] as? [String: Any])?["trustRemoteCodeDefault"] as? Bool ?? false
+    }
+    private var explicitLimitIsSet: Bool {
+        (((model.settings["models"] as? [String: Any])?["pool"] as? [String: Any])?["defaultPerModelMaxGBSet"] as? Bool)
+            ?? false
+    }
     private var headroomLabel: String {
         headroomGB == 0
             ? "\(LS("同時生成ヘッドルーム")): \(LS("自動"))"
@@ -889,10 +930,10 @@ struct ModelSourceSettingsView: View {
                 if let shortfall = model.replicaShortfallSummary {
                     LabeledContent(LS("レプリカ不足"), value: shortfall)
                 }
-                LabeledContent(LS("予約済みメモリ"), value: ByteCountFormatter.string(
-                    fromByteCount: model.modelPoolReservedBytes, countStyle: .memory))
-                LabeledContent(LS("常駐メモリ予算"), value: ByteCountFormatter.string(
-                    fromByteCount: model.modelPoolBudgetBytes, countStyle: .memory))
+                LabeledContent(LS("予約済みメモリ"),
+                               value: bytes(model.modelPoolReservedBytes, countStyle: .memory))
+                LabeledContent(LS("常駐メモリ予算"),
+                               value: bytes(model.modelPoolBudgetBytes, countStyle: .memory))
                 Text(LS("モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -900,6 +941,44 @@ struct ModelSourceSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Text(LS("非固定モデルの待機時間は再起動不要で、次の見回りから反映されます。一覧の待機中の行には解放までの残り時間を表示します。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("モデルの読み込みと安全性")) {
+                // v3.2.0 keys that were reachable only from the CLI until now
+                // (F-07 / F-25). Each control writes exactly one key.
+                Toggle(LS("バンドル済みローダーを許可"), isOn: Binding(
+                    get: { bundledLoadersAllowed },
+                    set: { value in Task { await model.setConfig("models.bundledLoaders", value: value) } }
+                ))
+                Text(LS("標準形式でないモデルを読み込むときに、同梱のローダーを使えるようにします。モデル供給元のPythonは実行しません。使用した場合はログに残ります。既定は無効です。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Picker(LS("メモリ見積り"), selection: Binding(
+                    get: { memoryAdmission },
+                    set: { value in Task { await model.setConfig("models.pool.memoryAdmission", value: value) } }
+                )) {
+                    Text(LS("厳格")).tag("strict")
+                    Text(LS("バランス")).tag("balanced")
+                }
+                Text(LS("モデルの重みを上限判定にどう計上するかです。厳格はディスク上のサイズの1.35倍、バランスは1.15倍で見積もります。どちらも退避と生存確認のガードを弱めません。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Toggle(LS("リモートコードの実行を既定で許可"), isOn: Binding(
+                    get: { trustRemoteCodeDefault },
+                    set: { value in Task { await model.setConfig("security.trustRemoteCodeDefault", value: value) } }
+                ))
+                Text(LS("既定は無効です。リモートコードが必要なモデルは MODEL_REQUIRES_REMOTE_CODE で読み込みが拒否されるため、その場合だけ有効にしてください。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Stepper("\(LS("モデルごとの上限（明示指定）")): \(explicitPerModelMaxGB) GB",
+                        value: $explicitPerModelMaxGB, in: 1...512)
+                Button(LS("明示した上限を適用")) {
+                    Task { await model.setDefaultPerModelMaxGB(explicitPerModelMaxGB) }
+                }.buttonStyle(.borderedProminent)
+                Text(explicitLimitIsSet
+                     ? LS("この値は明示指定として保存されています。未設定時の物理メモリ導出より優先されます。")
+                     : LS("未設定のため、上限は物理メモリから自動で導出されています。上の値を適用すると明示指定として保存されます。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1087,17 +1166,13 @@ struct ModelSourceSettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             Section(LS("プロンプト入力上限")) {
+                // One apply button for the whole section (WP-012 / F-24): the
+                // text field used to carry its own copy, so the same three
+                // values could be saved from two places with the same effect.
                 HStack {
                     TextField(LS("最大文字数"), value: $maxPromptChars, format: .number)
                         .frame(width: 160)
                     Text(LS("文字"))
-                    Button(LS("適用")) {
-                        Task {
-                            await model.setPromptInputLimits(
-                                maxPromptChars: maxPromptChars, maxImages: maxImages,
-                                maxImageBytes: max(1, maxImageMB * 1_048_576))
-                        }
-                    }.buttonStyle(.borderedProminent)
                 }
                 Stepper("\(LS("画像最大枚数")): \(maxImages)", value: $maxImages, in: 0...128)
                 Stepper("\(LS("画像1件の上限")): \(maxImageMB) MB", value: $maxImageMB, in: 1...2048)
@@ -1226,25 +1301,46 @@ struct ModelSourceSettingsView: View {
             adaptiveMemoryMaxRetrievedSegments = (adaptive["maxRetrievedSegments"] as? NSNumber)?.intValue ?? 8
             adaptiveMemoryVerbatimProtection = adaptive["verbatimProtection"] as? Bool ?? true
             adaptiveMemoryFallbackToExact = adaptive["fallbackToExact"] as? Bool ?? true
-            let profiles = pool["profiles"] as? [[String: Any]] ?? []
-            pinnedModelIds = Set(profiles
-                .filter { ($0["keepLoaded"] as? Bool) ?? false }
-                .compactMap { $0["modelId"] as? String })
-            pinnedModelReplicas = Dictionary(
-                profiles.compactMap { profile in
-                    (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
-                },
-                uniquingKeysWith: { first, _ in first })
-            let defaultGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
-            pinnedModelMaxGB = Dictionary(
-                profiles.compactMap { profile in
-                    (profile["modelId"] as? String).map {
-                        ($0, (profile["maxMemoryGB"] as? NSNumber)?.intValue ?? defaultGB)
-                    }
-                },
-                uniquingKeysWith: { first, _ in first })
+            explicitPerModelMaxGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
+            applyResidencyProfiles(pool)
+        }
+        // This page can open before the first settings read finishes: the read
+        // is a background retry (ISS-4). Rebuild the pin rows when it lands,
+        // otherwise they show an empty profile list over real saved profiles
+        // (AC-GUI-1 / AC-SET-2).
+        .onChange(of: model.settingsLoaded) { _, loaded in
+            guard loaded else { return }
+            let pool = ((model.settings["models"] as? [String: Any])?["pool"] as? [String: Any]) ?? [:]
+            explicitPerModelMaxGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
+            applyResidencyProfiles(pool)
         }
         }
+    }
+
+    /// Rebuilds the per-model residency drafts from one pool snapshot.
+    ///
+    /// `pinnedModelIds` is the toggle state for the rows below, so it must be
+    /// derived from the same snapshot the writes use: a snapshot that arrives
+    /// after the view appeared (see the `onChange` above) has to replace the
+    /// empty default, or the page claims nothing is pinned.
+    private func applyResidencyProfiles(_ pool: [String: Any]) {
+        let profiles = pool["profiles"] as? [[String: Any]] ?? []
+        pinnedModelIds = Set(profiles
+            .filter { ($0["keepLoaded"] as? Bool) ?? false }
+            .compactMap { $0["modelId"] as? String })
+        pinnedModelReplicas = Dictionary(
+            profiles.compactMap { profile in
+                (profile["modelId"] as? String).map { ($0, (profile["replicas"] as? NSNumber)?.intValue ?? 1) }
+            },
+            uniquingKeysWith: { first, _ in first })
+        let defaultGB = (pool["defaultPerModelMaxGB"] as? NSNumber)?.intValue ?? 32
+        pinnedModelMaxGB = Dictionary(
+            profiles.compactMap { profile in
+                (profile["modelId"] as? String).map {
+                    ($0, (profile["maxMemoryGB"] as? NSNumber)?.intValue ?? defaultGB)
+                }
+            },
+            uniquingKeysWith: { first, _ in first })
     }
 
     /// Label above value, instead of one row with a `Spacer` between them or
@@ -1447,6 +1543,13 @@ struct LMStudioSettingsView: View {
     @State private var isSelectingFolder = false
     private var lmStudio: [String: Any] { ((model.settings["models"] as? [String: Any])?["lmStudio"] as? [String: Any]) ?? [:] }
     var body: some View {
+        // v3.3.0 (WP-012 / F-23): this page rendered once from `onAppear` and
+        // had no ScrollView. A settings snapshot that arrived after the page
+        // opened therefore left the URL/token fields at their defaults, and in
+        // a short window the buttons below the fold were unreachable. Same
+        // wrapper as the prompt-cache page: scroll always, and read settings in
+        // a `.task` so the fields follow the snapshot that actually loaded.
+        ScrollView {
         Form {
             TextField("Base URL", text: $baseURL)
             HStack {
@@ -1486,7 +1589,13 @@ struct LMStudioSettingsView: View {
             Text(LS("LM Studioが停止中でもMLXBarは動作を継続します。GGUFはLM Studio Providerのみに送られます。")).foregroundStyle(.secondary)
                 .font(.caption)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        }.padding().onAppear { baseURL = lmStudio["baseUrl"] as? String ?? baseURL }
+        }
+        .padding()
+        .task {
+            await model.refreshSettings()
+            baseURL = lmStudio["baseUrl"] as? String ?? baseURL
+        }
+        }
     }
 
     private func chooseLMStudioFolder() {

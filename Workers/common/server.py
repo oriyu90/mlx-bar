@@ -549,6 +549,16 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                                  "message": "不明なワーカーメソッドが要求されました",
                                  "detail": str(method), "retryable": False}, status_code=400)
         except ModuleNotFoundError as exc:
+            # v3.2.3 (WP-001): a load that failed here used to leave no trace
+            # in any log, so the only evidence was a GUI error long after the
+            # fact. Method name and code only -- never request bodies, prompts
+            # or user document paths.
+            if method == "load":
+                LOGGER.error("model load failed code=%s detail=%s",
+                             "RUNTIME_NOT_INSTALLED", str(exc)[-1000:])
+            else:
+                LOGGER.error("rpc failed method=%s code=%s detail=%s",
+                             method, "RUNTIME_NOT_INSTALLED", str(exc)[-1000:])
             return JSONResponse({"type": "error", "code": "RUNTIME_NOT_INSTALLED",
                                  "message": f"必要なランタイムがありません: {exc.name}", "retryable": False}, status_code=409)
         except Exception as exc:
@@ -563,6 +573,12 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             # MODEL_QUANT_UNSUPPORTED / MODEL_TOKENIZER_MISSING.
             explicit_code = getattr(exc, "code", None)
             if isinstance(explicit_code, str) and explicit_code.startswith("MODEL_"):
+                if method == "load":
+                    LOGGER.error("model load failed code=%s detail=%s",
+                                 explicit_code, text[-1000:])
+                else:
+                    LOGGER.error("rpc failed method=%s code=%s detail=%s",
+                                 method, explicit_code, text[-1000:])
                 return JSONResponse({"type": "error", "code": explicit_code,
                                      "message": getattr(exc, "message", None) or text,
                                      "detail": text[-1000:],
@@ -581,6 +597,11 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 code, human = "MODEL_INCOMPATIBLE", "チャットテンプレートの適用に失敗しました"
             else:
                 code, human = "MODEL_INCOMPATIBLE", "モデルを読み込めませんでした"
+            if method == "load":
+                LOGGER.error("model load failed code=%s detail=%s", code, text[-1000:])
+            else:
+                LOGGER.error("rpc failed method=%s code=%s detail=%s",
+                             method, code, text[-1000:])
             return JSONResponse({"type": "error", "code": code, "message": human,
                                  "detail": text[-1000:], "retryable": False}, status_code=400)
 
@@ -879,6 +900,41 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
     return app
 
 
+PARENT_WATCHDOG_INTERVAL_SECONDS = 2.0
+
+
+def start_parent_watchdog() -> None:
+    """Exit when the coordinator that spawned us is gone (v3.3.0 / WP-014).
+
+    The supervisor already writes an orphan manifest and the next coordinator
+    reaps it, but that only helps on the *next* start: between a SIGKILLed
+    coordinator and the next launch the worker keeps the model resident and
+    the machine's memory occupied. `MLXBAR_PARENT_PID` makes the child notice
+    on its own. Unset (older coordinator, direct invocation) means no
+    watchdog, which keeps every existing launch path valid.
+    """
+    raw = os.environ.get("MLXBAR_PARENT_PID")
+    if not raw:
+        return
+    try:
+        expected = int(raw)
+    except ValueError:
+        return
+    if expected <= 1:
+        return
+
+    def watch() -> None:
+        while True:
+            if os.getppid() != expected:
+                LOGGER.error("parent process %s exited; worker shutting down", expected)
+                # Hard exit: uvicorn's shutdown path can block on the MLX
+                # thread, and a half-dead worker is worse than a missing one.
+                os._exit(1)
+            time.sleep(PARENT_WATCHDOG_INTERVAL_SECONDS)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
 def run(adapter: BaseAdapter) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
@@ -888,6 +944,7 @@ def run(adapter: BaseAdapter) -> None:
     except FileNotFoundError:
         pass
     app = create_app(adapter)
+    start_parent_watchdog()
 
     @app.on_event("startup")
     async def restrict_socket() -> None:

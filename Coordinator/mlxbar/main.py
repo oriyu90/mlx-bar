@@ -31,6 +31,12 @@ from .state import (AppState, CATALOG_CAPABILITIES_VERSION,
 
 LOGGER = logging.getLogger(__name__)
 
+# v3.2.3 (WP-001): 20 MB x 5 generations holds roughly a week of coordinator
+# diagnostics. The previous 5 MB x 1 could not survive the K4 monitoring
+# window, so the evidence for a failure was rotated away before anyone read it.
+LOG_MAX_BYTES = 20_000_000
+LOG_BACKUP_COUNT = 5
+
 # Reachable without credentials so a monitor can see the listener is alive.
 UNAUTHENTICATED_PATHS = {"/health"}
 # Headroom above the largest request the settings actually permit.
@@ -468,13 +474,19 @@ def configure_logging(root: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "coordinator.log"
     with contextlib.suppress(OSError):
-        if path.exists() and path.stat().st_size > 5_000_000:
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
             path.replace(directory / "coordinator.log.1")
-    handler = logging.handlers.RotatingFileHandler(path, maxBytes=5_000_000, backupCount=1)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(handler)
+    # v3.2.3 (WP-001): httpx logs every request at INFO, which at one-week
+    # retention would evict the lines that actually diagnose a failure. The
+    # coordinator's own client already logs the outcomes it cares about.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
 

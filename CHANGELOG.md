@@ -2,6 +2,40 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [3.3.0] - 2026-10-31
+
+**7観点横断精査（メモリ/クラッシュ/安定性/GUI/設定/互換/表示）の修正版。** P0 0件、P1 10件・P2 18件を整理し、fail-open封鎖・失敗の記憶・契約同期の3系統を修正。設定スキーマ`schemaVersion=1`は不変（未知キーは422、前方互換configは読み取り専用）。
+
+### 新機能
+
+- **クラッシュループブレーカ（WP-010）**: `MODEL_CRASH_LOOP`（300秒に2回→3回目拒否、retryable=False、unload/pinで解除）。レプリカ再試行に指数バックオフ30→600秒
+- **親死watchdog（WP-014）**: `MLXBAR_PARENT_PID`でworkerが親の消滅を2秒間隔で監視し終了（実測0.2秒）
+- **GUI到達性（WP-007）**: `models.bundledLoaders` / `models.pool.memoryAdmission` / `trustRemoteCode` / `defaultPerModelMaxGB`を設定画面から変更可能に
+- **i18n検査（WP-013）**: `scripts/check_i18n.py`（453キー、欠落0）
+
+### 修正
+
+- **メモリfail-open封鎖（WP-005）**: `size_bytes=0`は未知として8GiB計上、scannerは2階層再帰、計測不能はfail-closed、pressure重みを半減
+- **設定の原子性（WP-008）**: fsync（file+dir）・一意tmp名・キー単位リカバリ（`recovered_keys`）
+- **設定スナップショット上書き防止（WP-002/006）**: `settingsLoaded`ガード、rootsの安全更新、PUT /settingsの全量ロールバック
+- **ErrorText全登録（WP-003）**: Python発行コード37件を追加（66→103エントリ）、契約テストを全走査化
+- **警告の表示品質（WP-004/012）**: `messageEn`の言語優先順位、縮退の`MODEL_LOAD_DEGRADED`表面化、単位・fallbackReason・Max token・LM Studio表示の修正
+- **ログ基盤（WP-001）**: httpx抑制、20MB×5世代、ロード失敗の構造化ログ
+- **明示メモリ上限（WP-009）**: `defaultPerModelMaxGBSet`（additive）で明示時のみ採用
+
+### 既知の制限（v3.3.1以降）
+
+- AC-K-2（niwaki forward保持質量の測定）: GPU+実モデル必須のため未測定
+- AC-K-3（7日間ログ監視）: 経過時間が必要
+- `recovered_keys`はstatus未公開（F-R1）、`host_memory`の`measured`未使用で圧力ガード単独fail-openが残存（F-R2）、supervisor側の解除経路欠落（F-R3）、生キー表示2件（F-R4）
+- 縮退の「連続回数」上限は未実装（クラッシュのみ）
+
+### テスト
+
+- `pytest Tests`（全件）: **830 passed / 3 failed / 1 skipped**（失敗3件はHEADでも同一の既知flaky。新規失敗0）
+- `swift test`: **28 tests / 0 failures**
+- `check_i18n.py`: 453キー欠落0
+
 ## [3.2.2] - 2026-10-31
 
 **Ornith形式エラーの真因対応と誤診解消。** `MODEL_WEIGHTS_INCOMPLETE` 新設、Anthropic分類追加、preflight失敗のワーカーログ記録。設定スキーマ・既存API形状は不変。

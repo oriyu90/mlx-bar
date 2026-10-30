@@ -154,9 +154,20 @@ class CoordinatorE2ETests(unittest.TestCase):
         try:
             _, socket_path = self.start(old_port)
             with self.client(socket_path) as client:
-                changed = client.put("/api/v1/settings", json={"api": {"port": blocked_port}})
+                before = client.get("/api/v1/settings").json()
+                original_tokens = before["generation"]["maxTokens"]
+                # v3.2.3 (WP-006): the failing body also changes an unrelated
+                # key. A 409 must leave *nothing* applied -- before this, the
+                # listener rollback restored only api/security and the other
+                # keys stayed written while the caller saw a failure.
+                changed = client.put("/api/v1/settings", json={
+                    "api": {"port": blocked_port},
+                    "generation": {"maxTokens": original_tokens + 1},
+                })
                 self.assertEqual(changed.status_code, 409)
-                self.assertEqual(client.get("/api/v1/settings").json()["api"]["port"], old_port)
+                after = client.get("/api/v1/settings").json()
+                self.assertEqual(after["api"]["port"], old_port)
+                self.assertEqual(after["generation"]["maxTokens"], original_tokens)
                 self.assertEqual(httpx.get(f"http://127.0.0.1:{old_port}/health").status_code, 200)
         finally:
             blocker.close()

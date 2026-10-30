@@ -187,6 +187,11 @@ struct KnowledgeBaseSettingsView: View {
         }
         .padding()
         .task {
+            // Never seed this form from an empty snapshot (AC-GUI-1): opening
+            // Settings before the first settings read finished left every field
+            // at its default, and "Save settings" then wrote those defaults back
+            // over the real RAG configuration.
+            await model.refreshSettings()
             enabled = rag["enabled"] as? Bool ?? false
             let embedding = rag["embedding"] as? [String: Any] ?? [:]
             baseURL = embedding["baseUrl"] as? String ?? baseURL

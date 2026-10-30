@@ -55,12 +55,24 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "general.language"):
                 store.update({"general": {"language": "fr"}})
 
-    def test_unknown_fields_are_preserved(self):
+    def test_unknown_fields_are_rejected(self):
+        """v3.3.0 (WP-011): a typo must not be merged and persisted.
+
+        Before this, `deep_merge` accepted any key and `_validate` only checked
+        the keys it knew, so `{"future": {"answer": 42}}` was written to disk
+        and silently ignored forever. AC-SET-4 turns that into a 422.
+        """
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory))
-            store.update({"future": {"answer": 42}})
+            with self.assertRaisesRegex(ValueError, "unknown setting"):
+                store.update({"future": {"answer": 42}})
+            self.assertNotIn("future", store.data)
+            # A plausible typo inside a known section is rejected the same way
+            # while the rest of the payload still applies.
+            with self.assertRaisesRegex(ValueError, "unknown setting"):
+                store.update({"api": {"prot": 12000}})
             store.update({"api": {"port": 12000}})
-            self.assertEqual(store.data["future"]["answer"], 42)
+            self.assertEqual(store.data["api"]["port"], 12000)
 
     def test_invalid_port_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

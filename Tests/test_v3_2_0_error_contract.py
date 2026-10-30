@@ -10,11 +10,14 @@ work and that hid the real mlx-vlm failure (G3).
 AC-5-6 (WP-R1): the English table check used to assert a hand-written list of
 nine v3.2.0 codes, so the 422 `INVALID_PROFILE` this release introduced -- and
 five older codes -- stayed unregistered and leaked the coordinator's Japanese
-`message` into an English interface. The check now derives the code set from
-`Coordinator/mlxbar/api/*.py` itself, so a code added on the Python side fails
-here until it is registered in `ErrorText.swift`. Codes forwarded dynamically
-(`event.get("code", ...)`) or emitted by the workers are not statically
-extractable from the API package and remain out of this scan's scope.
+`message` into an English interface.
+
+v3.2.3 (WP-003 / F-09): the scan covered `Coordinator/mlxbar/api/*.py` only, so
+36 codes emitted by the worker stack, `supervisor.py`, RAG, updates and LM
+Studio stayed unregistered while the test stayed green. It now scans
+`Coordinator/mlxbar/**` and `Workers/**`, which is where the codes actually
+live. A code that is genuinely internal (`UNKNOWN_METHOD`, a JSON-RPC
+dispatch detail with no GUI path) is listed in `INTERNAL_CODES`.
 """
 from __future__ import annotations
 
@@ -27,9 +30,18 @@ from mlxbar.errors import MLXBarError
 ROOT = Path(__file__).resolve().parents[1]
 ERROR_TEXT = ROOT / "Sources" / "MLXBar" / "Services" / "ErrorText.swift"
 API_DIR = ROOT / "Coordinator" / "mlxbar" / "api"
+SCAN_DIRS = (ROOT / "Coordinator" / "mlxbar", ROOT / "Workers")
 
 #: `{"code": "SOME_CODE"}` / `['code'] = "SOME_CODE"` in the HTTP layer.
 API_CODE_RE = re.compile(r"""["']code["']\s*[=:]\s*["']([A-Z][A-Z0-9_]+)["']""")
+#: The three shapes Python uses to mint a code, per PLAN.md section 10.
+EMITTED_CODE_RES = (
+    re.compile(r'MLXBarError\(\s*"([A-Z][A-Z0-9_]+)"'),
+    re.compile(r'"code"\s*:\s*"([A-Z][A-Z0-9_]+)"'),
+    re.compile(r'code\s*=\s*"([A-Z][A-Z0-9_]+)"'),
+)
+#: Codes with no user-visible surface: internal protocol details.
+INTERNAL_CODES = {"UNKNOWN_METHOD"}
 #: One `"CODE": ("ja", "en"),` entry of `CoordinatorErrorText.table`.
 SWIFT_ENTRY_RE = re.compile(
     r'^\s*"([A-Z][A-Z0-9_]+)":\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\)', re.M)
@@ -44,6 +56,25 @@ def api_codes() -> dict[str, list[str]]:
         source = path.read_text(encoding="utf-8")
         for match in API_CODE_RE.finditer(source):
             found.setdefault(match.group(1), []).append(path.name)
+    return found
+
+
+def emitted_codes() -> dict[str, list[str]]:
+    """Every literal code the coordinator and workers can produce.
+
+    Scans `Coordinator/mlxbar/**` and `Workers/**` (v3.2.3 / WP-003). Before
+    this the scan stopped at `api/*.py`, which is why 36 codes could leak
+    Japanese into the English UI with a green test suite.
+    """
+    found: dict[str, list[str]] = {}
+    for directory in SCAN_DIRS:
+        for path in sorted(directory.rglob("*.py")):
+            if ".venv" in path.parts or "__pycache__" in path.parts:
+                continue
+            source = path.read_text(errors="ignore")
+            for pattern in EMITTED_CODE_RES:
+                for match in pattern.finditer(source):
+                    found.setdefault(match.group(1), []).append(str(path.relative_to(ROOT)))
     return found
 
 
@@ -93,15 +124,28 @@ class SwiftErrorTableTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = ERROR_TEXT.read_text(encoding="utf-8")
         cls.table = swift_table(cls.source)
-        cls.codes = api_codes()
+        cls.api_codes = api_codes()
+        cls.codes = {code: files for code, files in emitted_codes().items()
+                     if code not in INTERNAL_CODES}
 
     def test_the_scan_actually_sees_the_api_codes(self):
         # Guards against a silently empty scan making the checks below vacuous.
-        self.assertGreaterEqual(len(self.codes), 20, sorted(self.codes))
+        self.assertGreaterEqual(len(self.codes), 60, sorted(self.codes))
         # F-01 regression: the 422 this release introduced, and a long-standing
         # one, must be visible to the extraction.
         self.assertIn("INVALID_PROFILE", self.codes)
         self.assertIn("MODEL_NOT_ROUTED", self.codes)
+        # F-09 regression: these live outside `api/*.py`, which is exactly the
+        # blind spot the old scan had.
+        for code in ("WORKER_CRASHED", "MODEL_LOAD_TIMEOUT", "RAG_EMPTY_QUERY",
+                     "MODEL_CRASH_LOOP", "MODEL_LOAD_DEGRADED"):
+            self.assertIn(code, self.codes)
+
+    def test_the_api_subset_is_still_covered(self):
+        # The narrower API scan must remain a subset of the full scan, so this
+        # test cannot silently drift to a different definition of "emitted".
+        self.assertTrue(set(self.api_codes) <= set(self.codes) | INTERNAL_CODES,
+                        sorted(set(self.api_codes) - set(self.codes)))
 
     def test_every_api_code_is_in_the_table(self):
         missing = sorted(code for code in self.codes if code not in self.table)

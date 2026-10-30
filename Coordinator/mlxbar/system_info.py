@@ -29,36 +29,70 @@ def physical_memory_bytes() -> int:
     return 0
 
 
-def host_memory() -> dict[str, int]:
+# v3.2.3 (WP-005): how much of the inactive/speculative population may be
+# counted as reclaimable at each macOS pressure level. At NORMAL the kernel
+# will hand those pages back cheaply; once the OS reports WARN or worse, a
+# large share of them is already dirty and reclaiming them costs a swap
+# storm, so only half is counted. This keeps available a monotone
+# non-increasing function of pressure (AC-MS-3).
+PRESSURE_RECLAIM_DIVISOR = {0: 1, 1: 2, 2: 2, 4: 2}
+
+
+def host_memory() -> dict[str, int | bool]:
     """Reclaimable bytes plus the macOS VM pressure level (1/2/4).
 
     Mirrors ModelPoolSupervisor._host_capacity's commands so both layers
     agree on what "free" means; kept separate so this module stays
     importable without the worker stack.
+
+    v3.2.3 (WP-005): ``measured`` is additive and says whether both probes
+    actually produced a value. Callers that guard memory safety must treat
+    ``measured is False`` as "unknown" and fail closed, instead of reading
+    ``availableBytes == 0`` as "the machine is full" (or ignoring the guard).
     """
-    available = 0
     pressure = 0
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        output = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
-                                text=True, timeout=5).stdout
-        wanted = ("Pages free:", "Pages inactive:", "Pages speculative:",
-                  "Pages purgeable:")
-        pages = 0
-        for line in output.splitlines():
-            if line.startswith(wanted):
-                pages += int(line.rsplit(maxsplit=1)[-1].rstrip("."))
-        available = pages * page_size
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
+    pressure_measured = False
     try:
         output = subprocess.run(
             ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
             capture_output=True, text=True, timeout=5).stdout
         pressure = int(output.strip())
+        pressure_measured = pressure >= 0
     except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return {"availableBytes": available, "pressureLevel": pressure}
+        pressure = 0
+
+    available = 0
+    pages_measured = False
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        output = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                                text=True, timeout=5).stdout
+        free = inactive = speculative = purgeable = 0
+        for line in output.splitlines():
+            head, _, tail = line.rpartition(":")
+            try:
+                pages = int(tail.strip().rstrip("."))
+            except ValueError:
+                continue
+            if head.startswith("Pages free"):
+                free += pages
+            elif head.startswith("Pages inactive"):
+                inactive += pages
+            elif head.startswith("Pages speculative"):
+                speculative += pages
+            elif head.startswith("Pages purgeable"):
+                purgeable += pages
+        if free or inactive or speculative or purgeable:
+            pages_measured = True
+            # Counted after summing so the result never depends on which page
+            # class happened to be odd.
+            reclaimable_pages = inactive + speculative
+            divisor = PRESSURE_RECLAIM_DIVISOR.get(pressure, 1)
+            available = (free + purgeable + reclaimable_pages // divisor) * page_size
+    except (OSError, ValueError, subprocess.SubprocessError):
+        available = 0
+    return {"availableBytes": available, "pressureLevel": pressure,
+            "measured": pages_measured and pressure_measured}
 
 
 def cpu_info() -> dict[str, Any]:

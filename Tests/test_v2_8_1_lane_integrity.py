@@ -89,7 +89,8 @@ class LaneIntegrityTests(unittest.IsolatedAsyncioTestCase):
         semaphore permit consumed forever.
         """
         pool = self.make_pool()
-        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm"})
+        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm",
+                            "size_bytes": 1 << 30})
         slot = pool._slots["model-1"]
         # One "other" lane active so the acquire path probes headroom.
         pool._gen_active_lanes = 1
@@ -137,7 +138,8 @@ class LaneIntegrityTests(unittest.IsolatedAsyncioTestCase):
         its parent finalizes, the marker must stop it from committing.
         """
         pool = self.make_pool()
-        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm"})
+        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm",
+                            "size_bytes": 1 << 30})
         slot = pool._slots["model-1"]
         pool._gen_active_lanes = 1
         started, release = self._parked_capacity(pool)
@@ -170,7 +172,8 @@ class LaneIntegrityTests(unittest.IsolatedAsyncioTestCase):
         horizon is what keeps a status poll from killing it.
         """
         pool = self.make_pool()
-        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm"})
+        await pool.load({"id": "model-1", "name": "model-1", "engine": "mlx-lm",
+                            "size_bytes": 1 << 30})
         slot = pool._slots["model-1"]
         await slot.gen_lock.acquire()
         slot.gen_owner = "r1"

@@ -179,6 +179,43 @@ final class StatusDecodingTests: XCTestCase {
         XCTAssertFalse(model.settingsLoaded)
     }
 
+    /// AC-GUI-1 / WP-002: the *whole-section* setters must refuse while the
+    /// settings snapshot is still unloaded. Sending a section built from this
+    /// view's draft defaults would overwrite real saved values (F-06/F-08).
+    ///
+    /// `MenuBarViewModel` owns its `CoordinatorClient` (`private let client`),
+    /// so a unit test cannot observe the HTTP request. What is observable is
+    /// the refusal: the settings-loading banner, `busy` untouched (the `perform`
+    /// block that issues the PUT never runs), and local state unchanged.
+    func testWholeSectionSettersRefuseWhileSettingsAreUnloaded() async {
+        let model = MenuBarViewModel()
+        XCTAssertFalse(model.settingsLoaded)
+        XCTAssertTrue(model.settings.isEmpty)
+
+        let loadingNotice = ["Loading settings. Try again in a moment.",
+                             "設定を読み込み中です。少し待ってからもう一度お試しください"]
+
+        await model.setApiLimits(maxRequestBytes: 8_388_608, maxConnections: 64)
+        XCTAssertTrue(loadingNotice.contains(model.errorMessage ?? ""),
+                      model.errorMessage ?? "no error message")
+        XCTAssertFalse(model.busy)
+
+        model.errorMessage = nil
+        await model.setRagSettings(enabled: true, baseURL: "http://127.0.0.1:1234/v1",
+                                   model: "text-embedding-3-small",
+                                   chunkSize: 1000, chunkOverlap: 200,
+                                   defaultTopK: 4, maxContextChars: 8000)
+        XCTAssertTrue(loadingNotice.contains(model.errorMessage ?? ""),
+                      model.errorMessage ?? "no error message")
+        XCTAssertFalse(model.busy)
+
+        // Nothing was written locally either: the enabled flag is still the
+        // untouched default and the snapshot is still empty.
+        XCTAssertFalse(model.ragEnabled)
+        XCTAssertTrue(model.settings.isEmpty)
+        XCTAssertFalse(model.settingsLoaded)
+    }
+
     /// T-4-2 / AC-4-2: the retry loop stops at the first success instead of
     /// burning the whole schedule.
     func testSettingsRetryStopsAtTheFirstSuccess() async {
@@ -271,10 +308,12 @@ final class StatusDecodingTests: XCTestCase {
         XCTAssertEqual(ModelWarning.list(from: ["id": "m", "name": "M"]), [])
     }
 
-    /// AC-W3 / §5.9: the server's language-specific field wins, because it
-    /// names the engine (`mlx-lm`) where the `ErrorText` table only says
-    /// "this runtime".
-    func testModelWarningUsesServerTextPerLanguage() throws {
+    /// AC-DISP-2 / WP-004: the registered `ErrorText` sentence now wins in both
+    /// languages, because the table is the only source guaranteed to have both.
+    /// The server's per-language fields are the fallback for codes it does not
+    /// know. This intentionally replaces the old "server field first" contract
+    /// (`testModelWarningUsesServerTextPerLanguage`, whose name would now lie).
+    func testModelWarningPrefersErrorTextTablePerLanguage() throws {
         let warning = try XCTUnwrap(ModelWarning([
             "code": "VISION_IMAGE_DROPPED",
             "message": "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます",
@@ -282,9 +321,32 @@ final class StatusDecodingTests: XCTestCase {
             "engine": "mlx-lm",
         ]))
         XCTAssertEqual(warning.text(language: "en"),
-                       "This model supports image input, but mlx-lm drops images.")
+                       "This runtime does not accept images, so attached images are discarded.")
         XCTAssertEqual(warning.text(language: "ja"),
-                       "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます")
+                       "このランタイムでは画像入力が使われないため、添付画像は破棄されます")
+
+        // The v3.2.3 degradation warning is registered, so it renders in both
+        // languages without depending on the server's `messageEn`.
+        let degraded = try XCTUnwrap(ModelWarning([
+            "code": "MODEL_LOAD_DEGRADED",
+            "message": "カタログと異なる経路で読み込みました（catalog=mlx-vlm loaded=mlx-lm）。"
+                + "対応機能や品質が変わる可能性があります",
+        ]))
+        XCTAssertEqual(
+            degraded.text(language: "en"),
+            "Loaded through a different path than the catalog entry. Capabilities or quality may differ.")
+        XCTAssertEqual(
+            degraded.text(language: "ja"),
+            "カタログと異なる経路で読み込みました。対応機能や品質が変わる可能性があります")
+
+        // A code the table does not know keeps the per-language server fields.
+        let future = try XCTUnwrap(ModelWarning([
+            "code": "SOME_FUTURE_WARNING",
+            "message": "サーバからの新しい警告です",
+            "messageEn": "A new warning from the server.",
+        ]))
+        XCTAssertEqual(future.text(language: "en"), "A new warning from the server.")
+        XCTAssertEqual(future.text(language: "ja"), "サーバからの新しい警告です")
     }
 
     /// AC-W3 / §5.9: without `messageEn`, English falls back to the registered
