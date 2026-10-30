@@ -2,6 +2,23 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [3.2.2] - 2026-10-31
+
+**Ornith形式エラーの真因対応と誤診解消。** `MODEL_WEIGHTS_INCOMPLETE` 新設、Anthropic分類追加、preflight失敗のワーカーログ記録。設定スキーマ・既存API形状は不変。
+
+### 修正
+
+- **Ornith形式エラーの真因（P0）**: ローカル配置がHubと異なり `optiq/` サブフォルダが剥がれてフラット化していた。`optiq/metadata.json`・`optiq/mtp.safetensors`・`optiq/optiq_vision.safetensors` を `optiq/` へ移動しHubと同形に修復。実機でロード＋生成（`**1+1=2**`）を確認
+- **エラーコード分離（P1）**: index参照の重み欠落を `MODEL_FORMAT_UNSUPPORTED`（形式非対応）から `MODEL_WEIGHTS_INCOMPLETE` に分離。GUIの誤表示「このモデルの形式には対応していません」を根絶。`ErrorText.swift` に日英登録、Anthropic分類に `invalid_request_error` 追加
+- **preflight失敗の可視化（P2）**: adapter の plan 失敗時にワーカーログへ code＋message を記録（従来は coordinator.log の 400 のみ）
+- **レビュー対応**: basenameフォールバックは削除（mlx-vlm が欠損shardを黙って捨てるため、許容はvisionなしのサイレント劣化を招く）。独立レビュー判定 REWORK→対応済み
+
+### テスト
+
+- `pytest Tests`（全件）: **821 passed / 2 failed**（失敗2件は既知flaky。詳細は `DESIGN_v3.2.0.md` §3）
+- `swift test`: **27 tests / 0 failures**
+- 新規: 重み欠落コード・flat配置のstrict拒否・ErrorText登録の3テスト
+
 ## [3.2.1] - 2026-10-30
 
 **モデル警告のGUI表示とniwaki生成配線の改善。** 設定スキーマ・既存API形状は不変で、追加はadditiveなフィールドのみ。新規 `.strings` なし。

@@ -379,6 +379,8 @@ def _anthropic_error_type(code: str | None) -> str:
         "MODEL_FORMAT_UNSUPPORTED": "invalid_request_error",
         "MODEL_QUANT_UNSUPPORTED": "invalid_request_error",
         "MODEL_TOKENIZER_MISSING": "invalid_request_error",
+        # TASK-003: index 参照の重み欠落も artifact の属性（再試行不可）。
+        "MODEL_WEIGHTS_INCOMPLETE": "invalid_request_error",
         # A runtime that cannot count tokens is a capability limitation, not a
         # bad request: pair it with the 503 the endpoint already returns.
         "COUNT_TOKENS_UNAVAILABLE": "api_error",

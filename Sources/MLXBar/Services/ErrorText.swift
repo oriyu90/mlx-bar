@@ -231,6 +231,11 @@ enum CoordinatorErrorText {
         "RESPONSE_FORMAT_INVALID": (
             "生成結果がresponse_formatに一致しませんでした",
             "The generated output did not match response_format."),
+        // v3.2.2 (TASK-003): index が参照する重みファイルの実在欠落。
+        // 旧 MODEL_FORMAT_UNSUPPORTED の「形式非対応」表示では誤診になるため分離。
+        "MODEL_WEIGHTS_INCOMPLETE": (
+            "モデルの重みファイルが不足しています。ダウンロードが不完全か、配置が変わっている可能性があります",
+            "Model weight files are missing. The download may be incomplete or files may have moved."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

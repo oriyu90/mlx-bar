@@ -115,6 +115,40 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.code_for(make_niwaki(self.root, weights=False)),
                          "MODEL_FORMAT_UNSUPPORTED")
 
+    def test_missing_index_referenced_shard(self):
+        # TASK-003: index が参照する重みファイルの実在欠落は新コードになる。
+        path = make_niwaki(self.root)
+        index_path = path / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index["weight_map"]["language_model.layers.1.weight"] = "missing-shard.safetensors"
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        self.assertEqual(self.code_for(path), "MODEL_WEIGHTS_INCOMPLETE")
+
+    def test_new_weights_incomplete_code_is_registered_in_error_text(self):
+        # TASK-003 P1: MODEL_WEIGHTS_INCOMPLETE は ErrorText.swift に日英登録
+        # されていること（誤診「形式非対応」の根絶）。
+        import re
+        swift = (Path(__file__).resolve().parents[1] / "Sources" / "MLXBar"
+                 / "Services" / "ErrorText.swift").read_text(encoding="utf-8")
+        self.assertIn('"MODEL_WEIGHTS_INCOMPLETE"', swift)
+        m = re.search(r'"MODEL_WEIGHTS_INCOMPLETE":\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"', swift)
+        self.assertIsNotNone(m, "日英エントリが見つからない")
+        self.assertTrue(m.group(1).strip(), "日本語文が空")
+        self.assertTrue(m.group(2).strip(), "英語文が空")
+
+    def test_flat_layout_shard_is_rejected_strictly(self):
+        # TASK-003 REVIEW F-01(a): sub/x.safetensors 欠落時に直下の basename が
+        # あっても preflight は許容しない。mlx-vlm 本体が欠損 shard を黙って
+        # 捨てるため、許容は vision なしのサイレント劣化を招く。
+        # 配置は Hub と同形に修復すること（Ornith 実例: optiq/ へ移動）。
+        path = make_niwaki(self.root)
+        (path / "relocated.safetensors").write_bytes(b"\x00" * 16)
+        index_path = path / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index["weight_map"]["language_model.layers.1.weight"] = "optiq/relocated.safetensors"
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        self.assertEqual(self.code_for(path), "MODEL_WEIGHTS_INCOMPLETE")
+
     def test_unsupported_quantization_width(self):
         self.assertEqual(self.code_for(make_niwaki(self.root, bits=7)),
                          "MODEL_QUANT_UNSUPPORTED")

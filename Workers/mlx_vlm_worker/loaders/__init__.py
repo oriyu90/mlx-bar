@@ -157,6 +157,11 @@ def generic_preflight(path: str | Path) -> dict:
                 index_ok = False
             else:
                 for name in {str(value) for value in weight_map.values()}:
+                    # TASK-003 REVIEW F-01: basename フォールバックは行わない。
+                    # mlx-vlm 本体は欠損 shard を黙って捨てるため、preflight で
+                    # 許容すると vision なしの「ロード成功」というサイレント劣化を
+                    # 招く。配置が平坦化されている場合は実ファイルを Hub と同形に
+                    # 修復すること（Ornith 実例: optiq/ へ移動で解決済み）。
                     if not (path / name).exists():
                         missing_files.append(name)
         except Exception:
@@ -176,10 +181,14 @@ def generic_preflight(path: str | Path) -> dict:
             "model.safetensors.index.json を読み取れません。ダウンロードが不完全か破損しています",
             detail=str(index_path))
     if missing_files:
+        # TASK-003 REVIEW F-04: message に絶対パスを埋め込まない。
+        # server.py が message をそのまま返すため API/GUI にローカルパスが
+        # 流出する。パスは detail のみ。
         raise ModelLoadError(
-            "MODEL_FORMAT_UNSUPPORTED",
+            "MODEL_WEIGHTS_INCOMPLETE",
             "index が参照する重みファイルが不足しています"
-            f"（{', '.join(missing_files[:3])} ほか）",
+            f"（{', '.join(missing_files[:3])} ほか）。"
+            "ダウンロードが不完全か、配置が変わっている可能性があります",
             detail=str(path))
 
     quantization = config.get("quantization")
@@ -214,7 +223,8 @@ def plan(path: str | Path, *, bundled_loaders_enabled: bool) -> dict:
     Returns ``{"loader", "loaderId", "preflight", "config"}``. Raises
     :class:`ModelLoadError` with the actionable code:
     ``MODEL_TOKENIZER_MISSING`` / ``MODEL_FORMAT_UNSUPPORTED`` /
-    ``MODEL_QUANT_UNSUPPORTED`` / ``MODEL_NEEDS_BUNDLED_LOADER``.
+    ``MODEL_QUANT_UNSUPPORTED`` / ``MODEL_WEIGHTS_INCOMPLETE`` /
+    ``MODEL_NEEDS_BUNDLED_LOADER``.
     """
     path = Path(path)
     report = generic_preflight(path)

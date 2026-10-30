@@ -570,7 +570,16 @@ class MLXVLMAdapter(BaseAdapter):
         # executes model-supplied code.
         from .loaders import plan as plan_load
         bundled = _bundled_loaders_enabled()
-        load_plan = plan_load(path, bundled_loaders_enabled=bundled)
+        try:
+            load_plan = plan_load(path, bundled_loaders_enabled=bundled)
+        except Exception as exc:
+            # TASK-003 P2: preflight 失敗をワーカーログに記録する。
+            # 従来は coordinator.log の 400 のみで、原因特定に worker 側の
+            # 痕跡が無かった。code/message を明示して残す。
+            LOGGER.warning("Load preflight failed for %s: %s: %s",
+                           path, getattr(exc, "code", type(exc).__name__),
+                           str(exc)[:300])
+            raise
         config = load_plan["config"]
         has_visual_input = any(config.get(key) not in (None, {}) for key in (
             "vision_config", "vision_tower", "visual", "image_token_id",
