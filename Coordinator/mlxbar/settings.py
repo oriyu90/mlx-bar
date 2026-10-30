@@ -32,6 +32,14 @@ DEFAULTS: dict[str, Any] = {
             "totalMemoryRatio": 0.75,
             "minimumSystemReserveGB": 4,
             "defaultPerModelMaxGB": 32,
+            # v3.2.0 (ISS-6): how the admission estimate charges a model's
+            # weights for the per-model cap and the global budget. "strict"
+            # keeps the historical 1.35x of the on-disk size; "balanced" uses
+            # 1.15x because MLX mmaps the safetensors and their clean
+            # file-backed pages are reclaimable. The headroom check charges
+            # only the anonymous (non-reclaimable) part either way, so this
+            # knob never weakens the eviction or liveness guards.
+            "memoryAdmission": "strict",
             "idleTTLSeconds": 900,
             # Loads are deliberately serial: two simultaneous cold loads have
             # the least predictable combined allocation peak.
@@ -57,6 +65,11 @@ DEFAULTS: dict[str, Any] = {
             "perGenerationHeadroomGB": 0,
             "profiles": [],
         },
+        # v3.2.0 (ISS-5 / AC-5-4): allow the worker to use a *bundled* loader for
+        # a non-standard artifact. Off by default; enabling it is an explicit
+        # user decision and every use is logged. Model-supplied Python is never
+        # executed either way.
+        "bundledLoaders": False,
         "lmStudio": {
             "enabled": True,
             "folder": None,
@@ -358,6 +371,9 @@ class SettingsStore:
             raise ValueError("api.anthropic.enabled must be boolean")
         if not isinstance(data.get("models", {}).get("autoLoadOnAPIRequest"), bool):
             raise ValueError("models.autoLoadOnAPIRequest must be boolean")
+        # v3.2.0 (ISS-5): opt-in for bundled loaders; default off.
+        if not isinstance(data.get("models", {}).get("bundledLoaders", False), bool):
+            raise ValueError("models.bundledLoaders must be boolean")
         pool = data.get("models", {}).get("pool", {})
         if not isinstance(pool.get("enabled", True), bool):
             raise ValueError("models.pool.enabled must be boolean")
@@ -386,6 +402,10 @@ class SettingsStore:
         if (isinstance(headroom, bool) or not isinstance(headroom, (int, float))
                 or (float(headroom) != 0 and not 0.25 <= float(headroom) <= 32)):
             raise ValueError("models.pool.perGenerationHeadroomGB must be 0 or between 0.25 and 32")
+        # v3.2.0 (ISS-6): additive choice of admission accounting. The default
+        # stays "strict" so an existing config keeps its exact behaviour.
+        if pool.get("memoryAdmission", "strict") not in {"strict", "balanced"}:
+            raise ValueError("models.pool.memoryAdmission must be strict or balanced")
         profiles = pool.get("profiles")
         if not isinstance(profiles, list) or len(profiles) > 64:
             raise ValueError("models.pool.profiles must be an array with at most 64 entries")

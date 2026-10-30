@@ -361,9 +361,24 @@ def _anthropic_error_type(code: str | None) -> str:
         "ENGINE_BUSY": "overloaded_error",
         "MEMORY_PRESSURE": "overloaded_error",
         "MEMORY_BUDGET_EXCEEDED": "overloaded_error",
+        # v3.2.0 (ISS-6 / WP-611): the memory refusal split into its four
+        # causes. All remain retryable-capacity errors, so Anthropic clients
+        # keep seeing the same error class — only the code/message got more
+        # specific. MEMORY_BUDGET_EXCEEDED stays mapped for older workers.
+        "MEMORY_HEADROOM_INSUFFICIENT": "overloaded_error",
+        "MEMORY_BUDGET_TOTAL": "overloaded_error",
+        "MEMORY_POOL_EXHAUSTED": "overloaded_error",
+        "MEMORY_POSTLOAD_EXCEEDED": "overloaded_error",
         "INPUT_TOO_LARGE": "invalid_request_error",
         "INVALID_REQUEST": "invalid_request_error",
         "UNSUPPORTED_PARAMETER": "invalid_request_error",
+        # v3.2.0 (ISS-5 / WP-511): the model could not even be attempted.
+        # These are properties of the artifact, not transient capacity, so a
+        # retry will not help — say so with the non-retryable class.
+        "MODEL_NEEDS_BUNDLED_LOADER": "invalid_request_error",
+        "MODEL_FORMAT_UNSUPPORTED": "invalid_request_error",
+        "MODEL_QUANT_UNSUPPORTED": "invalid_request_error",
+        "MODEL_TOKENIZER_MISSING": "invalid_request_error",
         # A runtime that cannot count tokens is a capability limitation, not a
         # bad request: pair it with the 503 the endpoint already returns.
         "COUNT_TOKENS_UNAVAILABLE": "api_error",
