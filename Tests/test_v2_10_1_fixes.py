@@ -306,9 +306,12 @@ class SupervisorDeriveAndPhaseTests(unittest.TestCase):
             "mlx-lm"))
         self.assertEqual(starts, ["mlx-lm"])
 
-    def test_fallback_phase_names_the_engine(self):
-        """After the symmetric fallback, switching mlx-vlm -> mlx-lm must not
-        claim "mlx-vlm へ切り替え中" for the *next* engine (v2.10.1)."""
+    def test_vision_model_never_enters_the_fallback(self):
+        """v3.2.0 (WP-211 / AC-2-2): a vision-capable model has exactly one
+        candidate, so the "mlx-lmへ切り替え中" phase cannot appear for it.
+
+        The symmetric-fallback phase naming this test used to cover is still
+        exercised by the text-model test below (mlx-vlm -> mlx-lm)."""
         vlm_dir = make_model_dir(self.tmp, "vl", QWEN_VL_CONFIG)
         phases: list[str] = []
         self.instrument(fails=True, phases=phases)
@@ -316,7 +319,7 @@ class SupervisorDeriveAndPhaseTests(unittest.TestCase):
             asyncio.run(self.sup.load(
                 {"id": "m1", "name": "M", "path": str(vlm_dir), "engine": "mlx-lm"},
                 None))
-        self.assertEqual(phases, ["Workerを起動中", "mlx-lmへ切り替え中"])
+        self.assertEqual(phases, ["Workerを起動中"])
 
     def test_reverse_fallback_phase_names_mlx_vlm(self):
         text_dir = make_model_dir(self.tmp, "text", TEXT_CONFIG)

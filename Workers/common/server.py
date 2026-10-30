@@ -557,6 +557,17 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
             # Japanese sentence in `message`, which is what the GUI shows.
             text = str(exc)
             lowered = text.lower()
+            # v3.2.0 (ISS-5 / WP-511): a preflight failure already knows its
+            # cause; do not re-guess it from the text. `code` is one of
+            # MODEL_NEEDS_BUNDLED_LOADER / MODEL_FORMAT_UNSUPPORTED /
+            # MODEL_QUANT_UNSUPPORTED / MODEL_TOKENIZER_MISSING.
+            explicit_code = getattr(exc, "code", None)
+            if isinstance(explicit_code, str) and explicit_code.startswith("MODEL_"):
+                return JSONResponse({"type": "error", "code": explicit_code,
+                                     "message": getattr(exc, "message", None) or text,
+                                     "detail": text[-1000:],
+                                     "retryable": bool(getattr(exc, "retryable", False))},
+                                    status_code=400)
             if "remote code" in lowered:
                 code, human = "MODEL_REQUIRES_REMOTE_CODE", "このモデルはリモートコードの実行が必要なため読み込めません"
             elif vision.GUARD_TAG in text:

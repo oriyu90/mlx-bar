@@ -177,7 +177,9 @@ class NonResidentAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.pool._physical_memory = lambda: 60 * GIB
         with self.assertRaises(MLXBarError) as raised:
             await self.pool.load_for_api(dict(other))
-        self.assertEqual(raised.exception.code, "MEMORY_BUDGET_EXCEEDED")
+        # v3.2.0 (ISS-6 / WP-611, AC-6-4): nothing left to reclaim inside the
+        # pool's own budget is reported separately from the overall-budget refusal.
+        self.assertEqual(raised.exception.code, "MEMORY_POOL_EXHAUSTED")
 
     async def test_budget_pressure_reclaims_a_non_resident_before_a_resident(self):
         await self.pool.load_for_api(_catalog("model-a", "model-a"))

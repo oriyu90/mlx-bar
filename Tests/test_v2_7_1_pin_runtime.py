@@ -197,12 +197,27 @@ class PreloadPinTests(unittest.IsolatedAsyncioTestCase):
         state.model_autoload_lock = asyncio.Lock()
         return state, main_module
 
-    async def test_last_model_preloads_transient(self):
+    async def test_last_model_is_not_preloaded_when_a_pinned_model_exists(self):
+        """v3.2.0 (WP-310 / AC-3-2): `preloadLastModel` now means "warm the last
+        model when nothing is pinned". A stale `last_loaded_model_id` used to
+        bring the *previous* model back next to the pinned one -- the "old model
+        loads itself" half of ISS-7 -- and, being transient, it was then reaped
+        after the idle TTL while the pinned model was the one that had failed."""
         state, main_module = self.make_state("model-2")
         task = main_module._preload_last_model(state)
         self.assertIsNotNone(task)
         await task
         self.assertTrue(self.pool._slots["model-1"].session_pinned)
+        self.assertNotIn("model-2", self.pool._slots)
+
+    async def test_last_model_preloads_transient_when_nothing_is_pinned(self):
+        """The narrowed `preloadLastModel` still works for the case it is for:
+        no residency profile at all -> warm the last used model, transiently."""
+        self.pool.settings.data["models"]["pool"]["profiles"] = []
+        state, main_module = self.make_state("model-2")
+        task = main_module._preload_last_model(state)
+        self.assertIsNotNone(task)
+        await task
         self.assertIn("model-2", self.pool._slots)
         self.assertFalse(self.pool._slots["model-2"].session_pinned)
 

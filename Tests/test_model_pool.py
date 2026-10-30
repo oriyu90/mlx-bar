@@ -199,10 +199,13 @@ class ModelPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(slot.worker.memory_limit_bytes, 8 * GIB)
 
     async def test_post_load_measurement_cannot_exceed_the_admitted_reservation(self):
+        # v3.2.0 (ISS-6 / WP-611, AC-6-4): the post-load measurement guard is a
+        # distinct failure from "the pool could not find room", so it reports its
+        # own code. The refusal itself (and slot cleanup) is unchanged.
         FakeWorker.observed_bytes = 3 * GIB
         with self.assertRaises(MLXBarError) as raised:
             await self.pool.load_for_api(self.model(1))
-        self.assertEqual(raised.exception.code, "MEMORY_BUDGET_EXCEEDED")
+        self.assertEqual(raised.exception.code, "MEMORY_POSTLOAD_EXCEEDED")
         self.assertFalse(self.pool._slots)
 
     async def test_generation_lease_is_released_when_stream_closes(self):

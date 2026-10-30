@@ -25,7 +25,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
 from .settings import app_support_dir
-from .state import AppState, CATALOG_CLASSIFIER_VERSION
+from .state import (AppState, CATALOG_CAPABILITIES_VERSION,
+                    CATALOG_CLASSIFIER_VERSION)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -478,6 +479,21 @@ def configure_logging(root: Path) -> None:
         os.chmod(path, 0o600)
 
 
+def _record_preload(state, value: str, *, model_id: str | None = None,
+                    reason: str | None = None, code: str | None = None) -> None:
+    """Publish one preload transition on the state object (WP-311).
+
+    Kept tolerant on purpose: `_preload_last_model` is exercised with test
+    doubles that only expose database/settings/workers, and a preload must
+    never fail because status bookkeeping is unavailable.
+    """
+    recorder = getattr(state, "set_preload_state", None)
+    if not callable(recorder):
+        return
+    with contextlib.suppress(Exception):
+        recorder(value, model_id=model_id, reason=reason, code=code)
+
+
 def _preload_last_model(state) -> "asyncio.Task | None":
     """Reload explicitly retained models and, optionally, the last model.
 
@@ -486,16 +502,22 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     only the first is an invitation to load 27 GB of weights unasked.
     """
     if state.database.metadata_value("api_autoload_suspended") == "1":
+        _record_preload(state, "skipped", reason="api_autoload_suspended")
         return None
     pinned_ids = [str(profile.get("modelId"))
                   for profile in state.settings.data.get("models", {}).get("pool", {}).get("profiles", [])
                   if profile.get("keepLoaded") and profile.get("modelId")]
     transient_ids: list[str] = []
-    if state.settings.data.get("general", {}).get("preloadLastModel", True):
+    # v3.2.0 (ISS-3 / WP-310, AC-3-2): the "warm the last model" fallback only
+    # applies when nothing is pinned. With a pinned set, a stale
+    # last_loaded_model_id used to be loaded too -- exactly the ISS-7 symptom
+    # ("I changed the resident model and the old one came back as well").
+    if not pinned_ids and state.settings.data.get("general", {}).get("preloadLastModel", True):
         model_id = state.database.metadata_value("last_loaded_model_id")
-        if model_id and model_id not in pinned_ids:
+        if model_id:
             transient_ids.append(model_id)
     if not pinned_ids and not transient_ids:
+        _record_preload(state, "skipped", reason="no_resident_target")
         return None
 
     async def work() -> None:
@@ -509,11 +531,15 @@ def _preload_last_model(state) -> "asyncio.Task | None":
                 for model_id in pinned_ids:
                     model = catalog.get(model_id)
                     if model is None:
+                        _record_preload(state, "skipped", model_id=model_id,
+                                        reason="model_not_in_catalog")
                         continue
+                    _record_preload(state, "running", model_id=model_id)
                     try:
                         await state.workers.load(model, pin=True)
                         logging.getLogger(__name__).info(
                             "Preloaded %s", model.get("name") or model_id)
+                        _record_preload(state, "loaded", model_id=model_id)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -521,27 +547,40 @@ def _preload_last_model(state) -> "asyncio.Task | None":
                         # remaining safe preloads.
                         logging.getLogger(__name__).warning(
                             "Could not preload %s: %s", model_id, exc)
+                        _record_preload(state, "failed", model_id=model_id,
+                                        reason=str(exc),
+                                        code=getattr(exc, "code", None))
                 for model_id in transient_ids:
                     model = catalog.get(model_id)
                     if model is None:
+                        _record_preload(state, "skipped", model_id=model_id,
+                                        reason="model_not_in_catalog")
                         continue
+                    _record_preload(state, "running", model_id=model_id)
                     try:
                         await state.workers.load(model, pin=False)
                         logging.getLogger(__name__).info(
                             "Preloaded %s", model.get("name") or model_id)
+                        _record_preload(state, "loaded", model_id=model_id)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         logging.getLogger(__name__).warning(
                             "Could not preload %s: %s", model_id, exc)
+                        _record_preload(state, "failed", model_id=model_id,
+                                        reason=str(exc),
+                                        code=getattr(exc, "code", None))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # A preload is a convenience. Failing it must not stop the
             # coordinator from serving, and the next request can still autoload.
             logging.getLogger(__name__).warning("Could not preload the last model: %s", exc)
+            _record_preload(state, "failed", reason=str(exc),
+                            code=getattr(exc, "code", None))
 
     return asyncio.create_task(work())
+
 
 
 def _omlx_auto_connect_task(state: AppState, *, max_attempts: int = 6,
@@ -645,6 +684,7 @@ async def serve(root: Path | None = None) -> None:
     state.install_missing_runtimes()
     scan_task = None
     if (state.database.metadata_value("catalog_classifier_version") != CATALOG_CLASSIFIER_VERSION
+            or state.database.metadata_value("catalog_capabilities_version") != CATALOG_CAPABILITIES_VERSION
             or not state.database.list_models()
             or state.database.has_duplicate_model_paths()
             or state.database.has_mergeable_pathless_providers()):

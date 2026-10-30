@@ -6,7 +6,6 @@ import hashlib
 import logging
 import os
 import signal
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +22,22 @@ LOGGER = logging.getLogger(__name__)
 # ceiling keeps a mistyped CLI argument (or a pasted epoch timestamp) from
 # turning a transient model into a permanent resident.
 MAX_IDLE_EXTENSION_SECONDS = 86_400
+# v3.2.0 (ISS-6 / WP-610): the admission estimate is split in two parts. MLX
+# mmaps the safetensors, so the on-disk weight bytes are clean file-backed
+# pages the kernel can reclaim under pressure; only the KV cache, activations
+# and process overhead are anonymous and unavoidable. The weights still carry
+# a conservative factor for the *per-model cap and global budget* (an
+# accounting reservation), while the headroom check compares only the
+# anonymous part against the machine's effective free memory.
+ADMISSION_FACTORS = {"strict": 1.35, "balanced": 1.15}
+DEFAULT_ADMISSION_MODE = "strict"
+ANONYMOUS_FLOOR_BYTES = 512 << 20
+ANONYMOUS_WEIGHT_RATIO = 0.10
+# The shipped `models.pool.defaultPerModelMaxGB` value. Kept as a named
+# constant because the admission path treats it as "unset" and derives the
+# ceiling from physical memory instead (see _per_model_limit).
+DEFAULT_PER_MODEL_MAX_GB = 32.0
+DEFAULT_PER_MODEL_PHYSICAL_RATIO = 0.6
 
 
 class _LaneAbandoned(Exception):
@@ -274,6 +289,13 @@ class ModelPoolSupervisor:
                 modalities=classification["modalities"],
                 confidence=min(classification["confidence"], 0.7),
                 reason=f"ロード時の自動再検出: {classification['reason']}",
+                # v3.2.0 (WP-210): keep the capability columns in step with the
+                # self-healed engine, otherwise the GUI would show a badge set
+                # derived from the stale row until the next scan.
+                capabilities=classification.get("capabilities"),
+                runtime_fit=classification.get("runtimeFit"),
+                evidence=classification.get("evidence"),
+                loader_id=classification.get("loaderId"),
             )
             LOGGER.info("Catalog row %s re-classified: engine %s -> %s",
                         model["id"], model.get("engine"), loaded.get("engine"))
@@ -389,9 +411,35 @@ class ModelPoolSupervisor:
                    + (1 if slot.gen_lock.locked() else 0))
 
     def _per_model_limit(self, model: dict) -> int:
+        """Byte ceiling for one model (v3.2.0 / WP-611, AC-6-3).
+
+        Precedence, most explicit first:
+
+        1. a profile's ``maxMemoryGB`` -- a per-model user choice, always wins;
+        2. a pool-wide ``defaultPerModelMaxGB`` that differs from the shipped
+           default (32) -- also a user choice;
+        3. nothing configured: derive from physical memory (60%). The fixed
+           32 GiB default used to refuse a 35 GiB model on a 96 GiB machine,
+           which is exactly the ISS-6 symptom. 60% of RAM remains the safety
+           ceiling AC-6-3 asks for.
+
+        Limitation: `SettingsStore` persists a fully merged document, so an
+        explicit 32 cannot be distinguished from "never set". It is treated as
+        unset (physical-derived). A user who really wants a 32 GiB ceiling can
+        pin it per model with `profile.maxMemoryGB`, which is checked first.
+        """
         profile = self._profile(str(model.get("id", "")))
-        value = profile.get("maxMemoryGB", self._pool_settings().get("defaultPerModelMaxGB", 32))
-        return int(float(value) * GIB)
+        configured = profile.get("maxMemoryGB")
+        if configured is not None:
+            return int(float(configured) * GIB)
+        settings = self._pool_settings()
+        value = settings.get("defaultPerModelMaxGB")
+        if value is not None and abs(float(value) - DEFAULT_PER_MODEL_MAX_GB) > 1e-9:
+            return int(float(value) * GIB)
+        physical = self._physical_memory()
+        if physical > 0:
+            return int(min(512 * GIB, physical * DEFAULT_PER_MODEL_PHYSICAL_RATIO))
+        return int(float(value if value is not None else DEFAULT_PER_MODEL_MAX_GB) * GIB)
 
     @staticmethod
     def _physical_memory() -> int:
@@ -410,40 +458,68 @@ class ModelPoolSupervisor:
     def _host_capacity() -> tuple[int, int]:
         """Return reclaimable bytes and the macOS pressure level.
 
-        This is deliberately independent of every worker. A worker's MLX
-        counters cannot see another worker or another application.
+        Deliberately independent of every worker: a worker's MLX counters
+        cannot see another worker or another application. v3.2.0 routes this
+        through `system_info.host_memory()`, the single implementation of the
+        same two probes (the duplicate here had to be kept in sync by hand).
         """
-        available = 0
-        pressure = 0
         try:
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            output = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
-                                    text=True, timeout=5).stdout
-            wanted = ("Pages free:", "Pages inactive:", "Pages speculative:",
-                      "Pages purgeable:")
-            pages = 0
-            for line in output.splitlines():
-                if line.startswith(wanted):
-                    pages += int(line.rsplit(maxsplit=1)[-1].rstrip("."))
-            available = pages * page_size
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-        try:
-            output = subprocess.run(
-                ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
-                capture_output=True, text=True, timeout=5).stdout
-            pressure = int(output.strip())
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-        return available, pressure
+            from ..system_info import host_memory
+        except Exception:  # pragma: no cover - import cycle safety net
+            return 0, 0
+        info = host_memory()
+        return int(info.get("availableBytes", 0)), int(info.get("pressureLevel", 0))
 
     @staticmethod
-    def _cold_estimate(model: dict) -> int:
-        # Catalog size is the weight files' on-disk charge.  Unknown runtime
-        # overhead and load transients get 35%, with a 512 MiB process floor.
-        # The MLX allocator ceiling and RSS watchdog remain the hard backstops.
-        weight_bytes = max(0, int(model.get("size_bytes", 0) or 0))
-        return max(512 << 20, int(weight_bytes * 1.35) + (512 << 20))
+    def _weights_bytes(model: dict) -> int:
+        """On-disk weight charge: mmapped, so reclaimable under pressure."""
+        return max(0, int(model.get("size_bytes", 0) or 0))
+
+    @classmethod
+    def _anonymous_estimate(cls, model: dict) -> int:
+        """Unavoidable anonymous memory: KV/activations plus process floor.
+
+        Deliberately reuses the same 512 MiB floor and 10% activation
+        allowance the cold estimate already carried, so the headroom check is
+        a strict decomposition of it rather than a new, looser model.
+        """
+        return ANONYMOUS_FLOOR_BYTES + int(cls._weights_bytes(model) * ANONYMOUS_WEIGHT_RATIO)
+
+    def _admission_mode(self) -> str:
+        mode = str(self._pool_settings().get("memoryAdmission", DEFAULT_ADMISSION_MODE)
+                   or DEFAULT_ADMISSION_MODE)
+        return mode if mode in ADMISSION_FACTORS else DEFAULT_ADMISSION_MODE
+
+    def _cold_estimate(self, model: dict) -> int:
+        # Catalog size is the weight files' on-disk charge. Unknown runtime
+        # overhead and load transients get 35% (balanced: 15%), with a 512 MiB
+        # process floor. The MLX allocator ceiling and RSS watchdog remain the
+        # hard backstops. Used for the per-model cap and the global budget.
+        factor = ADMISSION_FACTORS[self._admission_mode()]
+        weight_bytes = self._weights_bytes(model)
+        return max(ANONYMOUS_FLOOR_BYTES, int(weight_bytes * factor) + ANONYMOUS_FLOOR_BYTES)
+
+    def _memory_breakdown(self, model: dict, *, available: int, reserve: int,
+                          reclaimable: int, budget: int, estimate: int) -> dict:
+        """Numeric admission breakdown for logs and error messages."""
+        weights = self._weights_bytes(model)
+        anonymous = self._anonymous_estimate(model)
+        return {
+            "requestedBytes": estimate,
+            "weightsBytes": weights,
+            "anonymousBytes": anonymous,
+            "residentBytes": self._resident_charge(),
+            "reclaimableBytes": reclaimable,
+            "availableBytes": available,
+            "effectiveAvailableBytes": available + reclaimable,
+            "reserveBytes": reserve,
+            "budgetBytes": budget,
+            "mode": self._admission_mode(),
+        }
+
+    @staticmethod
+    def _gb(value: int) -> str:
+        return f"{value / GIB:.2f}"
 
     def _resident_charge(self) -> int:
         charge = sum(slot.reservation_bytes for slot in self._slots.values()
@@ -573,12 +649,22 @@ class ModelPoolSupervisor:
             }
 
     async def _admit(self, model: dict, *, resident: bool) -> tuple[int, list[PoolSlot]]:
+        """Decide whether (and how) a model may be loaded (v3.2.0 / WP-610).
+
+        Order matters and is the ISS-6 fix: per-model cap -> global budget ->
+        OS pressure -> **eviction plan** -> headroom judged against the
+        *effective* free memory (actual free + what the planned evictions give
+        back). v3.1.0 judged headroom before planning evictions, so a resident
+        model that could simply be reclaimed made a load fail with "not enough
+        free memory" even though eviction would have made room.
+        """
         estimate = self._cold_estimate(model)
         per_model = self._per_model_limit(model)
         if estimate > per_model:
             raise MLXBarError(
                 "MODEL_MEMORY_LIMIT",
-                f"モデルの安全見積もり{estimate / GIB:.1f} GBがモデル上限{per_model / GIB:.1f} GBを超えています",
+                f"モデルの安全見積もり{estimate / GIB:.1f} GBがモデル上限{per_model / GIB:.1f} GBを超えています"
+                "（モデルの maxMemoryGB か models.pool.defaultPerModelMaxGB を確認してください）",
                 409, False,
             )
         budget = self._global_budget()
@@ -587,16 +673,16 @@ class ModelPoolSupervisor:
             omlx_memory = await self._get_omlx_memory_usage()
             budget = max(0, budget - omlx_memory)
         if budget <= 0 or estimate > budget:
-            raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
-                              "モデルを安全にロードできる全体メモリ予算がありません", 503, True)
+            raise MLXBarError(
+                "MEMORY_BUDGET_TOTAL",
+                f"モデルを安全にロードできる全体メモリ予算がありません"
+                f"（要求 {estimate / GIB:.2f} GB / 全体予算 {budget / GIB:.2f} GB）",
+                503, True)
         available, pressure = await asyncio.to_thread(self._host_capacity)
         reserve = int(float(self._pool_settings().get("minimumSystemReserveGB", 4)) * GIB)
         if pressure >= 2:
             raise MLXBarError("MEMORY_PRESSURE",
                               "macOSがメモリ逼迫を報告しているため新しいモデルをロードしません", 503, True)
-        if available > 0 and available < estimate + reserve:
-            raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
-                              "現在の空きメモリでは安全余白を残してロードできません", 503, True)
         candidates = sorted(
             (slot for slot in self._slots.values()
              if slot.state == "ready" and slot.leases == 0
@@ -622,8 +708,49 @@ class ModelPoolSupervisor:
             evict.append(victim)
             charged -= victim.reservation_bytes
         if charged + estimate > budget:
-            raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
-                              "使用中または固定中のモデルを残したまま安全にロードできません", 503, True)
+            raise MLXBarError(
+                "MEMORY_POOL_EXHAUSTED",
+                f"使用中または固定中のモデルを残したまま安全にロードできません"
+                f"（要求 {estimate / GIB:.2f} GB / 回収可能 {sum(v.reservation_bytes for v in evict) / GIB:.2f} GB"
+                f" / 全体予算 {budget / GIB:.2f} GB）",
+                503, True)
+        # Headroom, now judged *after* the eviction plan: the reservation of
+        # every slot we are about to free becomes usable capacity. Only the
+        # anonymous part of the request is compared (the weights are mmapped,
+        # reclaimable file-backed pages), so a 47 GiB estimate for a 35 GiB
+        # model no longer fails on a machine that has 52 GiB free.
+        reclaimable = sum(victim.reservation_bytes for victim in evict)
+        if available > 0:
+            anonymous = self._anonymous_estimate(model)
+            effective = available + reclaimable
+            if anonymous + reserve > effective:
+                breakdown = self._memory_breakdown(
+                    model, available=available, reserve=reserve,
+                    reclaimable=reclaimable, budget=budget, estimate=estimate)
+                LOGGER.warning(
+                    "MEMORY_HEADROOM_INSUFFICIENT model=%s requested=%.2fGB weights=%.2fGB "
+                    "anonymous=%.2fGB resident=%.2fGB reclaimable=%.2fGB available=%.2fGB "
+                    "effective=%.2fGB reserve=%.2fGB mode=%s",
+                    model.get("id") or model.get("name"),
+                    breakdown["requestedBytes"] / GIB, breakdown["weightsBytes"] / GIB,
+                    breakdown["anonymousBytes"] / GIB, breakdown["residentBytes"] / GIB,
+                    reclaimable / GIB, available / GIB, effective / GIB,
+                    reserve / GIB, breakdown["mode"])
+                raise MLXBarError(
+                    "MEMORY_HEADROOM_INSUFFICIENT",
+                    f"メモリの余白が不足しています（要求 {anonymous / GIB:.2f} GB / "
+                    f"確保可能 {effective / GIB:.2f} GB、うち回収予定 {reclaimable / GIB:.2f} GB、"
+                    f"安全余白 {reserve / GIB:.2f} GB）。固定中のモデルを解除するか、"
+                    "他のアプリを終了してください",
+                    503, True)
+        if evict:
+            LOGGER.info(
+                "Memory admission model=%s requested=%.2fGB weights=%.2fGB anonymous=%.2fGB "
+                "evicting=%d reclaimable=%.2fGB available=%.2fGB effective=%.2fGB mode=%s",
+                model.get("id") or model.get("name"), estimate / GIB,
+                self._weights_bytes(model) / GIB, self._anonymous_estimate(model) / GIB,
+                len(evict), reclaimable / GIB, available / GIB,
+                (available + reclaimable) / GIB, self._admission_mode())
         return min(per_model, max(estimate, 1 << 30)), evict
 
     async def _switch_ready_slots_to_explicit_engine(self, model_id: str, engine: str) -> None:
@@ -842,13 +969,18 @@ class ModelPoolSupervisor:
                                       "ロード後の実測メモリがモデル上限を超えました", 503, True)
                 if observed > existing.reservation_bytes:
                     raise MLXBarError(
-                        "MEMORY_BUDGET_EXCEEDED",
-                        "ロード後の実測値が事前に確保した安全予約を超えました",
+                        "MEMORY_POSTLOAD_EXCEEDED",
+                        "ロード後の実測値が事前に確保した安全予約を超えました"
+                        f"（実測 {observed / GIB:.2f} GB / 予約 {existing.reservation_bytes / GIB:.2f} GB）",
                         503, True,
                     )
                 if self._resident_charge() > self._global_budget():
-                    raise MLXBarError("MEMORY_BUDGET_EXCEEDED",
-                                      "ロード後の実測値が全体メモリ予算を超えました", 503, True)
+                    raise MLXBarError(
+                        "MEMORY_POSTLOAD_EXCEEDED",
+                        "ロード後の実測値が全体メモリ予算を超えました"
+                        f"（使用中 {self._resident_charge() / GIB:.2f} GB / "
+                        f"予算 {self._global_budget() / GIB:.2f} GB）",
+                        503, True)
                 existing.state = "ready"
                 existing.last_released_at = time.monotonic()
                 existing.load_future = None
@@ -1706,7 +1838,10 @@ class ModelPoolSupervisor:
                 "replicaShortfalls": [],
                 "activeGenerations": min(1, len(self._legacy.active_requests)),
             }
-            status["loadedModels"] = [status["loadedModel"]] if status.get("loadedModel") else []
+            # v3.2.0 (ISS-7 / WP-710): the legacy single-model path has no
+            # settings profiles to consult, so nothing is "profile pinned".
+            status["loadedModels"] = ([{**status["loadedModel"], "profilePinned": False}]
+                                      if status.get("loadedModel") else [])
             return status
         loaded_models = []
         loading = None
@@ -1739,6 +1874,13 @@ class ModelPoolSupervisor:
                          "laneQueueDepth": len(slot.gen_queued),
                          "laneRecoveries": slot.gen_recoveries,
                          "keepLoaded": slot.keep_loaded or slot.session_pinned,
+                         # v3.2.0 (ISS-7 / WP-710, AC-7-1): `keepLoaded` above
+                         # also covers a plain manual load (session pin), which
+                         # is why the GUI drew a "fixed" pin on a model the user
+                         # never pinned. `profilePinned` is the settings-profile
+                         # answer only; the GUI uses it for the pin mark and
+                         # keeps `keepLoaded` for compatibility.
+                         "profilePinned": bool(slot.keep_loaded),
                          # v2.8.0: whether this slot counts against
                          # `maxResidentModels`, and the two fields the GUI/CLI
                          # need to render and extend the idle countdown without
@@ -1781,6 +1923,10 @@ class ModelPoolSupervisor:
             loaded_models.append({**external_status["loadedModel"], "poolState": "external",
                                   "memoryReservationBytes": None, "activeLeases": 0,
                                   "keepLoaded": True, "memoryManagedBy": "lm-studio",
+                                  # An LM Studio instance is not governed by our
+                                  # settings profiles, so it is never "pinned"
+                                  # in the resident-setting sense (WP-710).
+                                  "profilePinned": False,
                                   # LM Studio owns the process, so this pool never
                                   # evicts it and never counts it against the
                                   # resident limit it also does not manage.

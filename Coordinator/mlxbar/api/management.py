@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from copy import deepcopy
 import json
 import platform
@@ -115,7 +116,33 @@ async def status(request: Request):
             "contextCompression": getattr(app, "last_context_compression", None),
             "adaptiveMemory": getattr(app, "last_adaptive_memory", None),
             "rag": _cached_rag_summary(app),
+            "preload": _preload_status(app),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
+
+
+PRELOAD_STATES = ("pending", "running", "loaded", "failed", "skipped")
+
+
+def _preload_status(app) -> dict:
+    """Startup preload outcome for the menu bar (v3.2.0 / WP-311, AC-3-3).
+
+    Always returns the full five-key shape so the GUI can decode it without
+    optional unwrapping, and never raises: a missing state object reads as
+    "pending" rather than failing the whole status call.
+    """
+    value = getattr(app, "preload_state", None)
+    if not isinstance(value, dict):
+        return {"state": "pending", "modelId": None, "reason": None,
+                "code": None, "at": None}
+    state = value.get("state")
+    return {
+        "state": state if state in PRELOAD_STATES else "pending",
+        "modelId": value.get("modelId"),
+        "reason": value.get("reason"),
+        "code": value.get("code"),
+        "at": value.get("at"),
+    }
+
 
 
 def _rag_summary(app) -> dict:
@@ -313,8 +340,13 @@ async def unload_one(model_id: str, request: Request, force: bool = False):
             result = await unload_model(model_id, force=force)
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    # v3.2.0 (ISS-3/ISS-7 / WP-310, AC-3-4): a single unload no longer arms the
+    # *global* autoload gate -- that stopped the preload of every other pinned
+    # model as soon as one model was released. It only forgets this model's
+    # "last loaded" memory, which is what AC-7-3 asks for (unpin, restart, and
+    # it must not come back). The all-models unload below keeps the gate.
     if app.database.metadata_value("last_loaded_model_id") == model_id:
-        app.database.set_metadata_value("api_autoload_suspended", "1")
+        app.database.set_metadata_value("last_loaded_model_id", "")
     return result
 
 
@@ -699,6 +731,13 @@ def _release_unpinned_sessions(app, old_profiles: dict[str, bool]) -> None:
     its session pin as well, so the model becomes idle-TTL managed instead
     of staying pinned forever with a stale "fixed" row. Models that were
     never in profiles (plain manual loads) keep their session pin.
+
+    v3.2.0 (ISS-7 / WP-711, AC-7-3): the release also forgets
+    ``last_loaded_model_id`` for that model. Without it, unpinning and
+    restarting brought the model back as the transient "last model", so the
+    UI said "unpinned" while the process kept loading it. The model is
+    deliberately *not* unloaded here -- a generation may be running, and the
+    user asked for a setting change, not an eviction.
     """
     new_profiles = _profile_pin_map(app.settings.data)
     unpinned = [model_id for model_id, was in old_profiles.items()
@@ -710,6 +749,82 @@ def _release_unpinned_sessions(app, old_profiles: dict[str, bool]) -> None:
         for slot in slots.values():
             if str(slot.model.get("id", "")) in unpinned and slot.session_pinned:
                 slot.session_pinned = False
+    database = getattr(app, "database", None)
+    if database is None:
+        return
+    with contextlib.suppress(Exception):
+        if database.metadata_value("last_loaded_model_id") in unpinned:
+            database.set_metadata_value("last_loaded_model_id", "")
+
+
+def _pool_profiles(data: dict) -> list[dict]:
+    """Deep copy of the profiles array, tolerating an older/hand-edited file."""
+    profiles = data.get("models", {}).get("pool", {}).get("profiles", [])
+    return [dict(item) for item in profiles if isinstance(item, dict)]
+
+
+@router.put("/settings/models/pool/profiles/{model_id:path}")
+async def put_model_profile(model_id: str, request: Request,
+                            body: dict = Body(default_factory=dict)):
+    """Merge one model's pool profile (v3.2.0 / WP-712, AC-7-4).
+
+    `MenuBarViewModel.setModelPin` / `setModelReplicas` / `setModelMemoryLimit`
+    used to rewrite the whole `profiles` array from a GUI snapshot, so an
+    operation issued before `/settings` had been fetched (empty snapshot)
+    deleted every other resident setting. This endpoint patches one entry by
+    model id and keeps everything else untouched; the full-array
+    `PUT /api/v1/settings` remains accepted for compatibility.
+
+    Body: `{keepLoaded?: bool, replicas?: int, maxMemoryGB?: number}` -- an
+    omitted field keeps its stored value. `keepLoaded: false` removes the entry
+    and releases that model's session pin + `last_loaded_model_id` (WP-711);
+    it never unloads the model.
+    """
+    app = state(request)
+    model_id = (model_id or "").strip()
+    if not model_id:
+        raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                         "message": "モデルIDが空です"})
+    if not isinstance(body, dict):
+        raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                         "message": "プロフィールはJSONオブジェクトで指定してください"})
+    if "keepLoaded" in body and not isinstance(body["keepLoaded"], bool):
+        raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                         "message": "keepLoadedはtrue/falseで指定してください"})
+    if "replicas" in body:
+        replicas = body["replicas"]
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or not 1 <= replicas <= 8:
+            raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                             "message": "replicasは1〜8の整数で指定してください"})
+    if "maxMemoryGB" in body:
+        memory = body["maxMemoryGB"]
+        if (isinstance(memory, bool) or not isinstance(memory, (int, float))
+                or not 1 <= float(memory) <= 512):
+            raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                             "message": "maxMemoryGBは1〜512の数値で指定してください"})
+    old_profiles = _profile_pin_map(app.settings.data)
+    profiles = _pool_profiles(app.settings.data)
+    index = next((position for position, item in enumerate(profiles)
+                  if str(item.get("modelId")) == model_id), None)
+    entry = dict(profiles[index]) if index is not None else {"modelId": model_id,
+                                                             "keepLoaded": False}
+    entry["modelId"] = model_id
+    for key in ("keepLoaded", "replicas", "maxMemoryGB"):
+        if key in body:
+            entry[key] = body[key]
+    if index is not None:
+        profiles[index] = entry
+    else:
+        profiles.append(entry)
+    if body.get("keepLoaded") is False:
+        profiles = [item for item in profiles
+                    if str(item.get("modelId")) != model_id]
+    try:
+        public = app.settings.update({"models": {"pool": {"profiles": profiles}}})
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "INVALID_PROFILE", "message": str(exc)})
+    _release_unpinned_sessions(app, old_profiles)
+    return {"profiles": public["models"]["pool"]["profiles"]}
 
 
 @router.put("/settings")
