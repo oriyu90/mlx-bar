@@ -27,6 +27,18 @@ from .prompt_cache import CheckpointStore, build_guarded_state
 LOGGER = logging.getLogger(__name__)
 
 
+def _bundled_loaders_enabled() -> bool:
+    """Whether the coordinator opted into bundled loaders (default: off).
+
+    v3.2.0 (ISS-5 / AC-5-4): the default is disabled and the coordinator sets
+    `MLXBAR_BUNDLED_LOADERS=1` only when `models.bundledLoaders` is on, so
+    enabling it is an explicit, recorded decision rather than something a
+    model directory can trigger by itself.
+    """
+    value = (os.environ.get("MLXBAR_BUNDLED_LOADERS") or "").strip().casefold()
+    return value in {"1", "true", "yes", "on"}
+
+
 # Every APC cache generation is a directory under `apc_root` whose name starts
 # with this. The checkpoint store keeps its own generations under a sibling
 # `checkpoints/` directory, so the sweep below has to recognise which of the two
@@ -547,14 +559,32 @@ class MLXVLMAdapter(BaseAdapter):
         # vision engine, so the flag is deliberately ignored here.
         if not path:
             raise ValueError("model path is required")
-        self.apply_memory_limits()
-        config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+        # v3.2.0 (ISS-5 / WP-510): preflight *before* any allocation. An
+        # artifact that cannot work (missing tokenizer, incomplete download,
+        # unsupported quantization, an arch no installed runtime implements) or
+        # that needs a bundled loader must fail in milliseconds, not after tens
+        # of gigabytes of weights. `plan()` never loads weights and never
+        # executes model-supplied code.
+        from .loaders import plan as plan_load
+        bundled = _bundled_loaders_enabled()
+        load_plan = plan_load(path, bundled_loaders_enabled=bundled)
+        config = load_plan["config"]
         has_visual_input = any(config.get(key) not in (None, {}) for key in (
             "vision_config", "vision_tower", "visual", "image_token_id",
         ))
         self.modalities = ["text", "image"] if has_visual_input else ["text"]
-        from mlx_vlm import load
-        self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
+        self.apply_memory_limits()
+        if load_plan["loader"] is not None:
+            # Opt-in path (models.bundledLoaders): repository code only. The
+            # log line is deliberate -- AC-5-4 asks for explicit consent *and*
+            # a record of every use.
+            LOGGER.warning("Bundled loader enabled: %s for %s",
+                           load_plan["loaderId"], path)
+            self.model, self.processor = load_plan["loader"].load(
+                path, trust_remote_code=trust_remote_code)
+        else:
+            from mlx_vlm import load
+            self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
         self.model_path = path
         self.apply_memory_limits()
         self._reset_prompt_cache()

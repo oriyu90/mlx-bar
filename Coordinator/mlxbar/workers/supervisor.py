@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from ..catalog.classifier import classify as _classify_catalog_model
 from ..catalog.classifier import detect_engine
 from ..errors import MLXBarError
 
@@ -24,6 +25,61 @@ WORKER_MODULES = {"mlx-lm": "mlx_lm_worker.adapter", "mlx-vlm": "mlx_vlm_worker.
 WORKER_LOG_MAX_BYTES = 1_048_576
 WORKER_STARTUP_DETAIL_BYTES = 4000
 LOGGER = logging.getLogger(__name__)
+
+
+def _catalog_capabilities(model: dict) -> tuple[dict, dict]:
+    """Capabilities/runtimeFit for one model, cheaply when possible (WP-210).
+
+    The catalog row already carries both after a scan, so the common path does
+    no I/O at all. Older rows (or ad-hoc model dicts from the CLI) fall back to
+    a read-only classification of the directory, which reads config files and
+    at most a safetensors header — never tensor data, and never a load.
+    """
+    capabilities = model.get("capabilities")
+    runtime_fit = model.get("runtimeFit")
+    if isinstance(capabilities, dict) and capabilities:
+        return capabilities, runtime_fit if isinstance(runtime_fit, dict) else {}
+    path = model.get("path")
+    if not path:
+        return {}, {}
+    try:
+        info = _classify_catalog_model(Path(str(path)))
+    except Exception:  # noqa: BLE001 - capabilities are advisory, never fatal
+        return {}, {}
+    caps = info.get("capabilities")
+    fit = info.get("runtimeFit")
+    return (caps if isinstance(caps, dict) else {},
+            fit if isinstance(fit, dict) else {})
+
+
+def _mlx_lm_excluded(capabilities: dict, runtime_fit: dict) -> bool:
+    """True when the auto chain must not try mlx-lm for this model.
+
+    `vision` is the user-visible capability (images would be dropped);
+    `runtimeFit.mlx-lm == "unsupported"` also covers text-only families with no
+    mlx-lm implementation (qwen4_exp). An `unknown` fit is *not* excluded: when
+    there is no evidence, the historical symmetric retry stays in place.
+    """
+    return bool(capabilities.get("vision")) or runtime_fit.get("mlx-lm") == "unsupported"
+
+
+def _aggregate_engine_failure(model: dict, attempts: list[dict], *,
+                              explicit: bool) -> MLXBarError:
+    """Build the final error for an auto chain where every engine failed.
+
+    v3.2.0 (WP-211 / G3): the v2.10.0 code returned `last_error`, which for a
+    vision model was the mlx-lm guard's "load it with mlx-vlm" advice — the
+    exact opposite of a recovery path when mlx-vlm was the engine that actually
+    failed. The message now carries every candidate's own reason, and the
+    structured `attempts` list rides along in `as_dict()`.
+    """
+    detail = " / ".join(f"{item['engine']}: {item['message']}" for item in attempts)
+    hint = ""
+    if model.get("loaderId"):
+        hint = ("。このモデルは同梱ローダが必要です"
+                "（/api/v1/models で loaderId を確認してください）")
+    message = f"利用可能なエンジンでモデルをロードできませんでした（{detail}）{hint}"
+    return MLXBarError("MODEL_INCOMPATIBLE", message, 409, False, attempts=attempts)
 
 
 class WorkerStalled(Exception):
@@ -257,6 +313,15 @@ class WorkerSupervisor:
         env["MLXBAR_PROMPT_CACHE_KEEP_GENERATIONS"] = str(
             min(10, max(1, int(cache_settings.get("keepGenerations", 2)))))
         env["MLXBAR_PROMPT_CACHE_MEMORY_RATIO"] = str(cache_settings.get("memoryRatio", 0.10))
+        # v3.2.0 (ISS-5 / AC-5-4): bundled loaders are opt-in. The worker reads
+        # this flag; without it a non-standard artifact fails fast with
+        # MODEL_NEEDS_BUNDLED_LOADER instead of attempting a load.
+        bundled_loaders = bool(self.settings.data.get("models", {}).get("bundledLoaders", False))
+        if bundled_loaders:
+            env["MLXBAR_BUNDLED_LOADERS"] = "1"
+            LOGGER.warning("Bundled loaders are enabled for %s (explicit user setting)", engine)
+        else:
+            env.pop("MLXBAR_BUNDLED_LOADERS", None)
         self._configure_paged_cache_environment(env, engine)
         self._configure_kv_quant_environment(env, engine)
         # Stable block hashes are required for reuse across Python processes.
@@ -458,7 +523,21 @@ class WorkerSupervisor:
                     # silently switches engines — the user picked one on
                     # purpose and its failure must surface as an error.
                     candidates.append("mlx-vlm" if chosen == "mlx-lm" else "mlx-lm")
+                    # v3.2.0 (WP-211): a vision-capable model is the exception.
+                    # mlx-lm would either refuse it (guard) or silently drop
+                    # every image, so trying it wastes a worker start and, worse,
+                    # lets the guard's "load it with mlx-vlm" text mask the real
+                    # mlx-vlm failure (G3). Text-only models with no mlx-lm
+                    # implementation (qwen4_exp) are excluded the same way.
+                    capabilities, runtime_fit = _catalog_capabilities(model)
+                    if _mlx_lm_excluded(capabilities, runtime_fit):
+                        candidates = [item for item in candidates if item != "mlx-lm"]
+                        LOGGER.info(
+                            "Auto engine chain for %s skips mlx-lm (vision=%s, mlx-lm=%s)",
+                            model.get("id") or model.get("name"),
+                            capabilities.get("vision"), runtime_fit.get("mlx-lm"))
                 last_error: MLXBarError | None = None
+                attempts: list[dict] = []
                 for candidate in candidates:
                     chosen = candidate
                     self.loading["engine"] = chosen
@@ -475,14 +554,25 @@ class WorkerSupervisor:
                     except MLXBarError as exc:
                         await self._stop_worker()
                         last_error = exc
+                        attempts.append({"engine": chosen, "code": exc.code,
+                                         "message": exc.message,
+                                         "retryable": bool(exc.retryable)})
+                        # Every candidate's reason travels with the error the
+                        # caller finally sees (WP-211 / AC-2-2).
+                        exc.attempts = list(attempts)
                         if exc.code != "MODEL_INCOMPATIBLE":
                             raise
                 else:
                     if explicit or not model.get("provider_key"):
                         # v2.10.0: an explicit engine is honored strictly —
                         # no silent LM Studio delegation behind a failed
-                        # explicit request.
-                        raise last_error or MLXBarError("MODEL_INCOMPATIBLE", "モデルをロードできません", 409)
+                        # explicit request. v3.2.0: the aggregate message names
+                        # what each engine actually said, so the user is not
+                        # left with the last guard's misleading advice.
+                        raise _aggregate_engine_failure(model, attempts,
+                                                        explicit=explicit) if attempts else (
+                            last_error or MLXBarError("MODEL_INCOMPATIBLE",
+                                                      "モデルをロードできません", 409))
                     chosen = "lm-studio"
                     self.loading["engine"] = chosen
                     self.loading["phase"] = "LM Studioへ切り替え中"
@@ -501,6 +591,25 @@ class WorkerSupervisor:
                 self.loading = None
             capabilities = {**result.get("capabilities", {}), "modelMaxTokens": model_max_tokens}
             self.loaded = {**model, "engine": chosen, "state": "loaded", "capabilities": capabilities}
+            # v3.2.0 (WP-211 / AC-2-2b): an explicit mlx-lm choice on a model
+            # that advertises vision is honoured, but the user is told that
+            # images will be dropped instead of discovering it later.
+            if explicit and chosen == "mlx-lm":
+                advertised, _fit = _catalog_capabilities(model)
+                if advertised.get("vision"):
+                    self.loaded["warnings"] = [{
+                        "code": "VISION_IMAGE_DROPPED",
+                        "message": "このモデルは画像入力に対応していますが、mlx-lmでは画像が破棄されます。"
+                                   "画像を使う場合はmlx-vlmを選択してください",
+                        "messageEn": "This model supports image input, but mlx-lm drops images. "
+                                     "Choose mlx-vlm to use images.",
+                        "engine": chosen,
+                    }]
+                    self.loaded["evidence"] = {"visionImageDropped": True,
+                                               "explicitEngine": chosen}
+                    LOGGER.warning(
+                        "Explicit mlx-lm load of vision-capable %s: image inputs will be dropped",
+                        model.get("id") or model.get("name"))
             return self.loaded
 
     async def unload(self) -> dict:

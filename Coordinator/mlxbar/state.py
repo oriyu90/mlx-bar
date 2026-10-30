@@ -28,6 +28,13 @@ from .workers.model_pool import ModelPoolSupervisor
 # Bump this together with any change to `catalog/classifier.py` decision
 # rules, or stale rows keep serving the wrong engine until a manual scan.
 CATALOG_CLASSIFIER_VERSION = "3"
+# v3.2.0 (ISS-2): the capability/catalog columns (`capabilities`,
+# `runtimeFit`, `evidence`, `loaderId`) landed without changing the classifier
+# version, whose value is pinned by an existing test (and by the v3.1.0
+# upgrade check). A separate marker makes every existing install rescan once
+# so those columns get filled in; bump it with any change to what
+# `catalog/classifier.py` writes into them.
+CATALOG_CAPABILITIES_VERSION = "1"
 
 
 class AppState:
@@ -64,6 +71,35 @@ class AppState:
         # In-memory only, purely informational -- same treatment as
         # last_context_compression.
         self.last_rag_retrieval: dict | None = None
+        # v3.2.0 (ISS-3 / WP-311): outcome of the startup resident preload,
+        # published by /api/v1/status as `preload` so the menu bar can say
+        # "loading resident model..." / "could not load (reason)" instead of
+        # the failure only existing in the log. In-memory only: a restart
+        # re-runs the preload and overwrites it.
+        self.preload_state: dict = {
+            "state": "pending", "modelId": None, "reason": None,
+            "code": None, "at": None,
+        }
+
+    def set_preload_state(self, state: str, *, model_id: str | None = None,
+                          reason: str | None = None,
+                          code: str | None = None) -> dict:
+        """Record one preload transition (v3.2.0 / WP-311).
+
+        `state` is one of pending / running / loaded / failed / skipped; the
+        timestamp is a wall-clock epoch float so a client can age the row
+        without trusting its own clock against ours.
+        """
+        if state not in {"pending", "running", "loaded", "failed", "skipped"}:
+            state = "failed"
+        self.preload_state = {
+            "state": state,
+            "modelId": model_id,
+            "reason": reason,
+            "code": code,
+            "at": time.time(),
+        }
+        return dict(self.preload_state)
 
     def scan_job(self) -> dict:
         async def work(update):
@@ -73,6 +109,13 @@ class AppState:
             await asyncio.to_thread(self.database.replace_models, models)
             await asyncio.to_thread(self.database.set_metadata_value,
                                     "catalog_classifier_version", CATALOG_CLASSIFIER_VERSION)
+            # v3.2.0 (ISS-2): separate marker for the capability columns. A
+            # v3.1.0 install is already at classifier version "3", so without
+            # its own marker it would never rescan and its catalog rows would
+            # keep `capabilities` empty (the Ornith vision badge).
+            await asyncio.to_thread(self.database.set_metadata_value,
+                                    "catalog_capabilities_version",
+                                    CATALOG_CAPABILITIES_VERSION)
             return {"count": len(models)}
         return self.jobs.create("model_scan", work)
 

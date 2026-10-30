@@ -330,19 +330,22 @@ class SupervisorEngineTests(unittest.TestCase):
         self.sup._call = fake_call  # type: ignore[method-assign]
         return starts, calls
 
-    def test_auto_rederives_vlm_and_falls_back(self):
+    def test_auto_rederives_vlm_and_does_not_fall_back(self):
         """A stale catalog row (`engine: mlx-lm` on a vision directory) is
-        re-derived at load time; the auto chain then retries symmetrically
-        across the engine boundary."""
+        re-derived at load time, and v3.2.0 (WP-211 / AC-2-2) stops there.
+
+        A vision-capable model is never retried on mlx-lm: that worker's guard
+        refuses it with "load it with mlx-vlm", which used to replace the real
+        mlx-vlm failure in the final error (G3) and hid why the model would not
+        load. The mlx-vlm failure now surfaces unchanged."""
         vlm_dir = make_model_dir(self.tmp, "vl", QWEN_VL_CONFIG)
         starts, calls = self.instrument()
         model = {"id": "m1", "name": "M", "path": str(vlm_dir), "engine": "mlx-lm"}
         with self.assertRaises(MLXBarError):
             asyncio.run(self._load(model, None))
-        self.assertEqual(starts, ["mlx-vlm", "mlx-lm"])
-        self.assertEqual([call[0] for call in calls], ["load", "load"])
+        self.assertEqual(starts, ["mlx-vlm"])
+        self.assertEqual([call[0] for call in calls], ["load"])
         self.assertFalse(calls[0][1].get("allow_vlm"))
-        self.assertFalse(calls[1][1].get("allow_vlm"))
 
     async def _load(self, model: dict, engine: str | None) -> dict:
         return await self.sup.load(model, engine)
@@ -353,7 +356,9 @@ class SupervisorEngineTests(unittest.TestCase):
         model = {"id": "m1", "name": "M", "path": str(vlm_dir), "engine": "mlx-lm"}
         with self.assertRaises(MLXBarError):
             asyncio.run(self._load(model, "auto"))
-        self.assertEqual(starts, ["mlx-vlm", "mlx-lm"])
+        # "auto" is the same path as None; a vision model has one candidate
+        # (WP-211 / AC-2-2: no mlx-lm retry).
+        self.assertEqual(starts, ["mlx-vlm"])
 
     def test_auto_text_model_tries_mlx_lm_first(self):
         text_dir = make_model_dir(self.tmp, "text", TEXT_CONFIG)

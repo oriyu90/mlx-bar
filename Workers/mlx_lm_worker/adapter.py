@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib.metadata
 import logging
 import os
@@ -147,11 +148,22 @@ class MLXLMAdapter(BaseAdapter):
         # coordinator Candidate chain can retry with mlx-vlm. An explicit
         # user engine choice passes `allow_vlm=True` and keeps working.
         if not allow_vlm and vision.looks_like_vlm(path):
+            # v3.2.0 (WP-211): name the evidence, not just the verdict. The
+            # coordinator aggregates this text into `attempts[]`, so a vague
+            # message ("load it with mlx-vlm") used to be the only thing the
+            # user saw even when mlx-vlm was the engine that actually failed.
+            reading = vision.inspect(path)
+            keys = ", ".join(reading.get("visionConfigKeys") or []) or "なし"
+            tensors = reading.get("tensors") or {}
+            tensor_text = (f"visionテンソル {tensors.get('vision')}/{tensors.get('total')}件"
+                           if tensors.get("known") else "テンソル情報なし")
             raise RuntimeError(
-                f"{vision.GUARD_TAG}: vision-language model config detected; "
-                "mlx-lm cannot serve image inputs for this model. Load it with "
-                "the mlx-vlm engine, or pass allow_vlm=true for an explicit "
-                "text-only selection.")
+                f"{vision.GUARD_TAG}: vision-language model detected "
+                f"(vision設定キー: {keys}; {tensor_text}). "
+                "mlx-lm cannot serve image inputs for this model — loading it here "
+                "would silently drop every image. Use the mlx-vlm engine, or pass "
+                "allow_vlm=true to force an explicit text-only selection.")
+
         # The allocator ceiling has to exist before the runtime starts creating
         # arrays. Applying it only after load cannot contain a cold-load peak.
         self.apply_memory_limits()
@@ -170,12 +182,34 @@ class MLXLMAdapter(BaseAdapter):
             except Exception as exc:
                 if allow_remote or "remote code" not in str(exc).lower():
                     raise
+                # v3.2.0 (ISS-5): a failed load can leave a partially built
+                # model (and its MLX buffers) behind. Drop it before retrying:
+                # on a 100B-class checkpoint that residue is what turns one
+                # failed attempt into an out-of-memory kill.
+                self._release_partial_load()
                 # retry with remote code enabled
         self.model_path = path
         self.apply_memory_limits()
         self.cache_budget = _read_cache_budget(path)
         self._init_prompt_cache(path)
         return self.capabilities()
+
+    def _release_partial_load(self) -> None:
+        """Drop a half-built model and its MLX buffers before a retry (ISS-5).
+
+        The `trust_remote_code` retry runs the loader twice. Without this the
+        first attempt's partially constructed model stays reachable until the
+        next GC cycle, so a large checkpoint can exhaust memory during the
+        retry instead of recovering.
+        """
+        self.model = None
+        self.processor = None
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:  # noqa: BLE001 - cleanup must never mask the real error
+            pass
 
     def unload(self) -> None:
         self.prompt_cache = None

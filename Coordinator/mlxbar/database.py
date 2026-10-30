@@ -85,6 +85,7 @@ class Database:
             self.connection.row_factory = sqlite3.Row
             self.connection.executescript(SCHEMA)
         self._migrate_api_logs()
+        self._migrate_models()
         with contextlib.suppress(Exception):
             # Keep a long-lived coordinator's file bounded and reclaim WAL
             # pages on clean starts. Failures are non-fatal (steady-state
@@ -118,6 +119,45 @@ class Database:
                 if name not in columns:
                     self.connection.execute(f"ALTER TABLE api_logs ADD COLUMN {name} {definition}")
 
+    # v3.2.0 (ISS-2 / WP-210): additive catalog capability columns. There is
+    # no schemaVersion bump and no data rewrite: an existing DB gets the
+    # columns with NULL and every reader treats NULL as "not classified yet"
+    # ({} for the JSON fields, None for loaderId). The next scan fills them.
+    MODEL_COLUMNS = {
+        "capabilities": "TEXT",
+        "runtimeFit": "TEXT",
+        "evidence": "TEXT",
+        "loaderId": "TEXT",
+    }
+
+    def _migrate_models(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(models)")}
+        with self.connection:
+            for name, definition in self.MODEL_COLUMNS.items():
+                if name not in columns:
+                    self.connection.execute(f"ALTER TABLE models ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _model_from_row(row: sqlite3.Row) -> dict:
+        """Decode one catalog row, tolerating pre-v3.2.0 rows (NULL columns)."""
+        item = dict(row)
+        try:
+            item["modalities"] = json.loads(item.get("modalities") or "[]")
+        except (TypeError, ValueError):
+            item["modalities"] = []
+        for key in ("capabilities", "runtimeFit", "evidence"):
+            raw = item.get(key)
+            if isinstance(raw, str) and raw:
+                try:
+                    decoded = json.loads(raw)
+                except ValueError:
+                    decoded = {}
+                item[key] = decoded if isinstance(decoded, dict) else {}
+            else:
+                item[key] = {}
+        item["loaderId"] = item.get("loaderId") or None
+        return item
+
     def close(self) -> None:
         """Releases the connection so the WAL/SHM sidecar files (and the
         database file itself) can be safely deleted, e.g. by a system reset."""
@@ -129,10 +169,27 @@ class Database:
             self.connection.execute("DELETE FROM models")
             self.connection.executemany(
                 """INSERT INTO models
-                (id,source,name,path,provider_key,format,engine,modalities,confidence,reason,size_bytes)
-                VALUES (:id,:source,:name,:path,:provider_key,:format,:engine,:modalities,:confidence,:reason,:size_bytes)""",
-                [{**m, "modalities": json.dumps(m["modalities"])} for m in models],
+                (id,source,name,path,provider_key,format,engine,modalities,confidence,reason,size_bytes,
+                 capabilities,runtimeFit,evidence,loaderId)
+                VALUES (:id,:source,:name,:path,:provider_key,:format,:engine,:modalities,:confidence,
+                 :reason,:size_bytes,:capabilities,:runtimeFit,:evidence,:loaderId)""",
+                [self._model_insert_row(m) for m in models],
             )
+
+    @staticmethod
+    def _model_insert_row(model: dict) -> dict:
+        """Bind one catalog dict, JSON-encoding the additive fields.
+
+        The pre-v3.2.0 callers (tests, provider imports) build dicts without
+        the capability keys; those are written as NULL rather than dropping
+        the row, exactly like a row from an older scan.
+        """
+        row = {**model, "modalities": json.dumps(model.get("modalities") or [])}
+        for key in ("capabilities", "runtimeFit", "evidence"):
+            value = model.get(key)
+            row[key] = json.dumps(value, ensure_ascii=False) if isinstance(value, dict) and value else None
+        row["loaderId"] = model.get("loaderId") or None
+        return row
 
     def metadata_value(self, key: str) -> str | None:
         with self.lock:
@@ -149,42 +206,51 @@ class Database:
     def list_models(self) -> list[dict]:
         with self.lock:
             rows = self.connection.execute("SELECT * FROM models ORDER BY name COLLATE NOCASE").fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["modalities"] = json.loads(item["modalities"])
-            result.append(item)
-        return result
+        return [self._model_from_row(row) for row in rows]
 
     def get_model(self, model_id: str) -> dict | None:
         with self.lock:
             row = self.connection.execute("SELECT * FROM models WHERE id=?", (model_id,)).fetchone()
         if not row:
             return None
-        item = dict(row)
-        item["modalities"] = json.loads(item["modalities"])
-        return item
+        return self._model_from_row(row)
 
     def update_model_classification(self, model_id: str, *, format: str, engine: str | None,
                                     modalities: list[str], confidence: float,
-                                    reason: str) -> bool:
+                                    reason: str, capabilities: dict | None = None,
+                                    runtime_fit: dict | None = None,
+                                    evidence: dict | None = None,
+                                    loader_id: str | None = None) -> bool:
         """Rewrite one catalog row's classification (v2.10.0 load-time self-heal).
 
         Starts a transaction only for rows that exist; `replace_models` (scan)
         remains the sole bulk writer, and both go through the same single
         connection + lock. Returns False when the row vanished between the
         load and this write (concurrent scan), which the caller treats as a
-        no-op."""
+        no-op.
+
+        v3.2.0: the capability fields are optional and only written when the
+        caller has them, so the v2.10.0 call sites (and older tests) keep
+        working unchanged.
+        """
+        values = {"id": model_id, "format": format, "engine": engine,
+                  "modalities": json.dumps(modalities), "confidence": float(confidence),
+                  "reason": reason}
+        assignments = ["format=:format", "engine=:engine", "modalities=:modalities",
+                       "confidence=:confidence", "reason=:reason"]
+        for key, parameter, value in (
+                ("capabilities", "capabilities", capabilities),
+                ("runtimeFit", "runtimeFit", runtime_fit),
+                ("evidence", "evidence", evidence),
+                ("loaderId", "loaderId", loader_id)):
+            if value is None:
+                continue
+            assignments.append(f"{key}=:{parameter}")
+            values[parameter] = (json.dumps(value, ensure_ascii=False)
+                                 if isinstance(value, dict) else value)
         with self.lock, self.connection:
             cursor = self.connection.execute(
-                """UPDATE models
-                   SET format=:format, engine=:engine, modalities=:modalities,
-                       confidence=:confidence, reason=:reason
-                   WHERE id=:id""",
-                {"id": model_id, "format": format, "engine": engine,
-                 "modalities": json.dumps(modalities), "confidence": float(confidence),
-                 "reason": reason},
-            )
+                f"UPDATE models SET {', '.join(assignments)} WHERE id=:id", values)
         return cursor.rowcount > 0
 
     def has_duplicate_model_paths(self) -> bool:
