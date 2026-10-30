@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 3.2.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 3.2.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -40,6 +40,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - oMLX連携（v2.9.0）：Apple Silicon向け推論サーバーoMLX（https://github.com/jundot/omlx）をモデル単位でルーティング先に追加。接続設定・モデルごとのoMLX実行トグル・oMLX使用メモリの統合メモリ管理・`mlxbarctl omlx` 各コマンド
 - oMLXセットアップ（v2.10.0）：「Settings…」→「Runtime」のoMLXカードから`brew install jundot/omlx/omlx`によるインストール、`omlx start`/`omlx stop`の実行、進捗とキャンセルを含むジョブ管理。`models.omlx.autoConnect`有効時はCoordinator起動時に自動接続
 - 明示エンジン選択（v2.10.0）：モデル一覧から「mlx-lm で読み込む」／「mlx-vlm で読み込む」を一回限り指定可能。カタログ判別v3（アーキ名トークン判定・laguna等mlx-vlm nativeテキスト系）でビジョンモデルのmlx-lm誤ロードをガードし、自動時のみロード時再導出と mlx-lm⇄mlx-vlm フォールバック、成功後にカタログ行を自己修復
+- モデル警告のGUI表示とniwaki生成配線の改善（v3.2.1）：ロード時のモデル警告（例：mlx-lmでの画像破棄）をメニュー・カタログ・クイックチャットにオレンジ行で表示。niwaki形式は停止条件（EOS両ID）・特殊トークンスキップ・モデルカード既定サンプラを配線し、生成パイプラインを正常化。
 - 7件の問題への対応（v3.2.0）：赤字エラーの20秒自動消去と接続状態の分離表示、visionモデルのランタイム適性判定（機能×ランタイム表・失敗理由の保持）、常駐モデルの起動時ロード確実化と失敗理由の表示、再起動直後の言語・設定の安定化、niwaki形式など非標準MLXモデルの同梱ローダによる実ロード、空きメモリ判定の順序修正と理由コードの分離、常駐プロファイルのマージAPIと解除時の自動解放
 - 起動安定性・表示寿命・ロード耐性（v3.1.0）：メニューバー/設定画面の赤字エラー文言が表示後20秒で自動消去、Coordinator起動直後の`_preload_last_model`が`scan_job`完了後になるため常駐（固定）モデルの起動時ロードが確実化、mlx_lm_workerのremote code必須モデルを1回自動再試行（ロード耐性）
 - 安定性・精査修正（v3.0.0）：ロード済みモデルへの明示エンジン選択を即時反映（旧エンジンで握りつぶさない）、フォールバック中の表示文言を実際の切替先に、未判別モデルの自動導出、カタログ自己修復のイベントループ分離、ジョブ配管例外時の子プロセス確実終了、oMLX autoConnectの再試行契約遵守、実行中oMLX有効化時の常駐メモリ計上修正、英語UIのジョブ表示翻訳補完
@@ -65,7 +66,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-3.2.0.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-3.2.1.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -603,7 +604,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-3.2.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-3.2.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

@@ -2,6 +2,26 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [3.2.1] - 2026-10-30
+
+**モデル警告のGUI表示とniwaki生成配線の改善。** 設定スキーマ・既存API形状は不変で、追加はadditiveなフィールドのみ。新規 `.strings` なし。
+
+### 新機能
+
+- **モデル警告のGUI表示（WP-A / A2案）**: `status.loadedModel.warnings`（および `loadedModels[]`）をSwiftでデコードし、メニュー・モデルカタログ・クイックチャットにオレンジ行で表示。`VISION_IMAGE_DROPPED`（明示mlx-lm＋vision時）が対象。アンロード／別エンジン再ロードで自動消去（タイマーなし）。i18nはサーバ文優先・`messageEn`→ErrorText表フォールバックで新規 `.strings` なし
+- **niwaki生成配線の正常化（WP-B）**: 同梱ローダがcheckpointのEOS集合 `[248046, 248044]` を `load_processor` に明示（従来はtokenizer側の248046のみで248044が停止せず漏れた）。bundled-loader使用モデルは `skip_special_tokens=True`・モデルカード既定サンプラ（1.0/0.95/20）を適用。潜在バグ修正（PLEループのfail-fast化・`nn.quantize` mode伝播・tokenmap fallbackのbyte-decoder検査）
+
+### 既知の制限（継続）
+
+- niwakiの生成テキスト品質は継続検証中（EOS停止・特殊トークン漏れの配線は修正済み、縮退ループの重み由来要因は未確定）
+- 常駐A→Bの自動反映はGUI経由のみ、`warnings` の生成時API追加は見送り（今回は状態警告の表示に限定）
+
+### テスト
+
+- `pytest Tests`（全件）: **818 passed / 2 failed**（失敗2件は本変更と無関係の既知flaky2件）
+- `swift test`: **27 tests / 0 failures**（StatusDecodingTestsに警告デコード6件追加）
+- 新規回帰: EOS配線テスト（`EosWiringTests`、ランタイムなし環境ではskip）
+
 ## [3.2.0] - 2026-10-29
 
 **ユーザー報告7件（ISS-1〜7）への対応版。** 赤文字が消えない・VLMの起動先が誤る・常駐モデルが起動時に載らない・再起動直後の言語/設定・niwakiがロードできない・メモリ拒否の誤判定・常駐設定が反映されない、の7点。設計は `DESIGN_v3.2.0.md`、ユーザー向け要約は `RELEASE_NOTES_v3.2.0.md`。設定スキーマ（`schemaVersion=1`）と既存API形状は不変で、追加は任意キー2つ（`models.pool.memoryAdmission` / `models.bundledLoaders`）とadditiveなフィールドのみ。
