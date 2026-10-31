@@ -683,6 +683,17 @@ async def _runtime_auto_check_loop(state: AppState) -> None:
 async def serve(root: Path | None = None) -> None:
     state = AppState(root)
     configure_logging(state.root)
+    # v3.3.2: launchd starts the coordinator with cwd="/" while a terminal or
+    # the GUI may start it anywhere else. Anything that resolved a path against
+    # the working directory therefore behaved differently under launchd -- the
+    # worker subprocess could fail to start, leaving the resident preload stuck
+    # at "running" with no worker and no error. Pin the working directory to the
+    # app-support root so the process is cwd-independent.
+    try:
+        os.chdir(state.root)
+    except OSError:
+        LOGGER.warning("Could not change to %s; continuing from the current directory",
+                       state.root)
     control = state.root / "control"
     control.mkdir(parents=True, exist_ok=True)
     socket_path = control / "coordinator.sock"

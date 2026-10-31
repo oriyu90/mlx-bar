@@ -283,3 +283,33 @@ class NonBlockingStartupIoTests(unittest.TestCase):
         result, ticks = asyncio.run(scenario())
         self.assertTrue(result["ok"])
         self.assertGreater(ticks, 3, "the loop kept running during the blocking read")
+
+
+class CwdIndependenceTests(unittest.TestCase):
+    """v3.3.2: the coordinator must not depend on its working directory.
+
+    launchd starts it with cwd="/" while a terminal starts it anywhere else.
+    With cwd="/" the worker subprocess never came up, so the resident preload
+    sat at "running" forever with no worker and no error. ``serve()`` now pins
+    the working directory to the app-support root.
+    """
+
+    def test_serve_pins_the_working_directory(self):
+        import inspect
+
+        from mlxbar import main as main_module
+
+        source = inspect.getsource(main_module.serve)
+        self.assertIn("os.chdir", source,
+                      "serve() must not inherit launchd's cwd")
+        self.assertIn("state.root", source)
+
+    def test_worker_import_paths_are_absolute_and_exist(self):
+        from mlxbar.workers.supervisor import WorkerSupervisor
+
+        paths = WorkerSupervisor._worker_import_paths()
+        self.assertTrue(paths, "the worker needs at least one import path")
+        for value in paths:
+            self.assertTrue(Path(value).is_absolute(),
+                            f"relative import path would break under cwd=/ : {value}")
+            self.assertTrue(Path(value).exists(), value)
