@@ -209,3 +209,77 @@ class MemoryAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonBlockingStartupIoTests(unittest.TestCase):
+    """v3.3.1: model metadata reads must stay off the event loop.
+
+    The startup preload loads a resident model. Reading its directory
+    (max-token probe, engine detection, capability classification) used to run
+    synchronously inside the coroutine, so on an external or sleeping volume the
+    whole coordinator stopped answering `/health` for as long as the disk took.
+    The fix routes every one of those reads through ``asyncio.to_thread``; this
+    test fails if any of them comes back.
+    """
+
+    def test_load_routes_directory_reads_through_to_thread(self):
+        import asyncio
+        import inspect
+
+        from mlxbar.workers import supervisor as supervisor_module
+
+        source = inspect.getsource(supervisor_module.WorkerSupervisor.load)
+        # Each sync helper must be dispatched, never called directly.
+        self.assertIn("asyncio.to_thread", source,
+                      "load() must dispatch blocking I/O")
+        for helper in ("_detect_model_max_tokens", "detect_engine",
+                       "_catalog_capabilities"):
+            if helper == "_detect_model_max_tokens":
+                self.assertIn("asyncio.to_thread", source)
+                self.assertNotIn(
+                    "        model_max_tokens = self._detect_model_max_tokens",
+                    source,
+                    "the max-token probe must not run inline on the loop")
+            if helper == "detect_engine":
+                self.assertNotIn(
+                    "            detected = detect_engine(Path(model[\"path\"]))",
+                    source,
+                    "engine detection must not run inline on the loop")
+            if helper == "_catalog_capabilities":
+                self.assertNotIn(
+                    "                    capabilities, runtime_fit = _catalog_capabilities(model)",
+                    source,
+                    "capability classification must not run inline on the loop")
+                self.assertNotIn(
+                    "                advertised, _fit = _catalog_capabilities(model)",
+                    source,
+                    "capability classification must not run inline on the loop")
+
+    def test_to_thread_dispatch_actually_yields(self):
+        # A coroutine that blocks inside to_thread must not stall the loop.
+        import asyncio
+        import time
+
+        async def scenario():
+            ticks = 0
+            done = False
+
+            def slow_io():
+                time.sleep(0.3)
+                return {"ok": True}
+
+            async def heartbeat():
+                nonlocal ticks
+                while not done:
+                    ticks += 1
+                    await asyncio.sleep(0.02)
+
+            task = asyncio.create_task(heartbeat())
+            result = await asyncio.to_thread(slow_io)
+            done = True
+            await task
+            return result, ticks
+
+        result, ticks = asyncio.run(scenario())
+        self.assertTrue(result["ok"])
+        self.assertGreater(ticks, 3, "the loop kept running during the blocking read")

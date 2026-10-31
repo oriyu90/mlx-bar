@@ -531,7 +531,12 @@ class WorkerSupervisor:
         if engine == "auto":
             engine = None
         chosen = engine or model.get("engine")
-        model_max_tokens = self._detect_model_max_tokens(model.get("path"))
+        # v3.3.1: catalogue/model metadata reads touch the model directory.
+        # On an external or sleeping volume that blocks the event loop for the
+        # whole coordinator (the startup preload then makes the app appear hung).
+        # Keep the I/O off the loop.
+        model_max_tokens = await asyncio.to_thread(
+            self._detect_model_max_tokens, model.get("path"))
         # v2.10.0: re-derive the engine from the directory for auto loads so
         # a stale catalog row self-heals. v2.10.1: this now also runs when the
         # catalog row classified *None* (before the gate below used to refuse
@@ -540,7 +545,7 @@ class WorkerSupervisor:
         # still unresolvable (no config.json, exotic layout) keeps raising the
         # honest gate error. An explicit choice never consults the directory.
         if not explicit and model.get("path") and chosen in {"mlx-lm", "mlx-vlm", None}:
-            detected = detect_engine(Path(model["path"]))
+            detected = await asyncio.to_thread(detect_engine, Path(model["path"]))
             if detected and detected != chosen:
                 LOGGER.info(
                     "Auto engine derivation for %s: catalog=%s load-time=%s",
@@ -595,7 +600,8 @@ class WorkerSupervisor:
                     # lets the guard's "load it with mlx-vlm" text mask the real
                     # mlx-vlm failure (G3). Text-only models with no mlx-lm
                     # implementation (qwen4_exp) are excluded the same way.
-                    capabilities, runtime_fit = _catalog_capabilities(model)
+                    capabilities, runtime_fit = await asyncio.to_thread(
+                        _catalog_capabilities, model)
                     if _mlx_lm_excluded(capabilities, runtime_fit):
                         candidates = [item for item in candidates if item != "mlx-lm"]
                         LOGGER.info(
@@ -668,7 +674,8 @@ class WorkerSupervisor:
             # that advertises vision is honoured, but the user is told that
             # images will be dropped instead of discovering it later.
             if explicit and chosen == "mlx-lm":
-                advertised, _fit = _catalog_capabilities(model)
+                advertised, _fit = await asyncio.to_thread(
+                    _catalog_capabilities, model)
                 if advertised.get("vision"):
                     self.loaded["warnings"] = [{
                         "code": "VISION_IMAGE_DROPPED",

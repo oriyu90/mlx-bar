@@ -2,6 +2,21 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [3.3.1] - 2026-10-31
+
+**起動時ハングの修正。** 常駐モデルのpreload中、モデルディレクトリのメタデータ読取がイベントループ上で同期実行され、外付けボリュームやスリープ復帰直後は `/health` が応答しない時間が続いていた。全読取を `asyncio.to_thread` へ移し、35GBモデルのpreload中でも応答を維持する。
+
+### 修正
+
+- **起動時ハング（重大）**: `WorkerSupervisor.load` の `_detect_model_max_tokens` / `detect_engine` / `_catalog_capabilities`（計4箇所）を `asyncio.to_thread` へ。外部ボリューム上のモデル読取でイベントループが停止し、アプリ全体が無応答になっていた
+- 回帰テスト2件追加（同期I/Oが戻ったら落ちる／to_thread が実際にループを譲ること）
+
+### 検証
+
+- 実測: niwaki（35GB、外部ボリューム）のpreload中に `/api/v1/health` が10秒間隔で応答し続けることを確認（修正前は3分以上無応答）
+- `pytest Tests`: **833 passed / 2 failed / 1 skipped**（失敗2件は既知flaky）
+- `swift test`: 28 tests / 0 failures
+
 ## [3.3.0] - 2026-10-31
 
 **7観点横断精査（メモリ/クラッシュ/安定性/GUI/設定/互換/表示）の修正版。** P0 0件、P1 10件・P2 18件を整理し、fail-open封鎖・失敗の記憶・契約同期の3系統を修正。設定スキーマ`schemaVersion=1`は不変（未知キーは422、前方互換configは読み取り専用）。
