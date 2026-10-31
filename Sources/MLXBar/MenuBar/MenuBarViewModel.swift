@@ -757,10 +757,13 @@ final class MenuBarViewModel: ObservableObject {
     /// Localized line for the coordinator's resident-model preload state, with
     /// whether it is a failure (rendered as a warning, not a transient error).
     ///
-    /// Nothing is returned for "loaded" / "skipped": the model list already
-    /// tells that story, and a permanent "loaded" line would just add noise to
-    /// the popover. The reason prefers the machine code (so English stays
-    /// English) and falls back to the server's message for unknown codes.
+    /// Nothing is returned for "loaded", nor for the skip reasons that carry no
+    /// news ("no resident configured", and a transient last-used model that has
+    /// since gone away). A resident profile held back by the autoload gate *is*
+    /// news -- the model is configured to load at every start and it will not --
+    /// so it gets an informational line instead of silence (v3.3.3 / TASK-005).
+    /// The reason prefers the machine code (so English stays English) and falls
+    /// back to the server's message for unknown codes.
     var preloadStatusLine: (text: String, failed: Bool)? {
         guard let preload else { return nil }
         switch preload.state {
@@ -773,6 +776,8 @@ final class MenuBarViewModel: ObservableObject {
             // so drop it here instead of printing "(reason: …limit.).".
             if reason.hasSuffix(".") { reason.removeLast() }
             return (String(format: LS("常駐モデルの読み込みに失敗しました（理由: %@）"), reason), true)
+        case "skipped" where preload.reason == "api_autoload_suspended":
+            return (LS("常駐モデルの自動読み込みは停止しています（モデルを解放したため）。モデルを読み込むか、常駐を設定し直すと再開します"), false)
         default:
             return nil
         }

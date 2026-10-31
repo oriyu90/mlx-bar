@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 from copy import deepcopy
 import json
+import logging
 import platform
 import sys
 import time
@@ -23,6 +24,7 @@ from ..system_info import lm_studio_default_folder
 
 
 router = APIRouter(prefix="/api/v1")
+LOGGER = logging.getLogger(__name__)
 
 
 # The menu bar polls `/status` every second while open (plus a background
@@ -757,6 +759,51 @@ def _release_unpinned_sessions(app, old_profiles: dict[str, bool]) -> None:
             database.set_metadata_value("last_loaded_model_id", "")
 
 
+def _rearm_resident_autoload(app, why: str) -> None:
+    """Re-open the resident auto-load gate (v3.3.3 / TASK-005).
+
+    ``DELETE /models/loaded`` arms ``api_autoload_suspended`` so that "I
+    unloaded this" survives a restart (AC-7-3). That flag is a *global* gate,
+    so it also suppressed the pinned-resident preload -- and nothing ever
+    cleared it again. The visible result was a resident model that stayed
+    configured in the GUI but was never loaded after a restart, with no log
+    line and no warning to explain it.
+
+    Declaring a model resident (``keepLoaded: true``) is the opposite
+    instruction: "load this at every start". So it re-opens the gate. The
+    flag is only cleared once the settings write has succeeded, so a rejected
+    profile cannot change it.
+    """
+    database = getattr(app, "database", None)
+    if database is None:
+        return
+    with contextlib.suppress(Exception):
+        if database.metadata_value("api_autoload_suspended") == "1":
+            database.set_metadata_value("api_autoload_suspended", "0")
+            LOGGER.info("Resident auto-load gate cleared (%s)", why)
+
+
+def _profiles_have_resident(body) -> bool:
+    """Whether a settings body carries at least one pinned resident profile.
+
+    Only a body that actually *contains* the profiles array re-opens the gate:
+    unrelated settings writes must leave a deliberate unload alone.
+    """
+    if not isinstance(body, dict):
+        return False
+    models = body.get("models")
+    if not isinstance(models, dict):
+        return False
+    pool = models.get("pool")
+    if not isinstance(pool, dict) or "profiles" not in pool:
+        return False
+    profiles = pool.get("profiles")
+    if not isinstance(profiles, list):
+        return False
+    return any(isinstance(item, dict) and item.get("keepLoaded")
+               for item in profiles)
+
+
 def _pool_profiles(data: dict) -> list[dict]:
     """Deep copy of the profiles array, tolerating an older/hand-edited file."""
     profiles = data.get("models", {}).get("pool", {}).get("profiles", [])
@@ -824,6 +871,8 @@ async def put_model_profile(model_id: str, request: Request,
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "INVALID_PROFILE", "message": str(exc)})
     _release_unpinned_sessions(app, old_profiles)
+    if body.get("keepLoaded") is True:
+        _rearm_resident_autoload(app, "model pinned as resident")
     return {"profiles": public["models"]["pool"]["profiles"]}
 
 
@@ -855,6 +904,8 @@ async def put_settings(request: Request, body: dict):
             raise HTTPException(409, detail={"code": "LISTENER_SWITCH_FAILED", "message": str(exc)})
     if "models" in body:
         _release_unpinned_sessions(app, old_profiles)
+    if _profiles_have_resident(body):
+        _rearm_resident_autoload(app, "resident profile written via settings")
     return app.settings.public()
 
 

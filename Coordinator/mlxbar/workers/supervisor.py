@@ -20,6 +20,7 @@ import httpx
 from ..catalog.classifier import classify as _classify_catalog_model
 from ..catalog.classifier import detect_engine
 from ..errors import MLXBarError
+from ..io_guard import VolumeGuard
 
 # v3.3.0 (WP-010): a model that dies twice inside this window is not
 # crashing transiently, it is crashing *reliably*. Reloading it is then a
@@ -126,6 +127,10 @@ class WorkerSupervisor:
         self.instance_key = "".join(c if c.isalnum() or c in "-_" else "_"
                                     for c in instance_key)[:80] or "worker"
         self.memory_limit_bytes = max(0, int(memory_limit_bytes))
+        # v3.3.3 (TASK-005): every model-metadata read goes through this, so a
+        # volume that stops answering fails loudly instead of hanging the
+        # preload forever.
+        self.volume_guard = VolumeGuard()
         self.loaded: dict | None = None
         self.loading: dict | None = None
         self.process: asyncio.subprocess.Process | None = None
@@ -535,8 +540,12 @@ class WorkerSupervisor:
         # On an external or sleeping volume that blocks the event loop for the
         # whole coordinator (the startup preload then makes the app appear hung).
         # Keep the I/O off the loop.
-        model_max_tokens = await asyncio.to_thread(
-            self._detect_model_max_tokens, model.get("path"))
+        # v3.3.3 (TASK-005): bounded. A read that never returns (TCC holding
+        # the open() for a Removable Volumes prompt that launchd cannot show)
+        # used to leave the preload "running" forever with no worker and no
+        # error; now it fails with MODEL_VOLUME_UNREADABLE and says so.
+        model_max_tokens = await self.volume_guard.read(
+            self._detect_model_max_tokens, model.get("path"), what="model config")
         # v2.10.0: re-derive the engine from the directory for auto loads so
         # a stale catalog row self-heals. v2.10.1: this now also runs when the
         # catalog row classified *None* (before the gate below used to refuse
@@ -545,7 +554,8 @@ class WorkerSupervisor:
         # still unresolvable (no config.json, exotic layout) keeps raising the
         # honest gate error. An explicit choice never consults the directory.
         if not explicit and model.get("path") and chosen in {"mlx-lm", "mlx-vlm", None}:
-            detected = await asyncio.to_thread(detect_engine, Path(model["path"]))
+            detected = await self.volume_guard.read(
+                detect_engine, Path(model["path"]), what="model directory")
             if detected and detected != chosen:
                 LOGGER.info(
                     "Auto engine derivation for %s: catalog=%s load-time=%s",
@@ -600,8 +610,8 @@ class WorkerSupervisor:
                     # lets the guard's "load it with mlx-vlm" text mask the real
                     # mlx-vlm failure (G3). Text-only models with no mlx-lm
                     # implementation (qwen4_exp) are excluded the same way.
-                    capabilities, runtime_fit = await asyncio.to_thread(
-                        _catalog_capabilities, model)
+                    capabilities, runtime_fit = await self.volume_guard.read(
+                        _catalog_capabilities, model, what="model capabilities")
                     if _mlx_lm_excluded(capabilities, runtime_fit):
                         candidates = [item for item in candidates if item != "mlx-lm"]
                         LOGGER.info(

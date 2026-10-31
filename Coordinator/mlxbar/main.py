@@ -22,6 +22,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from . import __version__
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
 from .settings import app_support_dir
@@ -512,8 +513,18 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     Deliberately skipped when the user unloaded the model themselves: that flag
     is the difference between "MLXBar restarted" and "I turned this off", and
     only the first is an invitation to load 27 GB of weights unasked.
+
+    v3.3.3 (TASK-005): every outcome is logged. The three skip branches used to
+    write only to the in-memory status object, so a resident model that never
+    loaded produced no log line *and* no worker process -- which read as
+    "launchd refuses to start anything" rather than "the resident preload was
+    skipped for a reason".
     """
+    log = logging.getLogger(__name__)
     if state.database.metadata_value("api_autoload_suspended") == "1":
+        log.info("Preload skipped: the last unload was explicit, so the resident "
+                 "auto-load gate is still armed (load any model, or re-pin a "
+                 "resident, to clear it)")
         _record_preload(state, "skipped", reason="api_autoload_suspended")
         return None
     pinned_ids = [str(profile.get("modelId"))
@@ -529,65 +540,70 @@ def _preload_last_model(state) -> "asyncio.Task | None":
         if model_id:
             transient_ids.append(model_id)
     if not pinned_ids and not transient_ids:
+        log.info("Preload skipped: no resident model is configured")
         _record_preload(state, "skipped", reason="no_resident_target")
         return None
+    log.info("Preload starting: %d resident, %d last-used",
+             len(pinned_ids), len(transient_ids))
 
     async def work() -> None:
         try:
             async with state.model_autoload_lock:
                 catalog = {item.get("id"): item for item in state.database.list_models()}
-                # Fixed profiles first with a session pin; the last-used model
-                # is only transient (pin=False) so an API-autoloaded model
-                # never comes back from a restart as a pinned resident that
-                # blocks the fixed set or dodges the idle TTL.
-                for model_id in pinned_ids:
+
+                async def load_one(model_id: str, *, pin: bool, resident: bool) -> None:
                     model = catalog.get(model_id)
                     if model is None:
-                        _record_preload(state, "skipped", model_id=model_id,
-                                        reason="model_not_in_catalog")
-                        continue
+                        if resident:
+                            # Not a benign skip: profile ids are derived from
+                            # the model's real path, so moving or renaming a
+                            # model silently retires the resident setting. Say
+                            # so, and report it as a failure rather than as
+                            # "nothing to do".
+                            log.warning("Resident model %s is no longer in the model "
+                                        "list; re-pin it or rescan", model_id)
+                            _record_preload(
+                                state, "failed", model_id=model_id,
+                                reason="the resident model is no longer in the model list",
+                                code="RESIDENT_MODEL_MISSING")
+                        else:
+                            log.info("Preload skipped: last-used model %s is no longer "
+                                     "in the model list", model_id)
+                            _record_preload(state, "skipped", model_id=model_id,
+                                            reason="model_not_in_catalog")
+                        return
                     _record_preload(state, "running", model_id=model_id)
+                    started = time.monotonic()
                     try:
-                        await state.workers.load(model, pin=True)
-                        logging.getLogger(__name__).info(
-                            "Preloaded %s", model.get("name") or model_id)
-                        _record_preload(state, "loaded", model_id=model_id)
+                        await state.workers.load(model, pin=pin)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         # One incompatible retained model must not block all
                         # remaining safe preloads.
-                        logging.getLogger(__name__).warning(
-                            "Could not preload %s: %s", model_id, exc)
+                        log.warning("Could not preload %s: %s", model_id, exc)
                         _record_preload(state, "failed", model_id=model_id,
                                         reason=str(exc),
                                         code=getattr(exc, "code", None))
+                        return
+                    log.info("Preloaded %s in %.0fs", model.get("name") or model_id,
+                             time.monotonic() - started)
+                    _record_preload(state, "loaded", model_id=model_id)
+
+                # Fixed profiles first with a session pin; the last-used model
+                # is only transient (pin=False) so an API-autoloaded model
+                # never comes back from a restart as a pinned resident that
+                # blocks the fixed set or dodges the idle TTL.
+                for model_id in pinned_ids:
+                    await load_one(model_id, pin=True, resident=True)
                 for model_id in transient_ids:
-                    model = catalog.get(model_id)
-                    if model is None:
-                        _record_preload(state, "skipped", model_id=model_id,
-                                        reason="model_not_in_catalog")
-                        continue
-                    _record_preload(state, "running", model_id=model_id)
-                    try:
-                        await state.workers.load(model, pin=False)
-                        logging.getLogger(__name__).info(
-                            "Preloaded %s", model.get("name") or model_id)
-                        _record_preload(state, "loaded", model_id=model_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logging.getLogger(__name__).warning(
-                            "Could not preload %s: %s", model_id, exc)
-                        _record_preload(state, "failed", model_id=model_id,
-                                        reason=str(exc),
-                                        code=getattr(exc, "code", None))
+                    await load_one(model_id, pin=False, resident=False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # A preload is a convenience. Failing it must not stop the
             # coordinator from serving, and the next request can still autoload.
-            logging.getLogger(__name__).warning("Could not preload the last model: %s", exc)
+            log.warning("Could not preload the last model: %s", exc)
             _record_preload(state, "failed", reason=str(exc),
                             code=getattr(exc, "code", None))
 
@@ -694,6 +710,12 @@ async def serve(root: Path | None = None) -> None:
     except OSError:
         LOGGER.warning("Could not change to %s; continuing from the current directory",
                        state.root)
+    # v3.3.3 (TASK-005): a startup banner. Without one, "the app started but the
+    # resident model never loaded" had no record of which build, which process,
+    # or which data root produced the log -- which is exactly the case that was
+    # misdiagnosed as a launchd subprocess problem for three releases.
+    LOGGER.info("MLXBar coordinator %s starting pid=%s root=%s cwd=%s",
+                __version__, os.getpid(), state.root, Path.cwd())
     control = state.root / "control"
     control.mkdir(parents=True, exist_ok=True)
     socket_path = control / "coordinator.sock"
@@ -732,17 +754,29 @@ async def serve(root: Path | None = None) -> None:
     # window in which a client can reach half-built state. Loading a 27B model
     # takes tens of seconds, and the first request after a restart should not be
     # the thing that pays for it.
-    if scan_task is not None:
-        with contextlib.suppress(Exception):
-            await scan_task
-    preload_task = _preload_last_model(state)
-    # launchd sends SIGTERM on logout, restart and `launchctl bootout`. Without
-    # a handler the process dies before `finally` runs, stranding the worker
-    # subprocess with its model still resident.
+    # Register the termination handlers before anything long-running starts.
+    # launchd sends SIGTERM on logout, restart and `launchctl bootout`; while the
+    # handler was added only after the scan and the preload were scheduled, a
+    # SIGTERM in that window killed the process before `finally` ran and
+    # stranded the worker subprocess with its model still resident.
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, ValueError):
             loop.add_signal_handler(signal_name, management.handle_exit, signal_name, None)
+    if scan_task is not None:
+        # Rare (only when the catalog marker versions moved, e.g. the first
+        # start after an upgrade). Say so: the resident preload is queued
+        # behind this scan, and a long scan of an external volume otherwise
+        # looks exactly like "the resident model never loads".
+        logging.getLogger(__name__).info(
+            "Catalog rescan running before the resident preload starts")
+        # Publish *why* nothing is loading yet. Without this the state stays at
+        # its initial "pending", indistinguishable from a preload that never
+        # ran at all.
+        _record_preload(state, "pending", reason="catalog_scan")
+        with contextlib.suppress(Exception):
+            await scan_task
+    preload_task = _preload_last_model(state)
     for _ in range(50):
         if socket_path.exists():
             os.chmod(socket_path, 0o600)

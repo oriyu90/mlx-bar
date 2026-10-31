@@ -361,6 +361,21 @@ enum CoordinatorErrorText {
         "MODEL_LOAD_DEGRADED": (
             "カタログと異なる経路で読み込みました。対応機能や品質が変わる可能性があります",
             "Loaded through a different path than the catalog entry. Capabilities or quality may differ."),
+        // v3.3.3 (TASK-005): the resident profile outlived its model. Profile
+        // ids are derived from the model's real path, so moving or renaming a
+        // model retires the resident setting; the startup preload used to
+        // report that as a silent skip, which looked like the app not starting
+        // it at all.
+        "RESIDENT_MODEL_MISSING": (
+            "常駐に設定したモデルがモデル一覧に見つかりません。モデルを移動した場合は、設定画面で常駐を選び直してください",
+            "The model set as resident is no longer in the model list. If you moved it, pick it again in Settings."),
+        // v3.3.3 (TASK-005): an external volume that never answers. macOS
+        // holds open() until the Removable Volumes permission prompt is
+        // answered, which a launchd agent cannot show, so the startup preload
+        // used to sit at "loading" forever with no worker and no error.
+        "MODEL_VOLUME_UNREADABLE": (
+            "モデルフォルダを読み取れませんでした。外付けボリュームへのアクセスが許可されていない可能性があります。システム設定の「プライバシーとセキュリティ」で「リムーバブルボリューム」または「フルディスクアクセス」に MLXBar を追加してください",
+            "The model folder could not be read. Access to the external volume may not be allowed: add MLXBar to Removable Volumes or Full Disk Access in System Settings > Privacy & Security."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

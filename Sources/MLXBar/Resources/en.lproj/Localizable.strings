@@ -549,6 +549,7 @@
    literals used with LS(_:); %@ is filled with String(format:). */
 "常駐モデルを読み込み中…" = "Loading resident model…";
 "常駐モデルの読み込みに失敗しました（理由: %@）" = "Could not load the resident model (reason: %@).";
+"常駐モデルの自動読み込みは停止しています（モデルを解放したため）。モデルを読み込むか、常駐を設定し直すと再開します" = "Resident auto-load is paused because you unloaded the model. Loading a model, or setting a resident again, resumes it.";
 "設定ファイルを読み込めなかったため、初期値に戻しました（バックアップ: %@）" = "The settings file could not be read, so defaults were restored (backup: %@).";
 "一時" = "Temporary";
 "設定を読み込み中" = "Loading settings";

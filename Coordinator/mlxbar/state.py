@@ -101,9 +101,69 @@ class AppState:
         }
         return dict(self.preload_state)
 
+    def _roots_that_would_be_lost(self) -> list[str]:
+        """Configured model roots that hold catalog rows but are unreachable.
+
+        v3.3.3 (TASK-005): a rescan replaces the whole catalog, so a root that
+        is temporarily unreadable -- an external volume that has not mounted
+        yet at login, a sleeping disk -- contributes zero rows and every model
+        under it disappears. The scan then stamps the version markers, so the
+        loss is permanent: nothing rescans until the marker version changes
+        again. A resident model in that catalog then fails the startup preload
+        with `model_not_in_catalog`, silently, forever.
+
+        Only roots that *currently* hold rows count: a root the user deleted
+        from disk without removing it from settings keeps its old rows, but a
+        root that never contributed anything is just an unhelpful setting and
+        must not block scanning.
+        """
+        roots = [str(item) for item in self.settings.data["models"].get("roots", [])]
+        if not roots:
+            return []
+        try:
+            existing = self.database.list_models()
+        except Exception:  # noqa: BLE001 - a catalog read failure is not fatal
+            return []
+        lost: list[str] = []
+        for root in roots:
+            try:
+                path = Path(root).expanduser()
+                if path.exists():
+                    continue
+                prefix = os.path.normcase(str(path))
+            except (OSError, ValueError):
+                continue
+            if any(os.path.normcase(str(item.get("path") or "")).startswith(prefix)
+                   for item in existing):
+                lost.append(root)
+        return lost
+
     def scan_job(self) -> dict:
         async def work(update):
             await update(0.1, "モデルフォルダを走査中")
+            try:
+                # Bounded for the same reason model reads are (v3.3.3 /
+                # TASK-005): a TCC permission prompt for an external volume
+                # blocks open()/stat() with no way to answer it from launchd.
+                lost = await asyncio.wait_for(
+                    asyncio.to_thread(self._roots_that_would_be_lost), timeout=15)
+            except asyncio.TimeoutError:
+                logging.getLogger(__name__).warning(
+                    "Model scan skipped: the model roots did not answer within 15s "
+                    "(an external-volume permission prompt may be waiting); keeping "
+                    "the existing catalog")
+                return {"count": 0, "skipped": "unresponsive_roots", "roots": []}
+            if lost:
+                # Keep the catalog (and its resident rows) intact and leave the
+                # version markers alone, so the next start retries once the
+                # volume is back. Destroying the catalog here is what turned a
+                # "disk was not mounted yet" into a permanently broken resident
+                # model.
+                logging.getLogger(__name__).warning(
+                    "Model scan skipped: %s unreachable but still holds catalog "
+                    "entries; keeping the existing catalog until it is back",
+                    ", ".join(lost))
+                return {"count": 0, "skipped": "unavailable_roots", "roots": lost}
             models = await scan_all(self.settings.data, self.settings.lm_studio_token)
             await update(0.9, f"{len(models)}件を保存中")
             await asyncio.to_thread(self.database.replace_models, models)
