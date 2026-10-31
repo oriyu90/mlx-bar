@@ -131,6 +131,11 @@ class WorkerSupervisor:
         # volume that stops answering fails loudly instead of hanging the
         # preload forever.
         self.volume_guard = VolumeGuard()
+        # v3.4.0: a model's token limit and capability flags do not change while
+        # the process lives, so read them once. The operator report's worst case
+        # was a stalled volume turning *every* request into a 20 s wait; this
+        # keeps the steady state free of reads entirely.
+        self._metadata_cache: dict[str, object] = {}
         self.loaded: dict | None = None
         self.loading: dict | None = None
         self.process: asyncio.subprocess.Process | None = None
@@ -516,6 +521,23 @@ class WorkerSupervisor:
                                   data.get("retryable", False))
             return data
 
+    async def _cached_metadata(self, kind: str, path, func, *args, what: str):
+        """One metadata read per model path, bounded and cached (v3.4.0).
+
+        Called from `load`, which the API path reaches on every request for a
+        model that is not resident. Without the cache a stalled volume made each
+        of those requests wait out `VolumeGuard`'s deadline.
+        """
+        if not path:
+            return await self.volume_guard.read(func, *args, what=what)
+        key = f"{kind}\0{path}"
+        cached = self._metadata_cache.get(key)
+        if cached is not None:
+            return cached
+        value = await self.volume_guard.read(func, *args, what=what, volume_path=path)
+        self._metadata_cache[key] = value
+        return value
+
     async def load(self, model: dict, engine: str | None = None, explicit: bool | None = None) -> dict:
         # v2.10.0: `explicit` records the difference between "the caller named
         # this engine" (management body engine / CLI --engine / a resolved
@@ -544,8 +566,9 @@ class WorkerSupervisor:
         # the open() for a Removable Volumes prompt that launchd cannot show)
         # used to leave the preload "running" forever with no worker and no
         # error; now it fails with MODEL_VOLUME_UNREADABLE and says so.
-        model_max_tokens = await self.volume_guard.read(
-            self._detect_model_max_tokens, model.get("path"), what="model config")
+        model_max_tokens = await self._cached_metadata(
+            "max_tokens", model.get("path"), self._detect_model_max_tokens,
+            model.get("path"), what="model config")
         # v2.10.0: re-derive the engine from the directory for auto loads so
         # a stale catalog row self-heals. v2.10.1: this now also runs when the
         # catalog row classified *None* (before the gate below used to refuse
@@ -555,7 +578,8 @@ class WorkerSupervisor:
         # honest gate error. An explicit choice never consults the directory.
         if not explicit and model.get("path") and chosen in {"mlx-lm", "mlx-vlm", None}:
             detected = await self.volume_guard.read(
-                detect_engine, Path(model["path"]), what="model directory")
+                detect_engine, Path(model["path"]), what="model directory",
+                volume_path=model["path"])
             if detected and detected != chosen:
                 LOGGER.info(
                     "Auto engine derivation for %s: catalog=%s load-time=%s",
@@ -610,8 +634,9 @@ class WorkerSupervisor:
                     # lets the guard's "load it with mlx-vlm" text mask the real
                     # mlx-vlm failure (G3). Text-only models with no mlx-lm
                     # implementation (qwen4_exp) are excluded the same way.
-                    capabilities, runtime_fit = await self.volume_guard.read(
-                        _catalog_capabilities, model, what="model capabilities")
+                    capabilities, runtime_fit = await self._cached_metadata(
+                        "capabilities", model.get("path"), _catalog_capabilities,
+                        model, what="model capabilities")
                     if _mlx_lm_excluded(capabilities, runtime_fit):
                         candidates = [item for item in candidates if item != "mlx-lm"]
                         LOGGER.info(

@@ -9,6 +9,8 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from .. import __version__
+from .. import authtoken
 from ..errors import MLXBarError
 from ..rag.retrieval import inject_context_block
 from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
@@ -90,20 +92,61 @@ def app_state(request: Request):
 
 
 def authorize(request: Request) -> None:
+    """Reject a request without the current (or just-replaced) API token.
+
+    v3.4.0 (operator report A): the 401 now carries a non-secret fingerprint of
+    the *current* key plus when it was issued, so a client holding a cached key
+    can tell "stale key" from "server down" without logging a secret. A token
+    replaced within the last `authtoken.GRACE_SECONDS` is still accepted, so a
+    rotation does not turn into an outage.
+
+    """
     state = app_state(request)
     if not state.settings.data["api"].get("requireToken", True):
         return
-    expected = "Bearer " + state.settings.api_token
-    if not secrets.compare_digest(request.headers.get("authorization", ""), expected):
-        raise HTTPException(401, detail={
-            "code": "AUTHENTICATION_FAILED",
-            "message": "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください",
-        })
+    if authtoken.accept(state.settings, request.headers.get("authorization", "")):
+        return
+    raise HTTPException(401, detail=authtoken.failure_detail(state.settings))
 
 
 @router.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(request: Request):
+    """Unauthenticated liveness + volume state (v3.4.0, report B).
+
+    Deliberately reports state, not model names or paths: it is reachable
+    without credentials on the LAN. `volume_state` is the *remembered* volume
+    health, so this endpoint never touches the filesystem itself.
+    """
+    state = app_state(request)
+    workers = state.workers
+    loaded: list = []
+    reader = getattr(workers, "loaded_models", None)
+    if callable(reader):
+        loaded = [item for item in reader() if item]
+    elif getattr(workers, "loaded", None):
+        loaded = [workers.loaded]
+    volume_state = getattr(state, "volume_state", None)
+    preload = getattr(state, "preload_state", None) or {}
+    return {
+        "status": "ok",
+        "version": __version__,
+        "uptime_seconds": int(time.time() - getattr(state, "started_at", time.time())),
+        "auth_required": bool(state.settings.data["api"].get("requireToken", True)),
+        "model_loaded": bool(loaded),
+        "resident_model_count": len(loaded),
+        "volume_state": volume_state() if callable(volume_state) else "ok",
+        "preload_state": preload.get("state"),
+    }
+
+
+@router.get("/v1/auth/status")
+async def auth_status(request: Request):
+    """Unauthenticated: what key does this server expect right now? (v3.4.0)
+
+    Returns only a fingerprint and timestamps. Never the token, and never
+    whether a *presented* key matched -- that stays a 401 on the real endpoint.
+    """
+    return authtoken.status_payload(app_state(request).settings)
 
 
 @router.post("/v1/responses")

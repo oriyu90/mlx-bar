@@ -373,6 +373,11 @@ enum CoordinatorErrorText {
         // holds open() until the Removable Volumes permission prompt is
         // answered, which a launchd agent cannot show, so the startup preload
         // used to sit at "loading" forever with no worker and no error.
+        // v3.4.0: the volume is not mounted at all, which the user fixes
+        // differently from a permission problem.
+        "MODEL_VOLUME_DETACHED": (
+            "モデルフォルダが見つかりません。外付けボリュームが接続されているか確認してください",
+            "The model folder is missing. Check that the external volume is connected."),
         "MODEL_VOLUME_UNREADABLE": (
             "モデルフォルダを読み取れませんでした。外付けボリュームへのアクセスが許可されていない可能性があります。システム設定の「プライバシーとセキュリティ」で「リムーバブルボリューム」または「フルディスクアクセス」に MLXBar を追加してください",
             "The model folder could not be read. Access to the external volume may not be allowed: add MLXBar to Removable Volumes or Full Disk Access in System Settings > Privacy & Security."),

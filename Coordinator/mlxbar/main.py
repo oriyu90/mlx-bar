@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
+from . import authtoken
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
 from .settings import app_support_dir
@@ -39,7 +40,10 @@ LOG_MAX_BYTES = 20_000_000
 LOG_BACKUP_COUNT = 5
 
 # Reachable without credentials so a monitor can see the listener is alive.
-UNAUTHENTICATED_PATHS = {"/health"}
+# Reachable without credentials so a client can tell "wrong key" from "server
+# down" (v3.4.0, operator report A). Both report state only: no model names, no
+# paths, no token.
+UNAUTHENTICATED_PATHS = {"/health", "/v1/auth/status"}
 # Headroom above the largest request the settings actually permit.
 REQUEST_SIZE_SLACK_BYTES = 1 << 20
 DEFAULT_MAX_PROMPT_CHARACTERS = 100_000
@@ -129,7 +133,8 @@ class PublicRequestGuard:
                 return
         elif not self._authorized(headers):
             await self._reject(scope, send, 401, "AUTHENTICATION_FAILED",
-                               "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください")
+                               "APIキーが正しくありません。Authorization: Bearer ヘッダーを確認してください",
+                               extra=self._auth_diagnostics())
             return
         limit = max_request_bytes(self.state.settings)
         declared = headers.get("content-length")
@@ -152,9 +157,23 @@ class PublicRequestGuard:
             # Anything unexpected about the token or its settings fails closed;
             # the handler's own authorize() then produces the real error.
             return False
-        if secrets.compare_digest(headers.get("authorization", ""), "Bearer " + token):
+        # v3.4.0: a token replaced moments ago keeps working for the grace
+        # period, so a rotation is not an outage for a client that caches it.
+        if authtoken.accept(self.state.settings, headers.get("authorization", "")):
             return True
         return anthropic and secrets.compare_digest(headers.get("x-api-key", ""), token)
+
+    def _auth_diagnostics(self) -> dict:
+        """Non-secret fields that make a 401 actionable (v3.4.0)."""
+        try:
+            settings = self.state.settings
+            detail = authtoken.failure_detail(settings)
+        except (AttributeError, KeyError, OSError):
+            return {}
+        detail.pop("message", None)
+        detail.pop("code", None)
+        detail.pop("retryable", None)
+        return detail
 
     @staticmethod
     async def _send_json(send, status: int, payload: dict, error_code: str, scope) -> None:
@@ -167,10 +186,13 @@ class PublicRequestGuard:
         await send({"type": "http.response.body", "body": body})
 
     @classmethod
-    async def _reject(cls, scope, send, status: int, code: str, message: str) -> None:
-        await cls._send_json(send, status, {"error": {
-            "message": message, "type": "invalid_request_error", "param": None, "code": code}},
-            code, scope)
+    async def _reject(cls, scope, send, status: int, code: str, message: str,
+                      extra: dict | None = None) -> None:
+        error = {"message": message, "type": "invalid_request_error", "param": None,
+                 "code": code}
+        if extra:
+            error.update(extra)
+        await cls._send_json(send, status, {"error": error}, code, scope)
 
     @classmethod
     async def _reject_anthropic(cls, scope, send, status: int, kind: str, message: str) -> None:
@@ -244,6 +266,12 @@ def make_public_app(state: AppState) -> FastAPI:
             error["parameters"] = detail["parameters"]
         if detail.get("retryable") is not None:
             error["retryable"] = detail["retryable"]
+        # v3.4.0: additive diagnostics. `key_fingerprint` lets a client tell a
+        # stale key from an outage without logging a secret; `retry_after_ms`
+        # lets it back off instead of treating a stalled volume as permanent.
+        for key in ("retry_after_ms", "key_fingerprint", "token_issued_at", "version"):
+            if detail.get(key) is not None:
+                error[key] = detail[key]
         return JSONResponse(status_code=exc.status_code, content={"error": error}, headers=exc.headers)
 
     @app.exception_handler(StarletteHTTPException)

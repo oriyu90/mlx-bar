@@ -944,6 +944,9 @@ class SettingsStore:
         token = token.strip()
         if not 16 <= len(token) <= 512 or any(character.isspace() for character in token):
             raise ValueError("APIキーは空白を含まない16〜512文字で指定してください")
+        # v3.4.0: rotation invalidates the old key immediately, on purpose --
+        # the whole point of rotating is to revoke. Clients discover the change
+        # from the `key_fingerprint` in the 401 body instead of a grace window.
         self._write_secret(self.token_path, token)
         return token
 

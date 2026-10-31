@@ -59,7 +59,9 @@ class AppState:
         self.listener = None
         self.management_server = None
         self.public_listener_error: str | None = None
-        self.started_at = asyncio.get_event_loop().time()
+        # v3.4.0: wall-clock (not the loop's monotonic clock) so the
+        # unauthenticated /v1/health can report uptime to any client.
+        self.started_at = time.time()
         # Last context-compression event (see api/context_compression.py), or
         # None. In-memory only -- purely informational, not persisted, so a
         # restart simply forgets it rather than needing a DB migration.
@@ -80,6 +82,19 @@ class AppState:
             "state": "pending", "modelId": None, "reason": None,
             "code": None, "at": None,
         }
+
+    def volume_state(self) -> str:
+        """Remembered model-volume health, never a live probe (v3.4.0).
+
+        ``/v1/health`` is polled and must stay off the filesystem: the whole
+        point of the report's issue B was that probing a stalled volume blocks.
+        """
+        legacy = getattr(self.workers, "_legacy", None)
+        guard = getattr(legacy, "volume_guard", None)
+        try:
+            return "stalled" if guard is not None and guard.stalled() else "ok"
+        except Exception:  # noqa: BLE001 - status must not fail the endpoint
+            return "unknown"
 
     def set_preload_state(self, state: str, *, model_id: str | None = None,
                           reason: str | None = None,
