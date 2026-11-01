@@ -729,6 +729,15 @@ struct GeneralSettingsView: View {
                 get: { general["launchAtLogin"] as? Bool ?? false },
                 set: { value in Task { await model.setLaunchAtLogin(value) } }
             ))
+            // v4.0.2: only an installed .app may register a login item. A debug
+            // build would register a bare executable, which macOS opens with
+            // Terminal at login -- so the control explains itself instead of
+            // silently doing something the user cannot see until next reboot.
+            .disabled(!MenuBarViewModel.isBundledApp)
+            if !MenuBarViewModel.isBundledApp {
+                Text(LS("ログイン時の起動は、インストールした MLXBar.app からのみ設定できます"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Picker(LS("ログレベル"), selection: Binding(
                 get: { general["logLevel"] as? String ?? "info" },
                 set: { value in Task { await model.setConfig("general.logLevel", value: value) } }

@@ -1724,8 +1724,33 @@ final class MenuBarViewModel: ObservableObject {
     /// on every GUI launch, at minimum), so a CLI-set desired state still
     /// eventually takes effect. Checking the current status first avoids
     /// calling register()/unregister() when they'd be a no-op.
+    /// Whether `url` is a real `.app` bundle (v4.0.2).
+    ///
+    /// `SMAppService.mainApp` registers the *running executable*. Started from a
+    /// debug build (`swift run`, `.build/<arch>/debug/MLXBar`) that executable is
+    /// a bare Mach-O, and macOS can only open such a file with Terminal -- which
+    /// is exactly how a login produced a terminal window reading
+    /// `…/.build/arm64-apple-macosx/debug/MLXBar ; exit;`. Only a bundled app may
+    /// register, so that state cannot be created again. Pure and static so the
+    /// rule is testable without launching anything.
+    static func isAppBundle(_ url: URL) -> Bool {
+        url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+    }
+
+    /// Whether this process is running from an installed `.app`.
+    static var isBundledApp: Bool { isAppBundle(Bundle.main.bundleURL) }
+
     private func reconcileLaunchAtLogin() async {
         let desired = (settings["general"] as? [String: Any])?["launchAtLogin"] as? Bool ?? false
+        // The setting is still stored (so the CLI and a later bundled launch see
+        // it), but a non-bundled process must never write the login item.
+        guard Self.isBundledApp else {
+            if desired {
+                NSLog("MLXBar: launch at login needs the installed app; ignoring the request from %@",
+                      Bundle.main.bundleURL.path)
+            }
+            return
+        }
         let current = SMAppService.mainApp.status
         if desired, current != .enabled {
             try? SMAppService.mainApp.register()
@@ -2864,6 +2889,13 @@ final class MenuBarViewModel: ObservableObject {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) async {
+        // v4.0.2: never register from a debug build (see reconcileLaunchAtLogin).
+        // The preference is still saved, so the installed app picks it up.
+        if enabled, !Self.isBundledApp {
+            await setConfig("general.launchAtLogin", value: true)
+            errorMessage = LS("ログイン時の起動は、インストールした MLXBar.app からのみ設定できます")
+            return
+        }
         do {
             if enabled { try SMAppService.mainApp.register() }
             else { try await SMAppService.mainApp.unregister() }

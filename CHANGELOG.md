@@ -2,6 +2,27 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [4.0.2] - 2026-11-01
+
+**ログイン項目の誤登録を防止。** 再起動時にターミナルの窓が開き `…/.build/.../debug/MLXBar ; exit;` が実行される問題を修正。`SMAppService.mainApp.register()` は**実行中の実行ファイル**を登録するため、デバッグビルドから「ログイン時に起動」を有効にすると .app でない素の実行ファイルがログイン項目になり、macOS が Terminal で開いていた。
+
+### 修正
+
+- **登録はバンドル限定（重要）**: `MenuBarViewModel.isAppBundle(_:)`（純粋関数）を追加し、`reconcileLaunchAtLogin()` と `setLaunchAtLogin(_:)` の**両方**でガード。非バンドル時は設定値だけ保存し、ログに理由を残す
+- **設定画面の説明**: インストール版以外では「ログイン時に起動」を無効化し、「インストールした MLXBar.app からのみ設定できます」を表示（日英）
+
+### 互換性
+
+- `schemaVersion=1` 不変、API/CLI の変更なし（`general.launchAtLogin` の意味は同じ）
+- Python 側の変更なし（SwiftUI のみ）
+
+### 検証
+
+- `swift test`: **33 tests / 0 failures**（+4: バンドル判定）
+- `pytest`: **947 passed / 0 failed / 1 skipped**（変更なし）
+- `check_i18n`: 457 キー欠落 0
+- 実機: 誤登録項目（`.build/.../debug/MLXBar`）を削除し、`/Applications` 版から再登録。旧式ログイン項目に MLXBar が残っていないことを確認
+
 ## [4.0.1] - 2026-11-01
 
 **ロード時のメモリ判定・ロード中のキャッシュ操作・最新ランタイム適合。** 精査12件（HIGH 1 / MEDIUM 4 / LOW 3 / INFO 4、CRITICAL 0）から、HIGH と要望直結の MEDIUM を修正。**設定スキーマ（`schemaVersion=1`）は不変、API は追加のみ。**
