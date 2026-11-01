@@ -29,3 +29,27 @@ class MLXBarError(Exception):
         if self.retry_after_ms is not None:
             error["retry_after_ms"] = int(self.retry_after_ms)
         return {"error": error}
+
+
+def describe_error(exc: BaseException) -> str:
+    """The human-readable text of ``exc`` (v4.0.0 / FIND-02, FIND-16).
+
+    ``str(MLXBarError(...))`` is *not* the message: `BaseException.__str__`
+    returns ``str(self.args)`` whenever there is more than one argument, and
+    every dataclass field ends up in ``args``. Callers that put ``str(exc)``
+    into an API payload therefore shipped
+    ``('CODE', 'text', 503, True)`` into status/reason fields (FIND-02).
+    Prefer the explicit ``message`` field, and fall back to ``str()`` only for
+    exceptions that have none.
+    """
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    text = str(exc)
+    # An MLXBarError with an empty message would otherwise fall through to the
+    # args tuple again; the code is the useful half of that pair.
+    if text and text == str(getattr(exc, "args", ())):
+        code = getattr(exc, "code", None)
+        if isinstance(code, str) and code:
+            return code
+    return text or exc.__class__.__name__

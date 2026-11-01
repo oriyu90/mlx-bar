@@ -13,6 +13,7 @@ from .. import __version__
 from .. import authtoken
 from ..errors import MLXBarError
 from ..rag.retrieval import inject_context_block
+from ..state import preload_recovered
 from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
@@ -127,6 +128,14 @@ async def health(request: Request):
         loaded = [workers.loaded]
     volume_state = getattr(state, "volume_state", None)
     preload = getattr(state, "preload_state", None) or {}
+    # v4.0.0 (FIND-01): /health previously echoed the raw record, so a resident
+    # model that loaded after a failed preload read as "failed" here while
+    # /api/v1/status said "loaded". Same derivation, one owner (AppState).
+    preload_state = preload.get("state")
+    if preload_recovered(preload, state.settings.data,
+                         {str(item.get("id")) for item in loaded
+                          if isinstance(item, dict)}):
+        preload_state = "loaded"
     return {
         "status": "ok",
         "version": __version__,
@@ -135,7 +144,7 @@ async def health(request: Request):
         "model_loaded": bool(loaded),
         "resident_model_count": len(loaded),
         "volume_state": volume_state() if callable(volume_state) else "ok",
-        "preload_state": preload.get("state"),
+        "preload_state": preload_state,
     }
 
 

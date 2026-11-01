@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -412,6 +413,13 @@ class SettingsStore:
         # (DESIGN_v2.6.0.md section 3) keys off this transient flag plus
         # setup.completed so it never appears on updates.
         self.fresh_install: bool = False
+        # v4.0.0 (FIND-07): bumped on every successful write (rollbacks too),
+        # so a caller can tell whether the document changed under it.
+        self.revision: int = 0
+        # v4.0.0 (FIND-08): PUT /settings and friends serialize through this
+        # lock. Created lazily so a synchronous CLI can build the store without
+        # an event loop.
+        self._write_lock: asyncio.Lock | None = None
         self.data = self._load()
         self._ensure_token()
 
@@ -869,7 +877,21 @@ class SettingsStore:
         if float(generation.get("wiredLimitRatio", 0)) > float(memory_ratio):
             raise ValueError("generation.wiredLimitRatio must not exceed generation.memoryLimitRatio")
 
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """Serializes settings writes (v4.0.0 / FIND-08). Built on first use."""
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
+
     def update(self, patch: dict) -> dict:
+        # v4.0.0 (FIND-08): the read-only *refusal* for a newer-schema file lives
+        # in the HTTP layer (management._raise_if_settings_read_only), not here.
+        # v3.3.0 / AC-COMPAT-1 pins this method's downgrade behaviour: the file
+        # is rewritten as a v1-shaped document with the newer build's unknown
+        # keys carried through verbatim, and `test_v3_3_0_exec_contracts` asserts
+        # exactly that. Refusing here would break that contract, so the API is
+        # what declines the write while the library keeps its documented one.
         # v3.3.0 (WP-011): a typo must fail loudly (422 at the API) instead of
         # being merged and persisted as a new key that no reader ever uses.
         if isinstance(patch, dict):
@@ -880,6 +902,7 @@ class SettingsStore:
         self._validate(merged)
         self._atomic_write(merged)
         self.data = merged
+        self.revision += 1
         return self.public()
 
     def public(self) -> dict:

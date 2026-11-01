@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from .errors import describe_error
 from .settings import app_support_dir
 
 
@@ -438,7 +439,8 @@ def execute(args, client: Client):
                     result["loaded"] = client.request(
                         "POST", f"/api/v1/models/{args.model_id}/load", {"engine": "auto"}).json()
                 except Exception as exc:  # noqa: BLE001 - report, do not abort the pin
-                    result["loadError"] = str(exc)
+                    # v4.0.0 (FIND-16): keep the message, not MLXBarError's args tuple.
+                    result["loadError"] = describe_error(exc)
             return result
         if args.action == "set-replicas":
             if not 1 <= args.count <= 8:

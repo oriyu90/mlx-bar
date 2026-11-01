@@ -134,6 +134,36 @@ final class StatusDecodingTests: XCTestCase {
         XCTAssertNil(model.preloadStatusLine)
     }
 
+    /// v4.0.0 (FIND-13): the two skip reasons the popover used to swallow now
+    /// explain themselves in the chosen language, and neither is a failure.
+    /// The autoload-gate line keeps its own wording, and a reason the GUI does
+    /// not know stays silent rather than inventing text.
+    func testPreloadSkipReasonsAreExplained() {
+        let model = MenuBarViewModel()
+        model.applyGUILanguage("ja")
+        defer { UserDefaults.standard.removeObject(forKey: MenuBarViewModel.guiLanguageDefaultsKey) }
+
+        model.preload = PreloadStatus(["state": "skipped", "reason": "no_resident_target"])
+        XCTAssertEqual(model.preloadStatusLine?.failed, false)
+        XCTAssertEqual(
+            model.preloadStatusLine?.text,
+            "常駐に設定されたモデルはありません。モデル画面で「常駐を維持」を選ぶと、次回の起動時に自動で読み込みます")
+
+        model.applyGUILanguage("en")
+        model.preload = PreloadStatus(["state": "skipped", "reason": "model_not_in_catalog"])
+        XCTAssertEqual(model.preloadStatusLine?.failed, false)
+        XCTAssertEqual(
+            model.preloadStatusLine?.text,
+            "The model used last time is no longer in the model list, so nothing was loaded. "
+                + "Rescan the model list.")
+
+        model.applyGUILanguage("ja")
+        model.preload = PreloadStatus(["state": "skipped", "reason": "api_autoload_suspended"])
+        XCTAssertNotNil(model.preloadStatusLine)
+        model.preload = PreloadStatus(["state": "skipped", "reason": "something_else"])
+        XCTAssertNil(model.preloadStatusLine)
+    }
+
     /// AC-4-4: the recovery banner is announced once per backup name, is
     /// dismissible, and a *different* recovery notifies again — all without a
     /// live coordinator.

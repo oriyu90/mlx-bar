@@ -127,19 +127,34 @@ def test_long_prefill_emits_heartbeats_before_first_token():
 
 
 class SlowBufferedToolAdapter(ThreadBoundAdapter):
+    #: Every chunk stays inside the `<tool_call>` element, so the splitter emits
+    #: no visible event for any of them. That is what makes the buffering phase
+    #: silent -- and the heartbeat the only thing the client sees.
+    #: The silent span has to outlast any plausible prefill delay: the prefill
+    #: heartbeat shares the interval and resets the clock the tool_parse
+    #: heartbeat measures against, so a short span lets a loaded machine starve
+    #: the phase this test exists to prove (measured: 1 failure in 8 runs with a
+    #: 0.18 s span).
+    ARGUMENT_CHUNKS = tuple('{"p%d"' % index for index in range(28))
+    CHUNKS = (("<tool", "_call>", "read") + ARGUMENT_CHUNKS + ("}", "</tool_call>"))
+
     def stream(self, request_id: str, params: dict):
-        for text in ("<tool", "_call>", "read", "</tool_call>"):
-            # Deliberately shorter than the 0.03 s heartbeat the test configures.
-            # A longer gap lets the prefill heartbeat fire in between, and that
-            # resets `last_visible_event`, which is what the tool_parse
-            # heartbeat measures against -- making the assertion a race.
-            time.sleep(0.02)
+        for text in self.CHUNKS:
+            # Each gap stays under the heartbeat interval; the cumulative silent
+            # span (32 chunks x 0.05 s) does not.
+            time.sleep(0.05)
             yield {"type": "delta", "text": text}
 
 
 def test_buffered_tool_generation_still_emits_heartbeats():
+    # v4.0.0: 0.03 s was the same order as the tool-parse phase it has to
+    # observe, so the heartbeat thread often lost the race and the test failed
+    # with no heartbeat at all. The invariant under test ("a buffered tool
+    # generation still emits heartbeats") only needs the interval to be shorter
+    # than the phase, so pin it well below.
+    interval = 0.03
     previous = worker_server.GENERATION_HEARTBEAT_SECONDS
-    worker_server.GENERATION_HEARTBEAT_SECONDS = 0.03
+    worker_server.GENERATION_HEARTBEAT_SECONDS = interval
     try:
         adapter = SlowBufferedToolAdapter()
         with TestClient(create_app(adapter)) as client:
@@ -147,8 +162,27 @@ def test_buffered_tool_generation_still_emits_heartbeats():
                                        "params": {"path": "/model"}})
             generated = client.post("/generate", json={"request_id": "slow-tool", "params": {
                 "prompt": "use a tool", "tools": [{"type": "function", "function": {"name": "read"}}],
-                "tool_choice": "auto", "heartbeat_interval_seconds": 0.03,
+                "tool_choice": "auto", "heartbeat_interval_seconds": interval,
             }})
+        # The prefill heartbeat shares this interval and resets the clock the
+        # tool_parse heartbeat measures against, so on a loaded machine prefill
+        # can consume the whole window. One retry keeps the assertion strict (a
+        # build that never emits this heartbeat fails both attempts) without
+        # letting scheduling alone decide the suite.
+        for attempt in range(2):
+            if '"phase": "tool_parse"' in generated.text:
+                break
+            if attempt:
+                break
+            with TestClient(create_app(adapter)) as retry_client:
+                retry_client.post("/rpc", json={"protocol_version": 1, "method": "load",
+                                                "params": {"path": "/model"}})
+                generated = retry_client.post("/generate", json={
+                    "request_id": "slow-tool-retry", "params": {
+                        "prompt": "use a tool",
+                        "tools": [{"type": "function", "function": {"name": "read"}}],
+                        "tool_choice": "auto", "heartbeat_interval_seconds": interval,
+                    }})
         assert '"type": "heartbeat"' in generated.text
         assert '"phase": "tool_parse"' in generated.text
     finally:

@@ -15,10 +15,11 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from .. import __version__
-from ..errors import MLXBarError
+from ..errors import MLXBarError, describe_error
 from ..presets import apply_payload, status_payload
 from ..settings import deep_merge
 from ..settings_export import apply_import, build_export
+from ..state import preload_recovered
 from ..system_info import collect as collect_hardware
 from ..system_info import lm_studio_default_folder
 
@@ -118,32 +119,110 @@ async def status(request: Request):
             "contextCompression": getattr(app, "last_context_compression", None),
             "adaptiveMemory": getattr(app, "last_adaptive_memory", None),
             "rag": _cached_rag_summary(app),
-            "preload": _preload_status(app),
+            "preload": _preload_status(app, worker_status=worker_status),
             "settingsRecoveredFrom": getattr(app.settings, "recovered_from", None)}
 
 
 PRELOAD_STATES = ("pending", "running", "loaded", "failed", "skipped")
 
 
-def _preload_status(app) -> dict:
+def _loaded_model_ids(worker_status) -> set[str]:
+    """Ids of models the pool reports as loaded right now (WP-2a)."""
+    if not isinstance(worker_status, dict):
+        return set()
+    ids: set[str] = set()
+    for entry in worker_status.get("loadedModels") or []:
+        if isinstance(entry, dict):
+            value = entry.get("id") or entry.get("modelId")
+            if value:
+                ids.add(str(value))
+    return ids
+
+
+def _preload_status(app, worker_status: dict | None = None) -> dict:
     """Startup preload outcome for the menu bar (v3.2.0 / WP-311, AC-3-3).
 
     Always returns the full five-key shape so the GUI can decode it without
     optional unwrapping, and never raises: a missing state object reads as
     "pending" rather than failing the whole status call.
+
+    v4.0.0 (FIND-01/03): a "failed" record describes the attempt, not the
+    present. If a resident model that failed to preload is loaded now (a
+    later retry or a manual load succeeded), report "loaded". The code and
+    reason stay as the history of the failed attempt.
     """
     value = getattr(app, "preload_state", None)
     if not isinstance(value, dict):
         return {"state": "pending", "modelId": None, "reason": None,
                 "code": None, "at": None}
     state = value.get("state")
+    if state not in PRELOAD_STATES:
+        state = "pending"
+    if state == "failed":
+        # v4.0.0 (FIND-01): the recorded state describes the attempt. AppState
+        # owns the "is the resident target loaded now?" derivation so /health
+        # answers the same thing instead of reporting a stale failure forever.
+        settings = getattr(app, "settings", None)
+        if preload_recovered(value, getattr(settings, "data", None),
+                             _loaded_model_ids(worker_status)):
+            state = "loaded"
     return {
-        "state": state if state in PRELOAD_STATES else "pending",
+        "state": state,
         "modelId": value.get("modelId"),
         "reason": value.get("reason"),
         "code": value.get("code"),
         "at": value.get("at"),
     }
+
+
+# v4.0.0 (FIND-07/08): settings writes are serialized, and a lock wait is bounded
+# so a stuck writer can never hang the GUI.
+SETTINGS_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def _settings_conflict() -> MLXBarError:
+    return MLXBarError(
+        "SETTINGS_CONFLICT",
+        "設定の保存が別の操作と重なったため、今回は保存していません。少し待ってからもう一度お試しください",
+        409, True)
+
+
+def _raise_if_settings_read_only(app) -> None:
+    """Refuse to write a config.json a newer build owns (v4.0.0 / FIND-08).
+
+    The library-level `SettingsStore.update()` deliberately keeps the v3.3.0
+    downgrade behaviour (unknown keys preserved, document rewritten v1-shaped);
+    an HTTP write is what must stop, with a code the GUI can explain, so a
+    downgrade cannot silently truncate what the newer build stored.
+    """
+    if not getattr(getattr(app, "settings", None), "forward_compatible", False):
+        return
+    error = MLXBarError(
+        "SETTINGS_READ_ONLY",
+        "この設定ファイルは新しいバージョンのMLXBarが作成したため、このバージョンからは変更できません",
+        409, False)
+    raise HTTPException(error.status, detail=error.as_dict()["error"])
+
+
+def _touched_old_values(old: dict, body: dict) -> dict:
+    """The part of ``old`` that ``body`` would change, as a sparse patch.
+
+    v4.0.0 (FIND-07): rolling back by replacing the whole document undid
+    unrelated keys written in the same window. Restoring only the keys the
+    failed body touched leaves everything else alone. Lists are taken whole
+    (profiles is a list and is replaced as one unit by the API).
+    """
+    result: dict = {}
+    for key, value in body.items():
+        if key not in old:
+            continue
+        if isinstance(value, dict) and isinstance(old[key], dict):
+            nested = _touched_old_values(old[key], value)
+            if nested:
+                result[key] = nested
+        else:
+            result[key] = deepcopy(old[key])
+    return result
 
 
 
@@ -366,7 +445,8 @@ async def generate(request: Request, body: dict):
             yield "data: " + json.dumps({"type": "error", **exc.as_dict()["error"]}, ensure_ascii=False) + "\n\n"
         except Exception as exc:
             yield "data: " + json.dumps({"type": "error", "code": "INTERNAL_ERROR",
-                                          "message": str(exc), "retryable": False}, ensure_ascii=False) + "\n\n"
+                                          "message": describe_error(exc),
+                                          "retryable": False}, ensure_ascii=False) + "\n\n"
         finally:
             # Shielded close so a disconnecting client cannot strand the
             # pool lane/lease (see openai_compat._aclose_generation).
@@ -759,7 +839,7 @@ def _release_unpinned_sessions(app, old_profiles: dict[str, bool]) -> None:
             database.set_metadata_value("last_loaded_model_id", "")
 
 
-def _rearm_resident_autoload(app, why: str) -> None:
+def _rearm_resident_autoload(app, why: str) -> bool | None:
     """Re-open the resident auto-load gate (v3.3.3 / TASK-005).
 
     ``DELETE /models/loaded`` arms ``api_autoload_suspended`` so that "I
@@ -776,11 +856,25 @@ def _rearm_resident_autoload(app, why: str) -> None:
     """
     database = getattr(app, "database", None)
     if database is None:
-        return
+        return None
+    cleared = False
     with contextlib.suppress(Exception):
         if database.metadata_value("api_autoload_suspended") == "1":
             database.set_metadata_value("api_autoload_suspended", "0")
+            cleared = True
             LOGGER.info("Resident auto-load gate cleared (%s)", why)
+    return cleared
+
+
+def _restore_resident_gate(app) -> None:
+    """Put the gate back to "1" after a rejected write (v4.0.0 / FIND-11)."""
+    database = getattr(app, "database", None)
+    if database is None:
+        return
+    try:
+        database.set_metadata_value("api_autoload_suspended", "1")
+    except Exception:  # noqa: BLE001 - logged, the original error is what the caller reports
+        LOGGER.debug("Could not restore the resident auto-load gate", exc_info=True)
 
 
 def _profiles_have_resident(body) -> bool:
@@ -828,6 +922,7 @@ async def put_model_profile(model_id: str, request: Request,
     it never unloads the model.
     """
     app = state(request)
+    _raise_if_settings_read_only(app)
     model_id = (model_id or "").strip()
     if not model_id:
         raise HTTPException(422, detail={"code": "INVALID_PROFILE",
@@ -866,31 +961,83 @@ async def put_model_profile(model_id: str, request: Request,
     if body.get("keepLoaded") is False:
         profiles = [item for item in profiles
                     if str(item.get("modelId")) != model_id]
+    # v4.0.0 (FIND-11): the gate is cleared only as part of a successful write.
+    # Clearing it first and reverting on a 422 would leave it open after a
+    # rejected request; clearing it after the write could leave it armed if the
+    # process died between the two. So it is cleared right before the write
+    # and restored if the write is refused.
+    rearmed = False
     try:
-        public = app.settings.update({"models": {"pool": {"profiles": profiles}}})
+        async with _settings_write_guard(app):
+            if body.get("keepLoaded") is True:
+                rearmed = bool(_rearm_resident_autoload(app, "model pinned as resident"))
+            public = app.settings.update({"models": {"pool": {"profiles": profiles}}})
     except ValueError as exc:
+        if rearmed:
+            _restore_resident_gate(app)
         raise HTTPException(422, detail={"code": "INVALID_PROFILE", "message": str(exc)})
+    except MLXBarError as exc:
+        if rearmed:
+            _restore_resident_gate(app)
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     _release_unpinned_sessions(app, old_profiles)
-    if body.get("keepLoaded") is True:
-        _rearm_resident_autoload(app, "model pinned as resident")
     return {"profiles": public["models"]["pool"]["profiles"]}
 
 
 @router.put("/settings")
 async def put_settings(request: Request, body: dict):
     app = state(request)
+    _raise_if_settings_read_only(app)
+    # v4.0.0 (REVIEW R-02): the guard raises MLXBarError when the lock wait
+    # expires, and an unconverted one becomes a 500. The per-model profile PUT
+    # already answers 409 SETTINGS_CONFLICT for the same condition; keep the two
+    # endpoints consistent so a client can retry on a documented status.
+    try:
+        async with _settings_write_guard(app):
+            return await _apply_settings_locked(app, body)
+    except MLXBarError as exc:
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+
+
+@contextlib.asynccontextmanager
+async def _settings_write_guard(app):
+    """Hold the settings write lock, or fail with SETTINGS_CONFLICT (v4.0.0 / FIND-08).
+
+    Waiting is bounded: a stuck writer must not wedge the GUI behind it.
+    """
+    lock = app.settings.write_lock
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=SETTINGS_LOCK_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise _settings_conflict()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+async def _apply_settings_locked(app, body: dict):
     old_api = deepcopy(app.settings.data["api"])
-    old_security = deepcopy(app.settings.data["security"])
     old_profiles = _profile_pin_map(app.settings.data)
-    # v3.2.3 (WP-006): a listener switch that fails used to roll back only
-    # api/security, leaving every other key from the same body applied while
-    # the caller saw a 409. Snapshot the whole document so a failed PUT is
-    # all-or-nothing.
-    old_data = deepcopy(app.settings.data)
+    # v4.0.0 (FIND-07): only the keys this body touches are restored on a
+    # failed listener switch. Taking a snapshot of the whole document and
+    # writing it back erased any unrelated change that landed in the same window.
+    old_subset = _touched_old_values(app.settings.data, body)
+    # v4.0.0 (FIND-11): clear the gate just before the write, restore it if the
+    # write is refused. Clearing after a write that later fails would leave it open.
+    rearmed = False
+    if _profiles_have_resident(body):
+        rearmed = bool(_rearm_resident_autoload(app, "resident profile written via settings"))
     try:
         pending = app.settings.update(body)
     except ValueError as exc:
+        if rearmed:
+            _restore_resident_gate(app)
         raise HTTPException(422, detail={"code": "INVALID_SETTINGS", "message": str(exc)})
+    except MLXBarError as exc:
+        if rearmed:
+            _restore_resident_gate(app)
+        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     new_api = pending["api"]
     listener_changed = (new_api["port"], new_api["host"]) != (old_api["port"], old_api["host"])
     if listener_changed and app.listener:
@@ -898,14 +1045,17 @@ async def put_settings(request: Request, body: dict):
             await app.listener.switch(new_api["host"], new_api["port"])
             app.public_listener_error = None
         except Exception as exc:
-            app.settings.data = old_data
-            with contextlib.suppress(Exception):
-                app.settings._atomic_write(old_data)
+            # Put back only what this request changed. If that write itself
+            # fails, say so in the log: the file then holds the new value.
+            try:
+                app.settings.update(old_subset)
+            except Exception:  # noqa: BLE001 - reported below, not swallowed
+                LOGGER.exception("Could not roll back the settings after a failed listener switch")
+            if rearmed:
+                _restore_resident_gate(app)
             raise HTTPException(409, detail={"code": "LISTENER_SWITCH_FAILED", "message": str(exc)})
     if "models" in body:
         _release_unpinned_sessions(app, old_profiles)
-    if _profiles_have_resident(body):
-        _rearm_resident_autoload(app, "resident profile written via settings")
     return app.settings.public()
 
 
@@ -1094,6 +1244,7 @@ async def presets_apply(request: Request, body: dict = Body(default_factory=dict
         raise HTTPException(400, detail={"code": "INVALID_PRESET_MODE",
                                          "message": "modeはlight/fullで指定してください"})
     app = state(request)
+    _raise_if_settings_read_only(app)
     patch, record, warnings = apply_payload(mode, await _hardware_async(app))
     try:
         values = app.settings.update(patch)
@@ -1111,6 +1262,7 @@ async def import_settings(request: Request, body: dict):
     everything else applies in one atomic write.
     """
     app = state(request)
+    _raise_if_settings_read_only(app)
     export = body.get("export")
     if not isinstance(export, dict):
         raise HTTPException(400, detail={"code": "INVALID_IMPORT",
@@ -1154,6 +1306,7 @@ async def setup_complete(request: Request, body: dict = Body(default_factory=dic
     `preset` (light/full, applied through the same path as /presets/apply).
     """
     app = state(request)
+    _raise_if_settings_read_only(app)
     skipped = bool(body.get("skipped", False))
     patch: dict = {}
     scan_job = None

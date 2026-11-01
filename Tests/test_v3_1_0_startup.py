@@ -130,7 +130,10 @@ class PreloadStateTests(unittest.IsolatedAsyncioTestCase):
         state, main_module = self.make_state(
             profiles=[{"modelId": "model-1", "keepLoaded": True}],
             failing={"model-1"})
-        task = main_module._preload_last_model(state)
+        # v4.0.0: a retryable failure also starts the bounded resident retry
+        # (30s x 3). This test pins the *first* pass, so the retry is disabled
+        # rather than making the suite wait 90 seconds for the same verdict.
+        task = main_module._preload_last_model(state, retry_interval=0, retry_attempts=0)
         await task
         self.assertEqual(state.preload_state["state"], "failed")
         self.assertEqual(state.preload_state["code"], "MEMORY_HEADROOM_INSUFFICIENT")

@@ -37,6 +37,36 @@ CATALOG_CLASSIFIER_VERSION = "3"
 CATALOG_CAPABILITIES_VERSION = "1"
 
 
+def preload_recovered(recorded, settings_data, loaded_model_ids) -> bool:
+    """Whether a failed preload record is stale because the model is loaded now.
+
+    v4.0.0 (FIND-01): the recorded state describes the *attempt*, not the
+    present. Once the resident model that failed to preload is loaded (a bounded
+    retry, a manual load, or an API autoload succeeded), reporting "failed"
+    makes the app say the resident model is broken while it is serving -- the
+    exact "the app misreads my setting" symptom. Only the failed model itself
+    counts: another model being loaded is not a recovery.
+
+    Both `/api/v1/status` and `/v1/health` derive the answer from here so they
+    cannot disagree. Never raises: status endpoints must not fail on bookkeeping.
+    """
+    try:
+        if not isinstance(recorded, dict) or recorded.get("state") != "failed":
+            return False
+        model_id = recorded.get("modelId")
+        if not model_id:
+            return False
+        profiles = ((settings_data or {}).get("models", {})
+                    .get("pool", {}).get("profiles", []))
+        pinned = {str(item.get("modelId")) for item in profiles
+                  if isinstance(item, dict) and item.get("keepLoaded")
+                  and item.get("modelId")}
+        return (str(model_id) in pinned
+                and str(model_id) in {str(item) for item in loaded_model_ids or ()})
+    except Exception:  # noqa: BLE001 - status must not fail on bookkeeping
+        return False
+
+
 class AppState:
     def __init__(self, root: Path | None = None):
         self.settings = SettingsStore(root)

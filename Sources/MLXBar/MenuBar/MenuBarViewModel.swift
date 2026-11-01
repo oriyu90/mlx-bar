@@ -757,13 +757,14 @@ final class MenuBarViewModel: ObservableObject {
     /// Localized line for the coordinator's resident-model preload state, with
     /// whether it is a failure (rendered as a warning, not a transient error).
     ///
-    /// Nothing is returned for "loaded", nor for the skip reasons that carry no
-    /// news ("no resident configured", and a transient last-used model that has
-    /// since gone away). A resident profile held back by the autoload gate *is*
-    /// news -- the model is configured to load at every start and it will not --
-    /// so it gets an informational line instead of silence (v3.3.3 / TASK-005).
-    /// The reason prefers the machine code (so English stays English) and falls
-    /// back to the server's message for unknown codes.
+    /// Nothing is returned for "loaded" or for a skip with no reason. Every
+    /// *named* skip reason does get a line (v4.0.0 / FIND-13): the coordinator
+    /// records why it did not auto-load, and a resident model that is configured
+    /// to load at every start but silently does not is exactly the "the app
+    /// misreads my setting" symptom this release is fixing. The two reasons
+    /// below are informational (`failed: false`), not warnings.
+    /// The failure reason prefers the machine code (so English stays English)
+    /// and falls back to the server's message for unknown codes.
     var preloadStatusLine: (text: String, failed: Bool)? {
         guard let preload else { return nil }
         switch preload.state {
@@ -778,6 +779,15 @@ final class MenuBarViewModel: ObservableObject {
             return (String(format: LS("常駐モデルの読み込みに失敗しました（理由: %@）"), reason), true)
         case "skipped" where preload.reason == "api_autoload_suspended":
             return (LS("常駐モデルの自動読み込みは停止しています（モデルを解放したため）。モデルを読み込むか、常駐を設定し直すと再開します"), false)
+        // v4.0.0 (FIND-13): no resident profile at all is the benign case -- say
+        // so once instead of leaving the popover silent about a configured
+        // feature that has nothing to do.
+        case "skipped" where preload.reason == "no_resident_target":
+            return (LS("常駐に設定されたモデルはありません。モデル画面で「常駐を維持」を選ぶと、次回の起動時に自動で読み込みます"), false)
+        // v4.0.0 (FIND-13): the transient last-used model is gone from the
+        // catalog. Not an error, but the user should know why nothing loaded.
+        case "skipped" where preload.reason == "model_not_in_catalog":
+            return (LS("前回使ったモデルがモデル一覧に見つからないため、読み込みませんでした。モデル一覧を再スキャンしてください"), false)
         default:
             return nil
         }

@@ -26,6 +26,7 @@ from . import __version__
 from . import authtoken
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
+from .errors import describe_error
 from .settings import app_support_dir
 from .state import (AppState, CATALOG_CAPABILITIES_VERSION,
                     CATALOG_CLASSIFIER_VERSION)
@@ -535,7 +536,79 @@ def _record_preload(state, value: str, *, model_id: str | None = None,
         recorder(value, model_id=model_id, reason=reason, code=code)
 
 
-def _preload_last_model(state) -> "asyncio.Task | None":
+# v4.0.0 (FIND-01): a resident model that failed on a *transient* error
+# (volume briefly unreadable, load timed out) is retried a few times instead of
+# staying "failed" until the next restart. Bounded on purpose: a permanent
+# failure is not retried, and a retry loop must not run forever.
+RESIDENT_PRELOAD_RETRY_SECONDS = 30.0
+RESIDENT_PRELOAD_RETRY_ATTEMPTS = 3
+
+
+def _resident_profile_pinned(state, model_id: str) -> bool:
+    """Whether ``model_id`` is still a keepLoaded:true profile in settings."""
+    profiles = state.settings.data.get("models", {}).get("pool", {}).get("profiles", [])
+    return any(isinstance(item, dict) and str(item.get("modelId")) == model_id
+               and bool(item.get("keepLoaded")) for item in profiles)
+
+
+async def _retry_resident_preloads(state, model_ids: list[str], *,
+                                   interval: float, attempts: int) -> None:
+    """Retry failed resident models a bounded number of times (v4.0.0 / FIND-01).
+
+    Stops early when: a retry succeeds; the user explicitly unloaded everything
+    (the gate is armed again); the model was unpinned (keepLoaded went false);
+    or the attempts run out. Each round takes ``model_autoload_lock`` only for
+    its own load, never across the sleep, so API autoloads are not held up.
+    Cancellation propagates.
+    """
+    log = logging.getLogger(__name__)
+    pending = list(model_ids)
+    for round_no in range(1, attempts + 1):
+        if not pending:
+            return
+        await asyncio.sleep(interval)
+        if state.database.metadata_value("api_autoload_suspended") == "1":
+            log.info("Resident preload retry stopped: the auto-load gate was armed")
+            return
+        still_failed: list[str] = []
+        for model_id in pending:
+            if not _resident_profile_pinned(state, model_id):
+                log.info("Resident preload retry dropped for %s: it is no longer pinned",
+                         model_id)
+                continue
+            model = next((item for item in state.database.list_models()
+                          if item.get("id") == model_id), None)
+            if model is None:
+                log.warning("Resident preload retry dropped for %s: no longer in the "
+                            "model list", model_id)
+                continue
+            _record_preload(state, "running", model_id=model_id)
+            try:
+                async with state.model_autoload_lock:
+                    await state.workers.load(model, pin=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                retryable = bool(getattr(exc, "retryable", False))
+                log.warning("Resident preload retry %d/%d failed for %s: %s",
+                            round_no, attempts, model_id, exc)
+                _record_preload(state, "failed", model_id=model_id,
+                                reason=describe_error(exc),
+                                code=getattr(exc, "code", None))
+                if retryable:
+                    still_failed.append(model_id)
+                continue
+            log.info("Resident preload retry %d/%d succeeded for %s",
+                     round_no, attempts, model_id)
+            _record_preload(state, "loaded", model_id=model_id)
+        pending = still_failed
+    if pending:
+        logging.getLogger(__name__).warning(
+            "Resident preload gave up after %d retries: %s", attempts, ", ".join(pending))
+
+
+def _preload_last_model(state, *, retry_interval: float = RESIDENT_PRELOAD_RETRY_SECONDS,
+                        retry_attempts: int = RESIDENT_PRELOAD_RETRY_ATTEMPTS) -> "asyncio.Task | None":
     """Reload explicitly retained models and, optionally, the last model.
 
     Deliberately skipped when the user unloaded the model themselves: that flag
@@ -574,6 +647,10 @@ def _preload_last_model(state) -> "asyncio.Task | None":
     log.info("Preload starting: %d resident, %d last-used",
              len(pinned_ids), len(transient_ids))
 
+    # Resident models whose failure is worth retrying (retryable=True). Filled
+    # by load_one; read by the retry pass after the first pass finishes.
+    retry_candidates: list[str] = []
+
     async def work() -> None:
         try:
             async with state.model_autoload_lock:
@@ -610,9 +687,13 @@ def _preload_last_model(state) -> "asyncio.Task | None":
                         # One incompatible retained model must not block all
                         # remaining safe preloads.
                         log.warning("Could not preload %s: %s", model_id, exc)
+                        # v4.0.0 (FIND-02): str(MLXBarError) is its args tuple,
+                        # so the menu bar printed "('CODE', 'text', 503, True)".
                         _record_preload(state, "failed", model_id=model_id,
-                                        reason=str(exc),
+                                        reason=describe_error(exc),
                                         code=getattr(exc, "code", None))
+                        if resident and bool(getattr(exc, "retryable", False)):
+                            retry_candidates.append(model_id)
                         return
                     log.info("Preloaded %s in %.0fs", model.get("name") or model_id,
                              time.monotonic() - started)
@@ -626,13 +707,20 @@ def _preload_last_model(state) -> "asyncio.Task | None":
                     await load_one(model_id, pin=True, resident=True)
                 for model_id in transient_ids:
                     await load_one(model_id, pin=False, resident=False)
+            # v4.0.0 (FIND-01): the retry pass runs outside the autoload lock.
+            # Sleeping while holding it would block API autoloads for the whole
+            # interval. Each round takes the lock only for its own load.
+            if retry_candidates and retry_attempts > 0:
+                await _retry_resident_preloads(
+                    state, list(retry_candidates), interval=retry_interval,
+                    attempts=retry_attempts)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # A preload is a convenience. Failing it must not stop the
             # coordinator from serving, and the next request can still autoload.
             log.warning("Could not preload the last model: %s", exc)
-            _record_preload(state, "failed", reason=str(exc),
+            _record_preload(state, "failed", reason=describe_error(exc),
                             code=getattr(exc, "code", None))
 
     return asyncio.create_task(work())

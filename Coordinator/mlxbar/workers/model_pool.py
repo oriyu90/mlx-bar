@@ -53,6 +53,12 @@ CRASH_LOOP_THRESHOLD = 2
 # Replica top-up backoff (F-13): 30s, 60s, 120s ... capped at 10 minutes.
 REPLICA_RETRY_BASE_SECONDS = 30.0
 REPLICA_RETRY_MAX_SECONDS = 600.0
+# v4.0.0 (WP-5): an unload that cannot take the load lock within this many
+# seconds is refused with 409 ENGINE_BUSY instead of hanging behind a load.
+LOAD_LOCK_TIMEOUT_SECONDS = 5.0
+# v4.0.0 (WP-3a): how many times a waiter may re-enter the load path after the
+# leader's load was cancelled. Strictly bounded to avoid any retry loop.
+LOAD_CANCELLED_REENTRY_LIMIT = 2
 
 
 class _LaneAbandoned(Exception):
@@ -134,6 +140,11 @@ class ModelPoolSupervisor:
         self._primary_model_id: str | None = None
         self._pool_lock = asyncio.Lock()
         self._load_lock = asyncio.Lock()
+        # v4.0.0 (REVIEW R-01): set before the first teardown await. A waiter
+        # that re-enters after its leader was cancelled must not start a new
+        # worker while the coordinator is shutting down: shutdown() has already
+        # snapshotted the slots, so that worker would be orphaned.
+        self._closing = False
         # oMLX provider for models routed to oMLX
         self._omlx_provider = OMLXProvider(settings, root)
         # Cross-model concurrent generation (v1.7.0).  concurrency == 1 keeps the
@@ -716,6 +727,13 @@ class ModelPoolSupervisor:
         if pressure >= 2:
             raise MLXBarError("MEMORY_PRESSURE",
                               "macOSがメモリ逼迫を報告しているため新しいモデルをロードしません", 503, True)
+        # v4.0.0 (WP-6): keep_loaded is refreshed from settings here, not only
+        # by status()/the reaper (which can lag ~30s). Without this, a model the
+        # user just unpinned stays shielded from eviction and admission refuses
+        # when it could have made room. session_pinned is left untouched.
+        for slot in self._slots.values():
+            profile = self._profile(str(slot.model.get("id", "")))
+            slot.keep_loaded = bool(profile.get("keepLoaded", False))
         candidates = sorted(
             (slot for slot in self._slots.values()
              if slot.state == "ready" and slot.leases == 0
@@ -861,6 +879,9 @@ class ModelPoolSupervisor:
     async def load(self, model: dict, engine: str | None = None, *, pin: bool = True) -> dict:
         if not self.enabled:
             return await self._legacy.load(model, engine)
+        if self._closing:
+            raise MLXBarError("ENGINE_SHUTTING_DOWN",
+                              "終了処理中のため、モデルを読み込めません", 503, True)
         model_id = str(model.get("id", ""))
         if not model_id:
             raise MLXBarError("MODEL_INCOMPATIBLE", "モデルIDがありません", 409)
@@ -972,8 +993,31 @@ class ModelPoolSupervisor:
                     return existing.worker.loaded or existing.model
             else:
                 future = None
-        if future is not None:
-            result = await asyncio.shield(future)
+        reentries = 0
+        while future is not None:
+            try:
+                result = await asyncio.shield(future)
+            except MLXBarError as exc:
+                # v4.0.0 (WP-3a): the leader was cancelled, so its future resolved
+                # as LOAD_CANCELLED. That must not be the waiter's fate: re-enter
+                # the load path (bounded) and let this waiter become the new leader.
+                if exc.code != "LOAD_CANCELLED" or reentries >= LOAD_CANCELLED_REENTRY_LIMIT:
+                    raise
+                if self._closing:
+                    # A re-entry here would create a slot after shutdown()
+                    # snapshotted them (REVIEW R-01). Fail the waiter instead;
+                    # its request is over anyway.
+                    raise MLXBarError("ENGINE_SHUTTING_DOWN",
+                                      "終了処理中のため、モデルを読み込めません", 503, True)
+                reentries += 1
+                future = None
+                async with self._pool_lock:
+                    current = self._slots.get(slot_key)
+                    if current is not None and current.state == "ready":
+                        return current.worker.loaded or current.model
+                    if current is not None and current.load_future is not None:
+                        future = current.load_future
+                continue
             self._primary_model_id = model_id
             return result
 
@@ -1022,6 +1066,16 @@ class ModelPoolSupervisor:
                         resident=resident,
                         last_released_at=time.monotonic(), load_future=future,
                     )
+                    # v4.0.0 (REVIEW R-17): the only placement that actually
+                    # closes the window. `load()`'s own check runs before
+                    # `_admit`, which awaits host-capacity I/O; shutdown() can
+                    # land in between and snapshot the slots we are about to
+                    # extend. Refuse here, inside the pool lock and after the
+                    # last await before the publish.
+                    if self._closing:
+                        raise MLXBarError(
+                            "ENGINE_SHUTTING_DOWN",
+                            "終了処理中のため、モデルを読み込めません", 503, True)
                     self._slots[slot_key] = existing
             if future.done():
                 return future.result()
@@ -1080,17 +1134,37 @@ class ModelPoolSupervisor:
                 code = getattr(exc, "code", "")
                 if code in {"WORKER_CRASHED", "WORKER_STALLED"}:
                     self._record_model_crash(model_id, str(code))
-                await existing.worker.shutdown()
-                async with self._pool_lock:
-                    if self._slots.get(slot_key) is existing:
-                        self._slots.pop(slot_key, None)
+                # v4.0.0 (WP-3b): resolve the future BEFORE any await below. The
+                # shutdown/lock awaits can raise or be cancelled themselves, and
+                # an unresolved future would hang every waiter. A leader's
+                # CancelledError is converted so waiters see LOAD_CANCELLED and
+                # may re-enter (WP-3a) instead of inheriting the cancellation.
                 if not future.done():
-                    future.set_exception(exc)
+                    if isinstance(exc, asyncio.CancelledError):
+                        future.set_exception(MLXBarError(
+                            "LOAD_CANCELLED",
+                            "モデルの読み込みがキャンセルされました。もう一度お試しください",
+                            503, True))
+                    else:
+                        future.set_exception(exc)
                 # The caller receives the original exception; retrieving it
                 # here prevents an unobserved-future warning when there were no
                 # concurrent waiters.
                 with contextlib.suppress(BaseException):
                     future.exception()
+                # v4.0.0 (REVIEW R-03): the slot must be dropped even when the
+                # worker's own shutdown raises, or a stale slot (with a resolved
+                # future) blocks every later load of this model until restart.
+                try:
+                    await existing.worker.shutdown()
+                except BaseException:  # noqa: BLE001 - the load error is the signal
+                    # Logged, not propagated: the caller must see the failure that
+                    # actually happened, not the teardown's.
+                    LOGGER.exception("Worker shutdown failed for %s", model_id)
+                finally:
+                    async with self._pool_lock:
+                        if self._slots.get(slot_key) is existing:
+                            self._slots.pop(slot_key, None)
                 raise
 
     async def load_for_api(self, model: dict, engine: str | None = None) -> dict:
@@ -1196,10 +1270,29 @@ class ModelPoolSupervisor:
                 if self._primary_model_id == model_id:
                     self._primary_model_id = None
 
+    @contextlib.asynccontextmanager
+    async def _unload_lock(self, timeout: float | None = None):
+        """v4.0.0 (WP-5): hold `_load_lock` for an unload, but give up after a
+        bounded wait. A load can hold the lock for minutes; an unload must not
+        hang behind it, so a timeout is reported as 409 ENGINE_BUSY instead.
+        Loads themselves keep waiting (they are long by design)."""
+        if timeout is None:
+            timeout = LOAD_LOCK_TIMEOUT_SECONDS
+        try:
+            await asyncio.wait_for(self._load_lock.acquire(), timeout)
+        except asyncio.TimeoutError as exc:
+            raise MLXBarError(
+                "ENGINE_BUSY", "モデルを読み込み中です。完了後にもう一度お試しください", 409, True,
+            ) from exc
+        try:
+            yield
+        finally:
+            self._load_lock.release()
+
     async def unload(self) -> dict:
         if not self.enabled:
             return await self._legacy.unload()
-        async with self._load_lock:
+        async with self._unload_lock():
             slots = list(self._slots.values())
             for slot in slots:
                 if slot.leases:
@@ -1215,7 +1308,7 @@ class ModelPoolSupervisor:
             return {"state": "unloaded", "count": len(slots) + external}
 
     async def unload_native(self) -> dict:
-        async with self._load_lock:
+        async with self._unload_lock():
             return await self._unload_native_slots()
 
     async def _unload_native_slots(self) -> dict:
@@ -1240,12 +1333,12 @@ class ModelPoolSupervisor:
             return {"state": "unloaded", "count": 0}
         # Handle oMLX models
         if self._omlx_enabled() and self._is_omlx_model(model_id):
-            async with self._load_lock:
+            async with self._unload_lock():
                 result = await self._omlx_provider.unload(model_id)
                 if self._primary_model_id == model_id:
                     self._primary_model_id = None
                 return result
-        async with self._load_lock:
+        async with self._unload_lock():
             if self._legacy.loaded and str(self._legacy.loaded.get("id", "")) == model_id:
                 await self._legacy.unload()
                 if self._primary_model_id == model_id:
@@ -1273,7 +1366,7 @@ class ModelPoolSupervisor:
             return {"state": "unloaded", "count": len(slots)}
 
     async def unload_engine(self, engine: str) -> dict:
-        async with self._load_lock:
+        async with self._unload_lock():
             targets = [slot for slot in self._slots.values()
                        if (slot.worker.loaded or slot.model).get("engine") == engine]
             for slot in targets:
@@ -1876,6 +1969,9 @@ class ModelPoolSupervisor:
         return self.effective_max_prompt_characters()
 
     async def shutdown(self) -> None:
+        # v4.0.0 (REVIEW R-01): before any await, so nothing can create a slot
+        # between this snapshot and the teardown below.
+        self._closing = True
         if self._reaper_task:
             self._reaper_task.cancel()
             await asyncio.gather(self._reaper_task, return_exceptions=True)

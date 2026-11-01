@@ -264,13 +264,26 @@ def test_coordinator_passes_its_own_timeout_to_the_worker():
 def test_disconnect_stops_the_generation_immediately():
     """The reported failure, as a test.
 
-    Slow tokens (0.05s) so the generation is certainly still in flight when the
-    client goes at 0.3s, and 500 of them: without the cooperative stop the
+    Slow tokens (0.05s) and 500 of them: without the cooperative stop the
     abandoned generation would keep going for another ~25 seconds while holding
     the only MLX thread.
+
+    v4.0.0: the disconnect is triggered by the first emitted token, not by a
+    wall-clock deadline. The old `disconnect_after=0.3` assumed the generation
+    had started by then; on a loaded machine it had not, the client left before
+    a single token, and the test failed with "the disconnect landed before
+    generation started" without proving anything about the stop path.
     """
     adapter = CountingStreamAdapter(total=500, token_seconds=0.05)
-    run = _GenerationRun(create_app(adapter), "abandoned", disconnect_after=0.3).start()
+    run = _GenerationRun(create_app(adapter), "abandoned").start()
+    # Wait for real tokens, not for arbitrary stream events: the event list also
+    # carries phase/heartbeat frames, so counting events does not prove the
+    # adapter started generating.
+    deadline = time.monotonic() + 20
+    while adapter.produced < 2 and time.monotonic() < deadline and not run.finished.is_set():
+        time.sleep(0.01)
+    assert adapter.produced >= 2, "generation never produced a second token"
+    run.disconnect()
     run.join()
     assert adapter.produced > 1, "the disconnect landed before generation started"
     assert _wait_until_closed(adapter), "adapter generator was never closed"

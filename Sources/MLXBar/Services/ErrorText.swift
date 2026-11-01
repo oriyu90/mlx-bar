@@ -95,6 +95,20 @@ enum CoordinatorErrorText {
         "LISTENER_SWITCH_FAILED": (
             "APIサーバーのポートまたはアドレスを切り替えられませんでした",
             "The API server port or address could not be switched."),
+        // v4.0.0: two overlapping settings writes must say "try again" rather
+        // than surface a bare code, and a config.json written by a newer build
+        // is read-only here so a downgrade cannot truncate it (FIND-07, FIND-08).
+        "SETTINGS_CONFLICT": (
+            "設定の保存が別の操作と重なったため、今回は保存していません。少し待ってからもう一度お試しください",
+            "Another settings change was in progress, so this one was not saved. Wait a moment and try again."),
+        "SETTINGS_READ_ONLY": (
+            "この設定ファイルは新しいバージョンのMLXBarが作成したため、このバージョンからは変更できません",
+            "This settings file was created by a newer version of MLXBar and cannot be changed from this version."),
+        // v4.0.0 (FIND-05): a cancelled load must read as "retry" instead of
+        // propagating an opaque CancelledError to unrelated waiters.
+        "LOAD_CANCELLED": (
+            "モデルの読み込みがキャンセルされました。もう一度お試しください",
+            "Loading the model was cancelled. Please try again."),
         "JOB_NOT_FOUND": (
             "指定されたジョブが見つかりません",
             "That job was not found."),
@@ -375,6 +389,11 @@ enum CoordinatorErrorText {
         // used to sit at "loading" forever with no worker and no error.
         // v3.4.0: the volume is not mounted at all, which the user fixes
         // differently from a permission problem.
+        // v4.0.0: a load/evict attempt that arrived while the coordinator was
+        // shutting down. Transient by definition -- the app is quitting.
+        "ENGINE_SHUTTING_DOWN": (
+            "終了処理中です。起動し直してからもう一度お試しください",
+            "MLXBar is shutting down. Start it again and retry."),
         "MODEL_VOLUME_DETACHED": (
             "モデルフォルダが見つかりません。外付けボリュームが接続されているか確認してください",
             "The model folder is missing. Check that the external volume is connected."),

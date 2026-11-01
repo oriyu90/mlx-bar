@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ..errors import MLXBarError
+from ..errors import MLXBarError, describe_error
 
 
 class RuntimeUpdateService:
@@ -94,16 +94,19 @@ class RuntimeUpdateService:
                 except Exception as rollback_exc:
                     rollback_error = str(rollback_exc)
             self.database.add_runtime_history(engine, failed_slot, "cancelled" if cancelled else "failed", {
-                "message": "利用者が更新を中止しました" if cancelled else str(exc),
+                "message": ("利用者が更新を中止しました" if cancelled
+                            else describe_error(exc)),
                 "rolledBack": activated and rollback_error is None,
                 "rollbackError": rollback_error,
             })
             if maintenance:
                 self.workers.end_maintenance(engine)
             if rollback_error:
-                raise MLXBarError("ROLLBACK_FAILED", f"更新失敗: {exc} / 復元失敗: {rollback_error}", 500) from exc
+                raise MLXBarError(
+                    "ROLLBACK_FAILED",
+                    f"更新失敗: {describe_error(exc)} / 復元失敗: {rollback_error}", 500) from exc
             if cancelled:
                 raise
             if isinstance(exc, MLXBarError):
                 raise
-            raise MLXBarError("UPDATE_FAILED", str(exc), 409) from exc
+            raise MLXBarError("UPDATE_FAILED", describe_error(exc), 409) from exc

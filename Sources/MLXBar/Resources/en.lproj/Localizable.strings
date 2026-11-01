@@ -550,6 +550,9 @@
 "常駐モデルを読み込み中…" = "Loading resident model…";
 "常駐モデルの読み込みに失敗しました（理由: %@）" = "Could not load the resident model (reason: %@).";
 "常駐モデルの自動読み込みは停止しています（モデルを解放したため）。モデルを読み込むか、常駐を設定し直すと再開します" = "Resident auto-load is paused because you unloaded the model. Loading a model, or setting a resident again, resumes it.";
+/* v4.0.0 (FIND-13): the two skip reasons the popover used to swallow. */
+"常駐に設定されたモデルはありません。モデル画面で「常駐を維持」を選ぶと、次回の起動時に自動で読み込みます" = "No model is set as resident. Choose \"Keep Resident\" on the Models screen and it loads automatically at the next start.";
+"前回使ったモデルがモデル一覧に見つからないため、読み込みませんでした。モデル一覧を再スキャンしてください" = "The model used last time is no longer in the model list, so nothing was loaded. Rescan the model list.";
 "設定ファイルを読み込めなかったため、初期値に戻しました（バックアップ: %@）" = "The settings file could not be read, so defaults were restored (backup: %@).";
 "一時" = "Temporary";
 "設定を読み込み中" = "Loading settings";
