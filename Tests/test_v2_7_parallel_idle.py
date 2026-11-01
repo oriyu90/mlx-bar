@@ -265,7 +265,10 @@ class OnDemandExpansionTests(PoolTestBase):
                 await asyncio.sleep(0.02)
             # Memory pressure refuses the expansion load: the 2nd request
             # must queue behind the busy replica (pre-v2.7.0 behaviour).
-            self.pool._host_capacity = lambda: (24 * GIB, 2)
+            # v4.0.1 (WP-0): the refusal this test needs is the critical level;
+            # level 2 (warning) now admits when the headroom covers the
+            # estimate -- see Tests/test_v4_0_1_pressure_gate.py.
+            self.pool._host_capacity = lambda: (24 * GIB, 4)
             second_events: list = []
             gen2 = self.pool.generate_for_model("model-1", "two", [], {}, "fb-2")
             task2 = asyncio.create_task(self._collect(gen2, second_events))

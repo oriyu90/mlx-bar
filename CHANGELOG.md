@@ -2,6 +2,24 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [4.0.1] - 2026-11-01
+
+**ロード時のメモリ判定・ロード中のキャッシュ操作・最新ランタイム適合。** 精査12件（HIGH 1 / MEDIUM 4 / LOW 3 / INFO 4、CRITICAL 0）から、HIGH と要望直結の MEDIUM を修正。**設定スキーマ（`schemaVersion=1`）は不変、API は追加のみ。**
+
+### 修正
+
+- **メモリ逼迫時の全ロード拒否（HIGH）**: macOS の逼迫レベル2（警告）で**あらゆるロードを 503 で拒否**し、直前に計算した `available`/`reserve` を使っていなかった。レベル4のみ無条件拒否、2〜3 は「空き−安全余白 ≥ 必要量」で許可。拒否時は `pressure`/`available`/`reserve`/`estimate`/`headroom` を `detail` に含める（実機: 空き55%・レベル2で 0.14GB のロードが 503 → 修正後 2.0 秒で成功）
+- **ロード中のキャッシュ削除（MEDIUM）**: ロード完了前のワーカーに要求が飛び、ロード完了まで応答しない可能性。`state != ready` のスロットはスキップして `{"skipped": "loading"}` を即返す（memory / disk / paged ＋ プール無効時の経路を統一）。実機で 29ms 応答を確認
+- **classifier の最新ランタイム対応（LOW）**: mlx-vlm 0.7.11 の vision/OCR 系 `model_type` 7件を**完全一致**で登録（`lfm3` などテキスト専用は追加しない）。`qwen4_exp` のコメントを 0.7.10/0.7.11 バイト一致に更新
+- `MLXBarError` に additive な `detail` を追加（該当エラーのみ）
+
+### 検証
+
+- `pytest Tests`: **947 passed / 0 failed / 1 skipped**（ベースライン 928、+19）。修正前のコードに戻すと新規 19 件中 12 件が fail
+- `check_i18n`: 456 キー欠落 0。`Sources/` 無変更
+- 実機（4.0.1 build 68）: 逼迫レベル2でロード成功／ロード中のキャッシュ削除が 29ms で `skipped`／設定変更が 31ms で反映／ロード中 SIGTERM で 1.0 秒終了・孤児なし・ソケット削除
+- ランタイム: mlx-lm 0.32.2（最新）と mlx-vlm 0.7.10 の API を実測、**mlx-vlm 0.7.11 はシグネチャ完全一致で適合**（`qwen4_exp` バイト一致・SmolVLM で load→generate 成功）。oMLX は未インストールのため静的レビュー＋既存テスト31件まで
+
 ## [4.0.0] - 2026-11-01
 
 **安定版。7観点の精査と、モデルロード／常駐設定まわりの競合修正。** 精査で16件（HIGH 7 / MEDIUM 6 / LOW 3、CRITICAL 0）を特定し、HIGH 全件と要望に直結する MEDIUM を修正。**設定スキーマ（`schemaVersion=1`）は不変、API は追加のみ。**

@@ -17,6 +17,11 @@ class MLXBarError(Exception):
     # only set by errors that are actually worth retrying (a stalled model
     # volume, for instance) so the payload keeps its old shape elsewhere.
     retry_after_ms: int | None = field(default=None)
+    # v4.0.1 (WP-0): the measured values behind a refusal (pressure level,
+    # available/reserve/estimate bytes), so a client can tell "the machine is
+    # out of memory" apart from "this build's threshold is wrong". Additive and
+    # absent (None) everywhere else, so existing payloads keep their shape.
+    detail: dict | None = field(default=None)
 
     def as_dict(self) -> dict:
         error = {
@@ -28,6 +33,8 @@ class MLXBarError(Exception):
             error["attempts"] = [dict(item) for item in self.attempts]
         if self.retry_after_ms is not None:
             error["retry_after_ms"] = int(self.retry_after_ms)
+        if self.detail:
+            error["detail"] = dict(self.detail)
         return {"error": error}
 
 

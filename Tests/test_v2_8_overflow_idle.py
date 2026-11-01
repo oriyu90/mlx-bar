@@ -158,7 +158,11 @@ class NonResidentAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "MODEL_MEMORY_LIMIT")
 
     async def test_non_resident_load_is_refused_under_os_memory_pressure(self):
-        self.pool._host_capacity = lambda: (24 * GIB, 2)
+        # v4.0.1 (WP-0): level 2 is a warning and no longer refuses a load on
+        # its own, so this test uses the critical level (4) -- the level that,
+        # together with supervisor.py and the reaper, still means "do not load".
+        # The guarantee is unchanged: OS pressure outranks the resident tier.
+        self.pool._host_capacity = lambda: (24 * GIB, 4)
         with self.assertRaises(MLXBarError) as raised:
             await self.pool.load_for_api(_catalog("model-a", "model-a"))
         self.assertEqual(raised.exception.code, "MEMORY_PRESSURE")

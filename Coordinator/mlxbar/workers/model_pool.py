@@ -59,6 +59,15 @@ LOAD_LOCK_TIMEOUT_SECONDS = 5.0
 # v4.0.0 (WP-3a): how many times a waiter may re-enter the load path after the
 # leader's load was cancelled. Strictly bounded to avoid any retry loop.
 LOAD_CANCELLED_REENTRY_LIMIT = 2
+# v4.0.1 (WP-0 / F-01): macOS `kern.memorystatus_vm_pressure_level` thresholds.
+# Level 4 is critical and refuses every new load unconditionally -- the same
+# number every other pressure check in this file and in supervisor.py uses.
+# Level 2 is merely "warning" and is reported routinely (another app's page
+# cache is enough), so it must not be a blanket refusal: at 2-3 the load is
+# admitted when the measured headroom covers the estimate. A machine with
+# 55% / 52 GiB free used to answer 503 to a 0.14 GB model.
+PRESSURE_REFUSE_LEVEL = 4
+PRESSURE_WARN_LEVEL = 2
 
 
 class _LaneAbandoned(Exception):
@@ -724,9 +733,34 @@ class ModelPoolSupervisor:
                 503, True)
         available, pressure = await asyncio.to_thread(self._host_capacity)
         reserve = int(float(self._pool_settings().get("minimumSystemReserveGB", 4)) * GIB)
-        if pressure >= 2:
-            raise MLXBarError("MEMORY_PRESSURE",
-                              "macOSがメモリ逼迫を報告しているため新しいモデルをロードしません", 503, True)
+        # v4.0.1 (WP-0 / F-01): the old `pressure >= 2` refused every load at
+        # macOS's *warning* level while the freshly measured `available` and
+        # `reserve` sat unused. Only the critical level is unconditional; a
+        # warning admits when the measured headroom still covers the estimate.
+        # The refusal carries the numbers so a report can be diagnosed.
+        headroom = available - reserve
+        pressure_detail = {
+            "pressure": int(pressure),
+            "available": int(available),
+            "reserve": int(reserve),
+            "estimate": int(estimate),
+            "headroom": int(headroom),
+        }
+        if pressure >= PRESSURE_REFUSE_LEVEL:
+            raise MLXBarError(
+                "MEMORY_PRESSURE",
+                "macOSがメモリ逼迫（critical）を報告しているため新しいモデルをロードしません"
+                f"（pressure={int(pressure)}, 空き {available / GIB:.2f} GB,"
+                f" 安全余白 {reserve / GIB:.2f} GB, 要求 {estimate / GIB:.2f} GB）",
+                503, True, detail=pressure_detail)
+        if pressure >= PRESSURE_WARN_LEVEL and headroom < estimate:
+            raise MLXBarError(
+                "MEMORY_PRESSURE",
+                "macOSがメモリ逼迫を報告しており、安全余白を除いた空きメモリが不足しています"
+                f"（pressure={int(pressure)}, 空き {available / GIB:.2f} GB,"
+                f" 安全余白 {reserve / GIB:.2f} GB, 要求 {estimate / GIB:.2f} GB）。"
+                "他のアプリを終了してから再試行してください",
+                503, True, detail=pressure_detail)
         # v4.0.0 (WP-6): keep_loaded is refreshed from settings here, not only
         # by status()/the reaper (which can lag ~30s). Without this, a model the
         # user just unpinned stays shielded from eviction and admission refuses
@@ -1918,25 +1952,52 @@ class ModelPoolSupervisor:
             raise
         return {"input_tokens": int(response.get("input_tokens", 0))}
 
+    def _prompt_cache_skip(self, slot: "PoolSlot | None") -> dict | None:
+        """v4.0.1 (WP-3 / F-02): the skip payload for a slot that is not ready.
+
+        Prompt-cache clears deliberately take no lock -- they have to answer at
+        once, and a load can hold `_load_lock` for minutes. But the slot is
+        published *before* its worker finishes loading, so a clear routed to it
+        would sit behind `load()` inside the worker: the "operation freezes
+        while a model loads" symptom v4.0.0 removed everywhere else. Skip the
+        slot and say why, instead of blocking or killing the load.
+        """
+        if slot is not None and slot.state != "ready":
+            return {"skipped": slot.state, "modelId": str(slot.model.get("id", ""))}
+        return None
+
+    def _legacy_cache_skip(self) -> dict | None:
+        """The same rule for the single-worker (`_legacy`) path."""
+        loading = getattr(self._legacy, "loading", None)
+        if loading:
+            return {"skipped": "loading",
+                    "modelId": str((loading or {}).get("id", "") or "")}
+        return None
+
     async def clear_memory_prompt_cache(self) -> dict:
+        if not self.enabled:
+            return self._legacy_cache_skip() or await self._legacy.clear_memory_prompt_cache()
         slot = self._primary_slot()
-        return await (slot.worker.clear_memory_prompt_cache()
-                      if slot else self._legacy.clear_memory_prompt_cache())
+        if slot is None:
+            return self._legacy_cache_skip() or await self._legacy.clear_memory_prompt_cache()
+        return self._prompt_cache_skip(slot) or await slot.worker.clear_memory_prompt_cache()
 
     async def clear_disk_prompt_cache(self) -> dict:
         if not self.enabled:
-            return await self._legacy.clear_disk_prompt_cache()
+            return self._legacy_cache_skip() or await self._legacy.clear_disk_prompt_cache()
         results = []
         for slot in self._slots.values():
-            results.append(await slot.worker.clear_disk_prompt_cache())
+            results.append(self._prompt_cache_skip(slot)
+                           or await slot.worker.clear_disk_prompt_cache())
         return results[-1] if results else await self._legacy.clear_disk_prompt_cache()
 
     async def clear_paged_prompt_cache(self) -> dict:
         if not self.enabled:
-            return await self._legacy.clear_paged_prompt_cache()
+            return self._legacy_cache_skip() or await self._legacy.clear_paged_prompt_cache()
         results = []
         for slot in self._slots.values():
-            results.append(await slot.worker.clear_paged_prompt_cache())
+            results.append(self._prompt_cache_skip(slot)
+                           or await slot.worker.clear_paged_prompt_cache())
         return results[-1] if results else await self._legacy.clear_paged_prompt_cache()
 
     def effective_max_tokens(self) -> int:

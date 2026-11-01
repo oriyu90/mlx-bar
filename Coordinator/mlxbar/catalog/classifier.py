@@ -74,11 +74,24 @@ ARCH_VISION_MARKERS = (
 # These models have no vision_config or processor file, so structural VLM
 # heuristics alone would incorrectly route them to mlx-lm.
 MLX_VLM_TEXT_MODEL_TYPES = {"laguna"}
+# mlx-vlm 0.7.11 vision/OCR `model_type`s that no ARCH_VISION_TOKENS entry or
+# ARCH_VISION_MARKERS substring covers. minicpm_ocr / minicpm_ocr_jev
+# (Ministral-OCR path) and nemotron_parse_v3_5 are document-parse towers that
+# match nothing above; lfm3_omni / d1_lfm3_omni are audio+vision exports with
+# no mlx-lm implementation at all. `d1_lfm3_vl` already matches via the "vl"
+# token and is listed only so the family sits in one place.
+# Matched by exact casefolded identity -- a substring rule would pull the
+# text-only `lfm3` (and its `lfm3_audio` sibling) into vision, which is wrong.
+# Evidence: mlx_vlm/models/ in 0.7.11, measured 2026-11.
+MLX_VLM_VISION_MODEL_TYPES = {
+    "lfm3_vl", "lfm3_omni", "d1_lfm3_vl", "d1_lfm3_omni",
+    "minicpm_ocr", "minicpm_ocr_jev", "nemotron_parse_v3_5",
+}
 # Architectures that mlx-lm cannot serve at all (independent of vision): the
 # family's forward/weight layout only exists in mlx-vlm. `qwen4_exp` is the
-# real Qwen3.8-Flash-Next export; mlx-vlm 0.7.10 ships it under
-# mlx_vlm/models/qwen4_exp, mlx-lm has no implementation (verified against the
-# installed runtimes, 2026-10). Keep this list tiny and evidence-backed --
+# real Qwen3.8-Flash-Next export; `mlx_vlm/models/qwen4_exp` is byte-identical
+# in mlx-vlm 0.7.10 and 0.7.11 and mlx-lm has no implementation for it
+# (measured 2026-11). Keep this list tiny and evidence-backed --
 # every entry adds a "mlx-lm is unsupported" claim to the UI.
 MLX_VLM_ONLY_MODEL_TYPES = MLX_VLM_TEXT_MODEL_TYPES | {"qwen4_exp"}
 MLX_LM_UNSUPPORTED_MODEL_TYPES = frozenset(MLX_VLM_ONLY_MODEL_TYPES)
@@ -122,7 +135,11 @@ def _vlm_architectures(config: dict) -> list[str]:
     for raw in _architecture_strings(config):
         lowered = raw.casefold()
         tokens = set(_TOKEN_SPLIT.split(lowered))
-        if tokens & ARCH_VISION_TOKENS or any(marker in lowered for marker in ARCH_VISION_MARKERS):
+        if (tokens & ARCH_VISION_TOKENS
+                or any(marker in lowered for marker in ARCH_VISION_MARKERS)
+                # Exact identity, never a substring: "lfm3" must not match
+                # "lfm3_vl" and vice versa.
+                or lowered in MLX_VLM_VISION_MODEL_TYPES):
             matches.append(raw)
     return matches
 
