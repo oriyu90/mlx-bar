@@ -36,14 +36,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..errors import MLXBarError
+from ..fallback.client import FallbackError
 from ..rag.retrieval import inject_context_block
 from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
 from .context_compression import maybe_compress_messages
 from .images import resolve_public_images
 from .anthropic_stream import AnthropicMessageBuilder, sse, _anthropic_error_type
 from .openai_compat import (
-    _ensure_requested_model, _find_model, _is_generatable, _last_user_text,
-    _normalize_thinking, app_state,
+    _ensure_requested_model, _fallback_aliases, _fallback_available,
+    _fallback_for_local_error, _fallback_generation, _find_model, _is_generatable,
+    _last_user_text, _normalize_thinking, app_state,
 )
 
 
@@ -331,20 +333,48 @@ async def _messages(request: Request):
     try:
         loaded = await _ensure_requested_model(request, requested_model)
     except MLXBarError as exc:
-        if workspace:
-            workspace.cleanup()
-        raise HTTPException(exc.status, detail={
-            "type": _anthropic_error_type(exc.code), "message": exc.message})
+        # v5.0.0: same trigger set as the OpenAI surface (see
+        # `_fallback_for_local_error`); MODEL_NOT_FOUND / INVALID_REQUEST never
+        # fall back.
+        fallback = _fallback_for_local_error(request, requested_model, exc, bool(images))
+        if fallback is None:
+            if workspace:
+                workspace.cleanup()
+            raise HTTPException(exc.status, detail={
+                "type": _anthropic_error_type(exc.code), "message": exc.message})
+        loaded = fallback
+        early_fallback_error = exc
+    else:
+        early_fallback_error = None
 
+    # A local error that already sent this request to an external provider must
+    # not be overwritten by the capacity check below (same rule as the OpenAI
+    # surface in `openai_compat.chat`).
+    fallback_reason = early_fallback_error.code if early_fallback_error else None
+    if fallback_reason is not None:
+        request.state.api_log["fallback_reason"] = fallback_reason
     capacity_check = getattr(state.workers, "raise_if_queue_full", None)
     if capacity_check:
         try:
             capacity_check()
         except MLXBarError as exc:
-            if workspace:
-                workspace.cleanup()
-            raise HTTPException(exc.status, detail={
-                "type": _anthropic_error_type(exc.code), "message": exc.message})
+            if not _fallback_available(request, requested_model, images, loaded):
+                if workspace:
+                    workspace.cleanup()
+                raise HTTPException(exc.status, detail={
+                    "type": _anthropic_error_type(exc.code), "message": exc.message})
+            fallback_reason = exc.code
+            # Remember the local refusal: a total external failure reports it.
+            early_fallback_error = exc
+            request.state.api_log["fallback_reason"] = fallback_reason
+    if fallback_reason is None and images:
+        service = getattr(state, "fallback", None)
+        if service is not None and service.should_forward_images() \
+                and service.should_fallback(requested_model, has_images=True,
+                                            aliases=_fallback_aliases(loaded, state,
+                                                                      requested_model)):
+            fallback_reason = "images"
+            request.state.api_log["fallback_reason"] = fallback_reason
 
     response_model = loaded.get("name") or loaded.get("id") or requested_model
     request_id = "chatcmpl-" + secrets.token_hex(12)
@@ -381,6 +411,11 @@ async def _messages(request: Request):
     generate_for_model = getattr(state.workers, "generate_for_model", None)
 
     def _generation():
+        if fallback_reason:
+            external = _fallback_generation(request, loaded, requested_model, messages,
+                                            images, options, fallback_reason)
+            if external is not None:
+                return external
         if generate_for_model:
             return generate_for_model(str(loaded.get("id", "")), messages, images, options,
                                       request_id, image_root=image_root)
@@ -398,6 +433,12 @@ async def _messages(request: Request):
                         if out.get("__error__"):
                             return
             except MLXBarError as exc:
+                yield sse({"__error__": True, "type": "error",
+                           "error": {"type": _anthropic_error_type(exc.code),
+                                     "message": exc.message}})
+            except FallbackError as exc:
+                # v5.0.0: every external candidate failed before any content.
+                request.state.api_log["error_code"] = exc.code
                 yield sse({"__error__": True, "type": "error",
                            "error": {"type": _anthropic_error_type(exc.code),
                                      "message": exc.message}})
@@ -425,6 +466,19 @@ async def _messages(request: Request):
     except MLXBarError as exc:
         raise HTTPException(exc.status if exc.status >= 400 else 502, detail={
             "type": _anthropic_error_type(exc.code), "message": exc.message})
+    except FallbackError as exc:
+        # v5.0.0: every external candidate failed. Report the local error the
+        # request originally hit (same rule as the OpenAI surface); with no
+        # local refusal -- the image fast path -- the external error is the
+        # honest answer.
+        if early_fallback_error is None:
+            raise HTTPException(503 if exc.retryable else 502, detail={
+                "type": _anthropic_error_type(exc.code), "message": exc.message})
+        raise HTTPException(early_fallback_error.status, detail={
+            "type": _anthropic_error_type(early_fallback_error.code),
+            "message": early_fallback_error.message,
+            "fallback": {"code": exc.code, "message": exc.message,
+                         "retryable": exc.retryable}})
     finally:
         await _aclose_generation(generation)
         if workspace:

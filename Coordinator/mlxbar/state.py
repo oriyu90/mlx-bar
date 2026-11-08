@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .catalog.scanner import scan_all
 from .database import Database
+from .fallback import FallbackService
 from .jobs import JobManager
 from .omlx_setup import OMLXSetupService
 from .runtimes.slots import SlotStore
@@ -85,6 +86,11 @@ class AppState:
         # server app, exposed as cancellable jobs by the Runtime page's card.
         self.omlx_setup = OMLXSetupService()
         self.omlx_setup_jobs: dict[str, str] = {}
+        # v5.0.0: API fallback to external providers (DESIGN_v5.0.0.md).
+        # Constructed unconditionally so the management API can read/edit its
+        # settings, but nothing reaches it while `apiFallback.enabled` is
+        # false -- the public surfaces check that before calling it.
+        self.fallback = FallbackService(self.settings)
         self.model_autoload_lock = asyncio.Lock()
         self.listener = None
         self.management_server = None

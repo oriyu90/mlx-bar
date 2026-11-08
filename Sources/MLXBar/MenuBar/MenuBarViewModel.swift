@@ -665,6 +665,17 @@ final class MenuBarViewModel: ObservableObject {
     @Published var omlxSetupJobs: [String: RuntimeJobInfo] = [:]
     /// Actions with a job in flight right now (button disabling).
     @Published var omlxBusySetupActions: Set<String> = []
+    // MARK: - API fallback (v5.0.0)
+    /// Decoded `apiFallback` document, refreshed from `/api/v1/fallback`.
+    @Published var fallbackSettings = FallbackSettings()
+    /// Per-model rate/cooldown state from `/api/v1/fallback/status`.
+    @Published var fallbackUsage: [FallbackUsage] = []
+    /// The most recent fallback that happened (nil when none since launch).
+    @Published var fallbackLastOutcome: FallbackOutcome?
+    /// Result line for the Settings page ("saved", "connection OK", ...).
+    @Published var fallbackMessage: String?
+    /// Provider ids whose connection test is in flight.
+    @Published var fallbackTesting: Set<String> = []
     private let client = CoordinatorClient()
     private let cancellationClient = CoordinatorClient()
     private var polling: Task<Void, Never>?
@@ -1342,6 +1353,224 @@ final class MenuBarViewModel: ObservableObject {
             }
         } catch {
             NSLog("MLXBar: oMLX API key refresh failed: %@", String(describing: error))
+        }
+    }
+
+    // MARK: - API fallback (v5.0.0, DESIGN_v5.0.0.md)
+
+    /// Reload the document, the usage state and the last outcome.
+    func refreshFallback() async {
+        do {
+            let payload = try await json("GET", "/api/v1/fallback") as? [String: Any] ?? [:]
+            if let document = payload["apiFallback"] as? [String: Any] {
+                fallbackSettings = FallbackSettings(document) ?? FallbackSettings()
+            }
+            if let status = payload["status"] as? [String: Any] {
+                fallbackUsage = FallbackUsage.parse(status)
+                fallbackLastOutcome = FallbackOutcome(status["lastOutcome"] as? [String: Any])
+            }
+        } catch {
+            NSLog("MLXBar: fallback settings refresh failed: %@", String(describing: error))
+        }
+    }
+
+    /// Re-read only the usage/cooldown state (cheap; used by the status line).
+    func refreshFallbackStatus() async {
+        do {
+            let status = try await json("GET", "/api/v1/fallback/status") as? [String: Any] ?? [:]
+            fallbackUsage = FallbackUsage.parse(status)
+            fallbackLastOutcome = FallbackOutcome(status["lastOutcome"] as? [String: Any])
+        } catch {
+            NSLog("MLXBar: fallback status refresh failed: %@", String(describing: error))
+        }
+    }
+
+    /// Common options. Ranges mirror `fallback/config.py` so the GUI refuses
+    /// out-of-range values before the coordinator has to.
+    func setFallbackCommon(enabled: Bool, cooldownSeconds: Int, maxAttempts: Int,
+                           forwardImagesImmediately: Bool) async {
+        guard 0...86_400 ~= cooldownSeconds else {
+            errorMessage = ui("Cooldown must be between 0 and 86,400 seconds",
+                              "クールダウンは0〜86,400秒で指定してください")
+            return
+        }
+        guard 1...2048 ~= maxAttempts else {
+            errorMessage = ui("Attempts must be between 1 and 2,048",
+                              "最大試行数は1〜2,048で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/fallback", [
+                "enabled": enabled, "cooldownSeconds": cooldownSeconds,
+                "maxAttempts": maxAttempts,
+                "forwardImagesImmediately": forwardImagesImmediately,
+            ])
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Saved", "保存しました")
+        }
+    }
+
+    func addFallbackProvider(name: String, protocolName: String, baseURL: String,
+                             timeoutSeconds: Int) async {
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        let trimmedURL = baseURL.trimmingCharacters(in: .whitespaces)
+        guard !trimmedName.isEmpty else {
+            errorMessage = ui("Enter a provider name", "プロバイダー名を入力してください")
+            return
+        }
+        guard trimmedURL.hasPrefix("http://") || trimmedURL.hasPrefix("https://") else {
+            errorMessage = ui("The base URL must start with http:// or https://",
+                              "ベースURLは http:// または https:// で始めてください")
+            return
+        }
+        guard 5...3600 ~= timeoutSeconds else {
+            errorMessage = ui("Timeout must be between 5 and 3,600 seconds",
+                              "タイムアウトは5〜3,600秒で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("POST", "/api/v1/fallback/providers", [
+                "name": trimmedName, "protocol": protocolName,
+                "baseURL": trimmedURL, "timeoutSeconds": timeoutSeconds,
+            ])
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Provider added", "プロバイダーを追加しました")
+        }
+    }
+
+    func updateFallbackProvider(_ providerId: String, name: String?, protocolName: String?,
+                                baseURL: String?, timeoutSeconds: Int?, enabled: Bool?) async {
+        var patch: [String: Any] = [:]
+        if let name { patch["name"] = name.trimmingCharacters(in: .whitespaces) }
+        if let protocolName { patch["protocol"] = protocolName }
+        if let baseURL {
+            let trimmed = baseURL.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") else {
+                errorMessage = ui("The base URL must start with http:// or https://",
+                                  "ベースURLは http:// または https:// で始めてください")
+                return
+            }
+            patch["baseURL"] = trimmed
+        }
+        if let timeoutSeconds {
+            guard 5...3600 ~= timeoutSeconds else {
+                errorMessage = ui("Timeout must be between 5 and 3,600 seconds",
+                                  "タイムアウトは5〜3,600秒で指定してください")
+                return
+            }
+            patch["timeoutSeconds"] = timeoutSeconds
+        }
+        if let enabled { patch["enabled"] = enabled }
+        guard !patch.isEmpty else { return }
+        await perform {
+            _ = try await self.json("PUT", "/api/v1/fallback/providers/\(self.pathComponent(providerId))",
+                                    patch)
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Saved", "保存しました")
+        }
+    }
+
+    func removeFallbackProvider(_ providerId: String) async {
+        await perform {
+            _ = try await self.json("DELETE", "/api/v1/fallback/providers/\(self.pathComponent(providerId))")
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Provider removed", "プロバイダーを削除しました")
+        }
+    }
+
+    func setFallbackApiKey(_ providerId: String, key: String) async {
+        await perform {
+            _ = try await self.json("PUT",
+                                    "/api/v1/fallback/providers/\(self.pathComponent(providerId))/api-key",
+                                    ["apiKey": key])
+            await self.refreshFallback()
+            self.fallbackMessage = key.isEmpty
+                ? self.ui("API key removed", "APIキーを削除しました")
+                : self.ui("API key saved", "APIキーを保存しました")
+        }
+    }
+
+    func addFallbackModel(_ providerId: String, model: String, priority: Int,
+                          supportsImages: Bool, sourceModels: [String],
+                          sourceModelsExplicit: Bool) async {
+        let trimmed = model.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            errorMessage = ui("Enter the model name used by the provider",
+                              "外部プロバイダー側のモデル名を入力してください")
+            return
+        }
+        guard 0...1000 ~= priority else {
+            errorMessage = ui("Priority must be between 0 and 1,000",
+                              "優先順位は0〜1,000で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json("POST",
+                                    "/api/v1/fallback/providers/\(self.pathComponent(providerId))/models",
+                                    ["model": trimmed, "priority": priority,
+                                     "supportsImages": supportsImages,
+                                     "sourceModels": sourceModels,
+                                     "sourceModelsExplicit": sourceModelsExplicit])
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Model added", "モデルを追加しました")
+        }
+    }
+
+    /// Update one fallback model. `patch` carries only the changed keys, so a
+    /// field the user is not editing is never rewritten from a stale copy.
+    func updateFallbackModel(_ providerId: String, modelId: String, patch: [String: Any]) async {
+        guard !patch.isEmpty else { return }
+        if let priority = patch["priority"] as? Int, !(0...1000).contains(priority) {
+            errorMessage = ui("Priority must be between 0 and 1,000",
+                              "優先順位は0〜1,000で指定してください")
+            return
+        }
+        await perform {
+            _ = try await self.json(
+                "PUT", "/api/v1/fallback/providers/\(self.pathComponent(providerId))/models/\(self.pathComponent(modelId))",
+                patch)
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Saved", "保存しました")
+        }
+    }
+
+    func removeFallbackModel(_ providerId: String, modelId: String) async {
+        await perform {
+            _ = try await self.json(
+                "DELETE", "/api/v1/fallback/providers/\(self.pathComponent(providerId))/models/\(self.pathComponent(modelId))")
+            await self.refreshFallback()
+            self.fallbackMessage = self.ui("Model removed", "モデルを削除しました")
+        }
+    }
+
+    func testFallbackProvider(_ providerId: String, modelId: String? = nil) async {
+        fallbackTesting.insert(providerId)
+        defer { fallbackTesting.remove(providerId) }
+        do {
+            var body: [String: Any] = [:]
+            if let modelId { body["modelId"] = modelId }
+            let result = try await json(
+                "POST", "/api/v1/fallback/providers/\(pathComponent(providerId))/test", body) as? [String: Any] ?? [:]
+            if result["ok"] as? Bool == true {
+                let ms = (result["durationMs"] as? NSNumber)?.intValue ?? 0
+                fallbackMessage = ui("Connection OK (\(ms) ms)", "接続に成功しました（\(ms) ms）")
+            } else {
+                let code = result["code"] as? String
+                let serverMessage = result["message"] as? String
+                fallbackMessage = CoordinatorErrorText.resolve(
+                    code: code, serverMessage: serverMessage, language: guiLanguage)
+            }
+        } catch {
+            errorMessage = presentError(error)
+        }
+    }
+
+    func resetFallbackLimits() async {
+        await perform {
+            _ = try await self.json("POST", "/api/v1/fallback/reset-limits")
+            await self.refreshFallbackStatus()
+            self.fallbackMessage = self.ui("Rate usage and cooldowns were reset",
+                                           "レート使用状況とクールダウンをリセットしました")
         }
     }
 

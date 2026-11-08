@@ -252,6 +252,12 @@ def parser() -> argparse.ArgumentParser:
     set_rag_token.add_argument("token", nargs="?", default="")
     secrets_group.add_parser("get-omlx-token")
     set_omlx_token = secrets_group.add_parser("set-omlx-token"); set_omlx_token.add_argument("token", nargs="?", default="")
+    get_fb_key = secrets_group.add_parser("get-fallback-key",
+                                          help="フォールバックプロバイダーのAPIキーを表示")
+    get_fb_key.add_argument("provider_id")
+    set_fb_key = secrets_group.add_parser("set-fallback-key",
+                                          help="フォールバックプロバイダーのAPIキーを保存（省略で削除）")
+    set_fb_key.add_argument("provider_id"); set_fb_key.add_argument("token", nargs="?", default="")
     rag = sub.add_parser("rag").add_subparsers(dest="action", required=True)
     rag.add_parser("status")
     rag_collection = rag.add_parser("collection").add_subparsers(dest="sub", required=True)
@@ -318,6 +324,68 @@ def parser() -> argparse.ArgumentParser:
     omlx_start.add_argument("--wait", action="store_true", help="完了まで待機する")
     omlx_stop = omlx.add_parser("stop", help="oMLXサーバーを停止 (omlx stop)")
     omlx_stop.add_argument("--wait", action="store_true", help="完了まで待機する")
+    fallback = sub.add_parser(
+        "fallback", help="APIフォールバック（外部AIプロバイダーへの自動委譲）の設定と状態")
+    fb_sub = fallback.add_subparsers(dest="action", required=True)
+    fb_sub.add_parser("get", help="設定・APIキーの有無・使用状況を表示")
+    fb_sub.add_parser("status", help="直近のフォールバック実行とレート使用状況を表示")
+    fb_set = fb_sub.add_parser("set", help="共通設定（指定したオプションだけ変更）")
+    fb_set.add_argument("--enabled", choices=["true", "false"], default=None)
+    fb_set.add_argument("--cooldown-seconds", type=int, default=None,
+                        help="失敗したモデルを後回しにする秒数（0〜86400）")
+    fb_set.add_argument("--max-attempts", type=int, default=None,
+                        help="1要求で試す外部モデルの上限（1〜2048）")
+    fb_set.add_argument("--forward-images-immediately", choices=["true", "false"], default=None,
+                        help="画像付き要求はキューを待たず、画像対応の外部モデルへ送る")
+    fb_add = fb_sub.add_parser("add-provider", help="外部プロバイダーを追加")
+    fb_add.add_argument("--name", required=True)
+    fb_add.add_argument("--protocol", default="openai-chat",
+                        choices=["openai-chat", "openai-responses", "anthropic-messages"])
+    fb_add.add_argument("--base-url", required=True)
+    fb_add.add_argument("--timeout-seconds", type=int, default=120)
+    fb_edit = fb_sub.add_parser("update-provider", help="外部プロバイダーの設定を変更")
+    fb_edit.add_argument("provider_id")
+    fb_edit.add_argument("--name", default=None)
+    fb_edit.add_argument("--protocol", default=None,
+                         choices=["openai-chat", "openai-responses", "anthropic-messages"])
+    fb_edit.add_argument("--base-url", default=None)
+    fb_edit.add_argument("--timeout-seconds", type=int, default=None)
+    fb_edit.add_argument("--enabled", choices=["true", "false"], default=None)
+    fb_rm = fb_sub.add_parser("remove-provider", help="外部プロバイダーを削除")
+    fb_rm.add_argument("provider_id")
+    fb_model = fb_sub.add_parser("add-model", help="フォールバックモデルを追加")
+    fb_model.add_argument("provider_id")
+    fb_model.add_argument("--model", required=True, help="外部APIへ渡すモデル名")
+    fb_model.add_argument("--label", default="")
+    fb_model.add_argument("--priority", type=int, default=10, help="小さいほど優先（0〜1000）")
+    fb_model.add_argument("--source-model", action="append", default=None,
+                          help="フォールバック元のMLXBarモデル（複数指定可、*で全モデル）")
+    fb_model.add_argument("--supports-images", choices=["true", "false"], default="false")
+    fb_model.add_argument("--max-requests", type=int, default=0, help="ウィンドウ内の上限（0=無制限）")
+    fb_model.add_argument("--rate-window-seconds", type=int, default=60)
+    fb_model.add_argument("--max-output-tokens", type=int, default=0, help="0=要求値をそのまま使用")
+    fb_model.add_argument("--max-context-tokens", type=int, default=0, help="0=無制限")
+    fb_model.add_argument("--image-detail", default="auto", choices=["auto", "low", "high"])
+    fb_medit = fb_sub.add_parser("update-model", help="フォールバックモデルの設定を変更")
+    fb_medit.add_argument("provider_id"); fb_medit.add_argument("model_id")
+    fb_medit.add_argument("--model", default=None)
+    fb_medit.add_argument("--label", default=None)
+    fb_medit.add_argument("--priority", type=int, default=None)
+    fb_medit.add_argument("--source-model", action="append", default=None,
+                          help="フォールバック元モデル（指定すると置き換え、*で全モデル）")
+    fb_medit.add_argument("--supports-images", choices=["true", "false"], default=None)
+    fb_medit.add_argument("--max-requests", type=int, default=None)
+    fb_medit.add_argument("--rate-window-seconds", type=int, default=None)
+    fb_medit.add_argument("--max-output-tokens", type=int, default=None)
+    fb_medit.add_argument("--max-context-tokens", type=int, default=None)
+    fb_medit.add_argument("--image-detail", default=None, choices=["auto", "low", "high"])
+    fb_medit.add_argument("--enabled", choices=["true", "false"], default=None)
+    fb_mrm = fb_sub.add_parser("remove-model", help="フォールバックモデルを削除")
+    fb_mrm.add_argument("provider_id"); fb_mrm.add_argument("model_id")
+    fb_test = fb_sub.add_parser("test", help="外部プロバイダーへの接続を確認（1トークン送信）")
+    fb_test.add_argument("provider_id"); fb_test.add_argument("--model-id", default=None)
+    fb_reset = fb_sub.add_parser("reset-limits", help="レート使用状況とクールダウンをリセット")
+    fb_reset.add_argument("--yes", action="store_true")
     sub.add_parser("diagnostics")
     remove_all = sub.add_parser("remove-all-data")
     remove_all.add_argument("--yes", action="store_true")
@@ -513,6 +581,90 @@ def execute(args, client: Client):
         return client.request("POST", f"/api/v1/generate/{args.request_id}/cancel").json()
     if args.command == "cancel-all":
         return client.request("POST", "/api/v1/generate/cancel-all").json()
+    if args.command == "fallback":
+        if args.action == "get": return client.request("GET", "/api/v1/fallback").json()
+        if args.action == "status": return client.request("GET", "/api/v1/fallback/status").json()
+        if args.action == "set":
+            patch = {}
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if args.cooldown_seconds is not None:
+                if not 0 <= args.cooldown_seconds <= 86400:
+                    raise ValueError("クールダウンは0〜86400秒で指定してください")
+                patch["cooldownSeconds"] = args.cooldown_seconds
+            if args.max_attempts is not None:
+                if not 1 <= args.max_attempts <= 2048:
+                    raise ValueError("最大試行数は1〜2048で指定してください")
+                patch["maxAttempts"] = args.max_attempts
+            if args.forward_images_immediately is not None:
+                patch["forwardImagesImmediately"] = args.forward_images_immediately == "true"
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", "/api/v1/fallback", patch).json()
+        if args.action == "add-provider":
+            return client.request("POST", "/api/v1/fallback/providers", {
+                "name": args.name, "protocol": args.protocol,
+                "baseURL": args.base_url, "timeoutSeconds": args.timeout_seconds}).json()
+        if args.action == "update-provider":
+            patch = {}
+            for key, value in (("name", args.name), ("protocol", args.protocol),
+                               ("baseURL", args.base_url),
+                               ("timeoutSeconds", args.timeout_seconds)):
+                if value is not None:
+                    patch[key] = value
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request("PUT", f"/api/v1/fallback/providers/{args.provider_id}",
+                                  patch).json()
+        if args.action == "remove-provider":
+            return client.request("DELETE", f"/api/v1/fallback/providers/{args.provider_id}").json()
+        if args.action == "add-model":
+            sources = args.source_model if args.source_model is not None else ["*"]
+            return client.request("POST", f"/api/v1/fallback/providers/{args.provider_id}/models", {
+                "model": args.model, "label": args.label, "priority": args.priority,
+                "sourceModels": sources,
+                "sourceModelsExplicit": "*" not in sources,
+                "supportsImages": args.supports_images == "true",
+                "maxRequests": args.max_requests,
+                "rateWindowSeconds": args.rate_window_seconds,
+                "maxOutputTokens": args.max_output_tokens,
+                "maxContextTokens": args.max_context_tokens,
+                "imageDetail": args.image_detail,
+            }).json()
+        if args.action == "update-model":
+            patch = {}
+            for key, value in (("model", args.model), ("label", args.label),
+                               ("priority", args.priority),
+                               ("maxRequests", args.max_requests),
+                               ("rateWindowSeconds", args.rate_window_seconds),
+                               ("maxOutputTokens", args.max_output_tokens),
+                               ("maxContextTokens", args.max_context_tokens),
+                               ("imageDetail", args.image_detail)):
+                if value is not None:
+                    patch[key] = value
+            if args.source_model is not None:
+                patch["sourceModels"] = args.source_model
+                patch["sourceModelsExplicit"] = "*" not in args.source_model
+            if args.supports_images is not None:
+                patch["supportsImages"] = args.supports_images == "true"
+            if args.enabled is not None:
+                patch["enabled"] = args.enabled == "true"
+            if not patch:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            return client.request(
+                "PUT", f"/api/v1/fallback/providers/{args.provider_id}/models/{args.model_id}",
+                patch).json()
+        if args.action == "remove-model":
+            return client.request(
+                "DELETE", f"/api/v1/fallback/providers/{args.provider_id}/models/{args.model_id}").json()
+        if args.action == "test":
+            body = {"modelId": args.model_id} if args.model_id else {}
+            return client.request("POST", f"/api/v1/fallback/providers/{args.provider_id}/test",
+                                  body).json()
+        if args.action == "reset-limits":
+            return client.request("POST", "/api/v1/fallback/reset-limits").json()
     if args.command == "omlx":
         if args.action == "connect": return client.request("POST", "/api/v1/omlx/connect").json()
         if args.action == "status": return client.request("GET", "/api/v1/omlx/status").json()
@@ -898,6 +1050,17 @@ def execute(args, client: Client):
         if args.action == "set-rag-embedding-token": return client.request("PUT", "/api/v1/settings/rag-embedding-token", {"token": args.token}).json()
         if args.action == "get-omlx-token": return client.request("GET", "/api/v1/settings/omlx-token").json()
         if args.action == "set-omlx-token": return client.request("PUT", "/api/v1/settings/omlx-token", {"token": args.token}).json()
+        if args.action == "get-fallback-key":
+            document = client.request("GET", "/api/v1/fallback").json()
+            providers = (document.get("apiFallback") or {}).get("providers") or []
+            match = next((item for item in providers if item.get("id") == args.provider_id), None)
+            if match is None:
+                raise ValueError("指定されたフォールバックプロバイダーが見つかりません")
+            return {"providerId": args.provider_id,
+                    "configured": bool(match.get("apiKeyConfigured"))}
+        if args.action == "set-fallback-key":
+            return client.request("PUT", f"/api/v1/fallback/providers/{args.provider_id}/api-key",
+                                  {"apiKey": args.token}).json()
     if args.command == "logs":
         if args.action == "show": return client.request("GET", f"/api/v1/logs?limit={args.limit}").json()
         if args.action == "clear": return client.request("DELETE", "/api/v1/logs").json()

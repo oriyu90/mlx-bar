@@ -24,6 +24,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from . import authtoken
+from .api.fallback import router as fallback_router
 from .api.management import router as management_router
 from .api.openai_compat import router as public_router
 from .errors import describe_error
@@ -227,6 +228,9 @@ def make_management_app(state: AppState) -> FastAPI:
     app = FastAPI(title="MLXBar Management API", docs_url=None, redoc_url=None)
     app.state.mlxbar = state
     app.include_router(management_router)
+    # v5.0.0: API fallback settings (DESIGN_v5.0.0.md). Management-only: the
+    # provider API keys must never be reachable from the public surfaces.
+    app.include_router(fallback_router)
 
     @app.exception_handler(Exception)
     async def logged_internal_error(request: Request, exc: Exception):

@@ -2,6 +2,56 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [5.0.0] - 2026-11-08
+
+**APIフォールバック。** キューが一杯のとき、レート上限に達しているとき、またはローカルモデルが応答できないときに、登録した外部AIプロバイダーへリクエストを転送できるようになりました。設定画面に「APIフォールバック」タブを追加し、GUIと `mlxbarctl fallback` の両方から設定できます。**既定は無効**で、無効時は v4.0.2 と同一の経路・同一のエラーを返します。
+
+### 追加
+
+- **外部プロバイダー（複数登録可）**: OpenAI Chat Completions（`openai-chat`）、OpenAI Responses（`openai-responses`）、Anthropic Messages（`anthropic-messages`）の3プロトコル。プロバイダーごとにベースURL・タイムアウト・APIキー・接続テスト
+- **フォールバックモデルごとの設定**: 優先順位、フォールバック元MLXBarモデル（`*` = 全モデル）、画像対応、レート上限（`maxRequests` / `rateWindowSeconds`）、最大出力トークン、最大コンテキスト（超過分は古いメッセージから省略）、画像の詳細度、追加HTTPヘッダー
+- **解決順**: 明示指定されたフォールバック元モデルは `*` より優先。`priority` 昇順 → プロバイダー登録順 → モデル登録順。失敗したモデルはクールダウン、レート上限到達モデルは後回し
+- **画像の扱い**: 画像付き要求は「画像に対応」のモデルにだけ送信。そのようなモデルがあればキューを待たずに転送し、無ければ従来どおりローカルで待つ
+- **管理API**: `GET/PUT /api/v1/fallback`、`/api/v1/fallback/providers`（追加・更新・削除）、`/providers/{id}/models`、`/providers/{id}/api-key`、`/providers/{id}/test`、`/api/v1/fallback/status`、`/api/v1/fallback/reset-limits`
+- **CLI**: `mlxbarctl fallback {get,status,set,add-provider,update-provider,remove-provider,add-model,update-model,remove-model,test,reset-limits}`、`mlxbarctl secrets {get,set}-fallback-key`
+- **GUI**: 設定 → 「APIフォールバック」。プロバイダーカード、モデル行、フォールバック元モデルの複数選択（カタログから）、レート使用状況・クールダウン・直近のフォールバックの表示（日英）
+- **エラーコード**: `FALLBACK_AUTH_FAILED` / `FALLBACK_RATE_LIMITED` / `FALLBACK_REJECTED` / `FALLBACK_UPSTREAM_ERROR` / `FALLBACK_TIMEOUT` / `FALLBACK_NETWORK_ERROR` / `FALLBACK_PROTOCOL_ERROR` / `FALLBACK_UNAVAILABLE` / `FALLBACK_ALL_FAILED` / `FALLBACK_PROVIDER_NOT_FOUND` / `FALLBACK_MODEL_NOT_FOUND`（`CoordinatorErrorText` に日英を登録）
+
+### 安全性・互換性
+
+- `apiFallback.enabled == false`（既定）では公開APIの経路に `if` が1つ増えるだけで、v4.0.2 と同じ例外が同じ位置から送出されます
+- 全候補が失敗した場合は**元のローカルエラー**をそのまま返し、外部の試行結果は `error.fallback` に付加します（`code` / `status` / `retryable` は不変）
+- 外部応答は既存のワーカーイベント形（`delta` / `reasoning_delta` / `tool_call_delta` / `completed` / `usage`）へ正規化するため、OpenAI・Anthropic のSSE組み立てコードは変更していません
+- APIキーは `control/fallback-<providerId>.key`（0600）に保存し、`config.json` には保存しません。公開APIからは設定もキーも取得できません。`providerId` は生成値＋厳格なパターン検証で、パストラバーサルを拒否します
+- SSE行バッファ・ツールコール引数バッファは1 MiBで打ち切り、レート表は256エントリで有界。`asyncio.CancelledError` は再送出し、再試行しません
+- 設定の検証は `fallback/config.py` の1か所に集約し、GUI・CLI・管理APIのどこから書いても同じ規則になります
+
+### 修正
+
+- モデル解決中に発生したローカルエラー（`MODEL_NOT_LOADED` 等）でフォールバックした場合、後続のキュー容量チェックが契機を `None` に戻してしまい、外部へ送信したにもかかわらずローカルエラーを返していた問題を修正（実機e2eで発見。回帰テスト3件を追加）
+- **Anthropic面で全フォールバック失敗がHTTP 500になっていた問題**を修正。`FallbackError` が `except MLXBarError` をすり抜けて汎用ハンドラに落ちていた。現在は元のローカルエラー（例: 429 `overloaded_error`）を返します（独立レビュー指摘・回帰テスト2件）
+- **外部がエラーをSSEイベントとして返した場合に「無言の空応答」になっていた問題**を修正。Anthropic の `event: error`、Responses の `response.failed`、OpenAI互換の `{"error": ...}` フレームを全プロトコルで認識し、内容より前なら次の候補へ、内容より後なら `error` イベントで通知します（独立レビュー指摘・回帰テスト4件）
+- **表示名で指定したフォールバック元モデルが一致しなかった問題**（HIGH）を修正。キュー満杯時は解決済みモデルの記述が要求名だけになるため、`sourceModels` に表示名を書くと一致しませんでした。カタログ行の `id` / `name` / `provider_key` も一致対象にしました（回帰テスト2件）
+- **空のストリームを空の成功応答として返していた問題**を修正。内容・終了理由・usage が1つも無いストリームは `FALLBACK_PROTOCOL_ERROR` として次の候補へ回します（回帰テスト2件）
+- **ツール呼び出し引数の累積バッファに上限が無かった問題**を修正。1 MiB で打ち切ります（回帰テスト1件）
+- **レート表のメモリ有界性**: `maxRequests=0`（無制限）のモデルは送信を数えないようにし、1ウィンドウあたりの記録も 4,096 件で打ち切りました（回帰テスト2件）
+- **設定の部分破損で全プロバイダーが消えていた問題**を修正。壊れたモデル/プロバイダー1件だけを落とし、残りを保持します（回帰テスト1件）
+- **画像とテキストが混在するメッセージの順序**が OpenAI Chat への転送で失われていた問題を修正（回帰テスト1件）
+- **管理APIの全置換PUTが削除済みプロバイダーを復活させていた問題**を修正。409 `SETTINGS_CONFLICT` で拒否します（回帰テスト1件）
+- 画像の即時転送が全滅したときのエラー種別を `server_error` に修正（`invalid_request_error` は誤りでした）
+
+### GUI（レビュー指摘の反映）
+
+- フォールバックモデル行に**モデル名・表示名の編集欄**を追加
+- 「詳細」に**温度・top_p（空欄で要求値）**と**追加HTTPヘッダー**の編集欄を追加（`名前: 値` を1行に1つ）
+
+### 検証
+
+- `pytest`: **1051 passed / 0 failed / 1 skipped**（v4.0.2 の 947 から +104。新規 `Tests/test_v5_0_0_fallback.py`）
+- `swift test`: **45 / 0**（+12: `FallbackSettingsTests`）
+- `check_i18n`: 525キー欠落0
+- 実機e2e: `scripts/verify-fallback-runtime.py` — 実コーディネーター＋偽上流サーバーで15項目すべてPASS
+
 ## [4.0.2] - 2026-11-01
 
 **ログイン項目の誤登録を防止。** 再起動時にターミナルの窓が開き `…/.build/.../debug/MLXBar ; exit;` が実行される問題を修正。`SMAppService.mainApp.register()` は**実行中の実行ファイル**を登録するため、デバッグビルドから「ログイン時に起動」を有効にすると .app でない素の実行ファイルがログイン項目になり、macOS が Terminal で開いていた。

@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 3.3.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 5.0.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -18,6 +18,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - モデルフォルダの追加と再スキャン
 - OpenAI互換のモデル一覧・モデル詳細・Chat Completions API（Open Interpreter、LibreChat、ZCode、Zed、Cline、OpenCode向け）
 - Anthropic Messages API互換の`/anthropic`入口（Claude Code向け）：messages・streaming・tool use・画像・count_tokens・models
+- **APIフォールバック（v5.0.0・既定で無効）**：キューが一杯のときやローカルで応答できないときに、登録した外部AIプロバイダー（OpenAI Chat Completions / OpenAI Responses / Anthropic Messages）へリクエストを転送します。モデルごとの優先順位・フォールバック元モデル・レート上限・画像対応・コンテキスト上限を設定できます。設定画面の「APIフォールバック」タブ、または `mlxbarctl fallback` で管理します
 - 同一モデルの並列常駐&生成（`models.pool.profiles[].replicas`）
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
@@ -103,6 +104,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - 「モデル」設定: API自動ロード、Max token上限、温度・Top P・繰り返しペナルティ、並列リクエストを設定・確認
 - 「一般」設定: GUI言語をEnglish／日本語から選択
 - 「APIサーバー」: URL確認、コピー、ポート変更
+- 「APIフォールバック」: 外部AIプロバイダーの登録、モデルごとの優先順位・フォールバック元モデル・レート上限・画像対応・コンテキスト上限（既定で無効。有効にすると対象リクエストの内容が外部へ送信されます）
 - 「詳細」: 最近のAPIアクセスを最大500件表示、コピー、消去
 - 「ランタイム」設定: 自動インストール状況の確認、最新版または指定版への更新、検証後の切替・復元・旧版削除
 - 「キャッシュ」設定: 永続プロンプトキャッシュと実験的Paged KVの個別有効化、容量上限、対応状況・使用量確認、RAM／snapshot／Paged SSDの個別消去、古いキャッシュ世代の自動回収
@@ -356,7 +358,7 @@ APIのモデル指定には、`GET /v1/models`が返す表示名または内部I
 
 OpenAI互換エラーはトップレベルの`error`オブジェクトで返します。一般的なクライアントが付加する`top_p`、penalty、`metadata`、`store`なども受理します。`stop`と`seed`はMLXランタイムへ実際に渡します。応答には`usage`を含め、`stream_options.include_usage: true`では`[DONE]`の直前にusage専用チャンクを返します。プロンプトキャッシュで再計算を省けたtoken数は、OpenAI標準の`usage.prompt_tokens_details.cached_tokens`に入れて返します。ランタイムが再利用量を報告しなかった場合は0を書かずにフィールドごと省くため、「キャッシュが効かなかった」と「計測していない」を取り違えません。
 
-v2.0.0から`response_format`の`json_object`・`json_schema`、`n`（複数候補生成、非stream時のみ、最大8）、レガシーの`/v1/completions`（生プロンプト、chat templateなし）に対応しました。`response_format`はMLXBarに文法制約デコーダがないため、プロンプト指示＋生成後バリデーションのベストエフォート実装です（`json_schema`は`oneOf`/`$ref`など一部キーワード未対応、事前にHTTP 400で拒否）。検証に失敗した場合は無効なJSONを黙って返さず、HTTP 502 `RESPONSE_FORMAT_INVALID`（`retryable: true`）で拒否します。`logprobs`とOpenAI Responses API（`/v1/responses`）、Chat Completionsのテキスト以外の出力は引き続き未対応で、フリーズせず入力エラー/HTTP 404として終了します（scope外とした理由は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)を参照）。
+v2.0.0から`response_format`の`json_object`・`json_schema`、`n`（複数候補生成、非stream時のみ、最大8）、レガシーの`/v1/completions`（生プロンプト、chat templateなし）に対応しました。`response_format`はMLXBarに文法制約デコーダがないため、プロンプト指示＋生成後バリデーションのベストエフォート実装です（`json_schema`は`oneOf`/`$ref`など一部キーワード未対応、事前にHTTP 400で拒否）。検証に失敗した場合は無効なJSONを黙って返さず、HTTP 502 `RESPONSE_FORMAT_INVALID`（`retryable: true`）で拒否します。`logprobs`とChat Completionsのテキスト以外の出力は引き続き未対応で、フリーズせず入力エラー/HTTP 404として終了します（scope外とした理由は[`DESIGN_v2.0.0.md`](DESIGN_v2.0.0.md)を参照）。OpenAI Responses API（`/v1/responses`）は、このMLXBar自身の公開入口としては引き続き404 `UNSUPPORTED_ENDPOINT` です（サーバー側の会話状態や組み込みツールを持たないため）。ただし**外部フォールバック先としては `openai-responses` を選択できます**（[APIフォールバック](#apiフォールバックv500既定で無効)を参照）。
 
 v2.1.0から、リクエストに任意の`rag`フィールドを付けると、ローカル知識ベースから関連文を検索してプロンプト先頭に合成`system`メッセージとして注入します（例: `"rag": {"collection": "my-notes", "topK": 4, "maxChars": 6000}`）。`rag`を付けないリクエストの挙動はv2.0.1と完全に同一です。直近のuserメッセージ本文をクエリにします。指定コレクションが無ければHTTP 404 `RAG_COLLECTION_NOT_FOUND`、`rag.enabled`（設定）が無効のときは400 `RAG_DISABLED`、外部の埋め込みエンドポイントに接続できないときは503 `RAG_EMBEDDING_UNAVAILABLE`（`retryable: true`）を返します。`"rag": {"optional": true}`を付けると、埋め込み取得に失敗しても文脈なしで通常生成にフォールバックします。埋め込み自体はMLXBarでは計算せず、`rag.embedding.baseUrl`で指定したOpenAI互換`/v1/embeddings`（LM Studio、Ollama など）へ委譲します。`/anthropic`側も同じ`rag`フィールドに対応します。設計は[`DESIGN_v2.1.0.md`](DESIGN_v2.1.0.md)を参照してください。
 
@@ -592,6 +594,58 @@ LAN公開中はAPIキーを無効にできません。信頼できる家庭内�
 
 MLXBar APIキーは`~/Library/Application Support/MLXBar/control/api-token`へ、LM Studio用キーは同じ`control`フォルダ内の秘密ファイルへ保存されます。どちらもユーザーだけが読み書きできる権限で保存され、`config.json`、診断情報、通常ログ、DMG内には含まれません。LM Studio用キーは「設定…」→「LM Studio」で設定または削除でき、モデル一覧取得と生成の両方へBearerキーとして送信されます。
 
+## APIフォールバック（v5.0.0・既定で無効）
+
+MLXBarのキューが一杯のとき、レート上限に達しているとき、またはローカルモデルが応答を開始できないときに、登録した外部AIプロバイダーへリクエストを転送できます。**既定では無効**で、有効にしないかぎり v4.0.2 と同じ経路・同じエラーを返します。
+
+> **プライバシー**: 有効にすると、対象のリクエスト内容（プロンプトと画像）が、選んだ外部プロバイダーへ送信されます。画像は「画像に対応」を有効にしたフォールバックモデルにだけ送られます。
+
+### 対応プロトコル
+
+| `protocol` | エンドポイント | 認証 |
+|---|---|---|
+| `openai-chat` | `{baseURL}/chat/completions` | `Authorization: Bearer` |
+| `openai-responses` | `{baseURL}/responses` | `Authorization: Bearer` |
+| `anthropic-messages` | `{baseURL}/messages` | `x-api-key` + `anthropic-version` |
+
+プロバイダーは何件でも登録でき、それぞれに複数のフォールバックモデルを持たせられます。
+
+### フォールバックの決まり
+
+1. **契機**: キュー満杯（`QUEUE_FULL`）、レート上限、ローカルエラー（`ENGINE_BUSY`・`MODEL_NOT_LOADED`・メモリ不足など）。`MODEL_NOT_FOUND` と `INVALID_REQUEST` は**転送しません**（入力の誤りを隠さないため）。
+2. **フォールバック元**: フォールバックモデルごとに「MLXBarのどのモデルをフォールバック元とするか」を指定します。`*` は全モデルです。**明示指定されたモデルは `*` より優先**され、`*` しか持たないモデルは、その要求モデルが明示指定されている場合は使われません。
+3. **優先順位**: `priority` が小さいほど先に試します。同じならプロバイダーの登録順、次にモデルの登録順です。失敗したモデルは `cooldownSeconds` のあいだ後回しにされ、レート上限に達したモデルも後回しになります。
+4. **画像**: 画像付きの要求は「画像に対応」を有効にしたモデルにだけ送られます。そのようなモデルがあれば、キューを待たずに送ります（`forwardImagesImmediately`）。無ければ従来どおりMLXBarのキューで待ちます。
+5. **レート**: モデルごとに `maxRequests` / `rateWindowSeconds` で送信数を制限できます（`0` は無制限）。カウントは送信開始時点で増えるため、失敗しても消費します。
+6. **コンテキスト**: `maxContextTokens` を指定すると、それを超える会話は古いメッセージから省いて送ります（システムメッセージは残します）。`maxOutputTokens` は要求の `max_tokens` の上限になります。
+7. **失敗時**: 次の候補を試し、全滅した場合は**元のローカルエラー**をそのまま返します（外部の試行結果は `error.fallback` に付きます）。
+
+### 設定
+
+GUIの「設定…」→「APIフォールバック」、またはCLIで設定します。
+
+```sh
+# プロバイダーを追加（IDが返ります）
+mlxbarctl fallback add-provider --name OpenAI \
+  --protocol openai-chat --base-url https://api.openai.com/v1
+
+# APIキーを保存（config.json には保存されません）
+mlxbarctl secrets set-fallback-key p-xxxxxxxx sk-...
+
+# フォールバックモデルを追加（--source-model を省略すると全モデル）
+mlxbarctl fallback add-model p-xxxxxxxx --model gpt-4.1-mini --priority 10 \
+  --source-model qwen-9b --supports-images true
+
+# 有効化
+mlxbarctl fallback set --enabled true
+
+# 状態（直近のフォールバック、レート使用状況）
+mlxbarctl fallback status
+```
+
+APIキーは `~/Library/Application Support/MLXBar/control/fallback-<providerId>.key`（0600）に保存し、`config.json` には `apiKeyConfigured` だけを記録します。公開API（`/v1/*`、`/anthropic/*`）からはフォールバック設定もAPIキーも取得できません。
+
+
 ## ソースからのビルド
 
 必要なものはSwift 6、macOS SDK、Python 3.12を取得できる`uv`、`hdiutil`です。
@@ -606,7 +660,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-3.3.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-5.0.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

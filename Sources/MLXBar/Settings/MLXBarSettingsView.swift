@@ -17,7 +17,8 @@ struct MLXBarSettingsView: View {
     @State private var selection = "APIサーバー"
     /// The Japanese titles double as localization keys, so the selection stays
     /// valid when the interface language changes underneath it.
-    private let pages = ["一般", "モデル", "APIサーバー", "LM Studio", "知識ベース", "ランタイム", "キャッシュ", "oMLX", "詳細", "削除"]
+    private let pages = ["一般", "モデル", "APIサーバー", "APIフォールバック", "LM Studio",
+                         "知識ベース", "ランタイム", "キャッシュ", "oMLX", "詳細", "削除"]
 
     var body: some View {
         NavigationSplitView {
@@ -29,6 +30,7 @@ struct MLXBarSettingsView: View {
             case "一般": GeneralSettingsView(model: model)
             case "モデル": ModelSourceSettingsView(model: model)
             case "APIサーバー": APISettingsView(model: model)
+            case "APIフォールバック": APIFallbackSettingsView(model: model)
             case "LM Studio": LMStudioSettingsView(model: model)
             case "知識ベース": KnowledgeBaseSettingsView(model: model)
             case "ランタイム": RuntimeManagerView(model: model)

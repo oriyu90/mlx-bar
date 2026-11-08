@@ -400,6 +400,40 @@ enum CoordinatorErrorText {
         "MODEL_VOLUME_UNREADABLE": (
             "モデルフォルダを読み取れませんでした。外付けボリュームへのアクセスが許可されていない可能性があります。システム設定の「プライバシーとセキュリティ」で「リムーバブルボリューム」または「フルディスクアクセス」に MLXBar を追加してください",
             "The model folder could not be read. Access to the external volume may not be allowed: add MLXBar to Removable Volumes or Full Disk Access in System Settings > Privacy & Security."),
+        // v5.0.0: API fallback to external providers.
+        "FALLBACK_AUTH_FAILED": (
+            "外部プロバイダーがAPIキーを受け付けませんでした。設定 > APIフォールバック でAPIキーを確認してください",
+            "The external provider rejected the API key. Check it in Settings > API Fallback."),
+        "FALLBACK_RATE_LIMITED": (
+            "外部プロバイダーのレート上限に達しました。しばらくしてからもう一度お試しください",
+            "The external provider's rate limit was reached. Try again shortly."),
+        "FALLBACK_REJECTED": (
+            "外部プロバイダーがリクエストを受け付けませんでした。モデル名と対応機能（画像など）を確認してください",
+            "The external provider rejected the request. Check the model name and its capabilities, such as images."),
+        "FALLBACK_UPSTREAM_ERROR": (
+            "外部プロバイダーがエラーを返しました",
+            "The external provider returned an error."),
+        "FALLBACK_TIMEOUT": (
+            "外部プロバイダーの応答がタイムアウトしました",
+            "The external provider did not answer in time."),
+        "FALLBACK_NETWORK_ERROR": (
+            "外部プロバイダーに接続できません。URLとネットワーク接続を確認してください",
+            "Could not reach the external provider. Check the URL and your network connection."),
+        "FALLBACK_PROTOCOL_ERROR": (
+            "外部プロバイダーの応答を解釈できませんでした。プロトコル（OpenAI / Anthropic）の設定を確認してください",
+            "The external provider's response could not be read. Check that the protocol (OpenAI or Anthropic) is right."),
+        "FALLBACK_UNAVAILABLE": (
+            "このモデルに割り当てられたフォールバック先がありません。設定 > APIフォールバック でフォールバック元モデルを確認してください",
+            "No fallback destination is assigned to this model. Check the source models in Settings > API Fallback."),
+        "FALLBACK_ALL_FAILED": (
+            "すべてのフォールバック先が失敗しました",
+            "Every fallback destination failed."),
+        "FALLBACK_PROVIDER_NOT_FOUND": (
+            "指定されたフォールバックプロバイダーが見つかりません。設定を読み直してください",
+            "That fallback provider was not found. Reload the settings."),
+        "FALLBACK_MODEL_NOT_FOUND": (
+            "指定されたフォールバックモデルが見つかりません。設定を読み直してください",
+            "That fallback model was not found. Reload the settings."),
     ]
 
     /// Best display string for the given error, in `language` ("ja" or "en").

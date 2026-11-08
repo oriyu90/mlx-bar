@@ -16,6 +16,7 @@ from ..rag.retrieval import inject_context_block
 from ..state import preload_recovered
 from .adaptive_memory import adaptive_memory_worker_options, maybe_plan_adaptive_memory
 from .context_compression import maybe_compress_messages
+from ..fallback.client import FallbackError
 from .images import resolve_public_images
 from . import response_format as response_format_lib
 
@@ -356,6 +357,15 @@ async def legacy_completions(request: Request, body: dict):
                 failed = True
                 request.state.api_log["error_code"] = exc.code
                 yield "data: " + json.dumps(exc.as_dict(), ensure_ascii=False) + "\n\n"
+            except FallbackError as exc:
+                # v5.0.0: every external candidate failed before any content
+                # arrived. Report it as a structured error event, not the
+                # generic INTERNAL_ERROR the catch-all below would produce.
+                failed = True
+                request.state.api_log["error_code"] = exc.code
+                yield "data: " + json.dumps({"error": {"code": exc.code, "message": exc.message,
+                                                        "retryable": exc.retryable}},
+                                            ensure_ascii=False) + "\n\n"
             except Exception as exc:
                 failed = True
                 request.state.api_log["error_code"] = "INTERNAL_ERROR"
@@ -572,26 +582,56 @@ async def chat(request: Request, body: dict):
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
     image_root = image_workspace.path if image_workspace else None
+    early_fallback_error = None
     try:
         loaded = await _ensure_requested_model(request, requested_model)
     except MLXBarError as exc:
-        if image_workspace:
-            image_workspace.cleanup()
-        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+        # v5.0.0: a local error that means "MLXBar cannot answer right now"
+        # (another model busy, load failed, memory refused) may be handed to an
+        # external provider. MODEL_NOT_FOUND / INVALID_REQUEST never are.
+        fallback = _fallback_for_local_error(request, requested_model, exc, bool(images))
+        if fallback is None:
+            if image_workspace:
+                image_workspace.cleanup()
+            raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+        loaded = fallback
+        early_fallback_error = exc
     if requested_max_tokens is None:
         # v2.7.2: recompute from the resolved model, not the pool primary.
         max_tokens = _default_max_tokens_for(app_state(request).workers, loaded)
         options["max_tokens"] = max_tokens
         request.state.api_log["max_tokens"] = max_tokens
     response_model = loaded.get("name") or loaded.get("id") or requested_model
+    # A local error that already sent this request to an external provider
+    # (raised while resolving/loading the model) must not be overwritten by the
+    # capacity check below, and it is what a total external failure reports.
+    fallback_reason = early_fallback_error.code if early_fallback_error else None
+    local_fallback_error = early_fallback_error
+    if fallback_reason is not None:
+        request.state.api_log["fallback_reason"] = fallback_reason
     try:
         capacity_check = getattr(app_state(request).workers, "raise_if_queue_full", None)
         if capacity_check:
             capacity_check()
     except MLXBarError as exc:
-        if image_workspace:
-            image_workspace.cleanup()
-        raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+        if not _fallback_available(request, requested_model, images, loaded):
+            if image_workspace:
+                image_workspace.cleanup()
+            raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+        fallback_reason = exc.code
+        local_fallback_error = exc
+        request.state.api_log["fallback_reason"] = fallback_reason
+    if fallback_reason is None and images:
+        # R9: with images attached, an external vision model is preferred over
+        # queueing behind a local one. `should_forward_images` is false unless
+        # the feature is on and at least one external model accepts images.
+        service = getattr(app_state(request), "fallback", None)
+        if service is not None and service.should_forward_images() \
+                and service.should_fallback(requested_model, has_images=True,
+                                            aliases=_fallback_aliases(loaded, app_state(request),
+                                                                      requested_model)):
+            fallback_reason = "images"
+            request.state.api_log["fallback_reason"] = fallback_reason
     normalized_messages, compression = await maybe_compress_messages(
         app_state(request).workers, loaded, normalized_messages,
         effective_tools, app_state(request).settings, request_id)
@@ -638,11 +678,16 @@ async def chat(request: Request, body: dict):
                            "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
                 yield "data: " + json.dumps(initial, ensure_ascii=False) + "\n\n"
                 generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
-                generation = (generate_for_model(
-                    str(loaded.get("id", "")), normalized_messages, images, options,
-                    request_id, image_root=image_root) if generate_for_model else
-                    app_state(request).workers.generate(
-                        normalized_messages, images, options, request_id, image_root=image_root))
+                generation = (_fallback_generation(request, loaded, requested_model,
+                                                   normalized_messages, images, options,
+                                                   fallback_reason)
+                              if fallback_reason else None)
+                if generation is None:
+                    generation = (generate_for_model(
+                        str(loaded.get("id", "")), normalized_messages, images, options,
+                        request_id, image_root=image_root) if generate_for_model else
+                        app_state(request).workers.generate(
+                            normalized_messages, images, options, request_id, image_root=image_root))
                 async for event in generation:
                     if event.get("type") == "delta":
                         mark_first_token()
@@ -732,6 +777,15 @@ async def chat(request: Request, body: dict):
                 failed = True
                 request.state.api_log["error_code"] = exc.code
                 yield "data: " + json.dumps(exc.as_dict(), ensure_ascii=False) + "\n\n"
+            except FallbackError as exc:
+                # v5.0.0: every external candidate failed before any content
+                # arrived. Report it as a structured error event, not the
+                # generic INTERNAL_ERROR the catch-all below would produce.
+                failed = True
+                request.state.api_log["error_code"] = exc.code
+                yield "data: " + json.dumps({"error": {"code": exc.code, "message": exc.message,
+                                                        "retryable": exc.retryable}},
+                                            ensure_ascii=False) + "\n\n"
             except Exception as exc:
                 failed = True
                 request.state.api_log["error_code"] = "INTERNAL_ERROR"
@@ -772,7 +826,9 @@ async def chat(request: Request, body: dict):
         for index in range(n):
             sub_request_id = request_id if n == 1 else f"{request_id}-{index}"
             message, finish_reason, usage = await _run_one_completion(
-                request, loaded, normalized_messages, images, options, sub_request_id, image_root)
+                request, loaded, normalized_messages, images, options, sub_request_id, image_root,
+                fallback_reason=fallback_reason, requested_model=requested_model,
+                local_fallback_error=local_fallback_error)
             if response_format is not None and not message.get("tool_calls"):
                 violations = response_format_lib.validate_output(message.get("content") or "", response_format)
                 if violations:
@@ -798,7 +854,10 @@ async def chat(request: Request, body: dict):
 
 async def _run_one_completion(request: Request, loaded: dict, normalized_messages: list[dict],
                               images: list[str], options: dict, request_id: str,
-                              image_root=None) -> tuple[dict, str, dict]:
+                              image_root=None, fallback_reason: str | None = None,
+                              requested_model: str | None = None,
+                              local_fallback_error: MLXBarError | None = None,
+                              ) -> tuple[dict, str, dict]:
     """Run one full (non-streaming) generation and return (message, finish_reason, usage).
 
     Split out of `chat()` so `n > 1` can call it in a loop without duplicating
@@ -811,11 +870,15 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
     usage = None
     cached_tokens = None
     generate_for_model = getattr(app_state(request).workers, "generate_for_model", None)
-    generation = (generate_for_model(
-        str(loaded.get("id", "")), normalized_messages, images, options,
-        request_id, image_root=image_root) if generate_for_model else
-        app_state(request).workers.generate(
-            normalized_messages, images, options, request_id, image_root=image_root))
+    generation = (_fallback_generation(request, loaded, requested_model or str(loaded.get("id", "")),
+                                       normalized_messages, images, options, fallback_reason)
+                  if fallback_reason else None)
+    if generation is None:
+        generation = (generate_for_model(
+            str(loaded.get("id", "")), normalized_messages, images, options,
+            request_id, image_root=image_root) if generate_for_model else
+            app_state(request).workers.generate(
+                normalized_messages, images, options, request_id, image_root=image_root))
     try:
         async for event in generation:
             if event.get("type") == "delta":
@@ -874,6 +937,19 @@ async def _run_one_completion(request: Request, loaded: dict, normalized_message
                                   event.get("retryable", False))
     except MLXBarError as exc:
         raise HTTPException(exc.status, detail=exc.as_dict()["error"])
+    except FallbackError as exc:
+        # v5.0.0: every external candidate failed. Report the *local* error the
+        # request originally hit, so a client sees the same code it would have
+        # without the feature; the external attempts ride along as detail.
+        # `local_fallback_error` is None only when the fallback was chosen for
+        # images while the local path was healthy -- then there is no local
+        # refusal to report, and the external failure is the honest answer.
+        if local_fallback_error is None:
+            raise HTTPException(503 if exc.retryable else 502, detail={
+                "code": exc.code, "message": exc.message, "retryable": exc.retryable,
+                "type": "server_error"})
+        raise HTTPException(local_fallback_error.status,
+                            detail=_fallback_failure_detail(local_fallback_error, exc))
     finally:
         await _aclose_generation(generation)
     message = {"role": "assistant", "content": text or None if tool_calls else text}
@@ -902,6 +978,116 @@ def _honor_resident_alias(state, resident: dict, requested: str) -> bool:
     if exact is None:
         return True
     return str(exact.get("id", "")) == str(resident.get("id", ""))
+
+
+def _fallback_service(request: Request):
+    """The fallback service, or None when this app state does not have one."""
+    return getattr(app_state(request), "fallback", None)
+
+
+def _fallback_aliases(loaded: dict | None, state=None,
+                      requested: str | None = None) -> tuple[str, ...]:
+    """Every name the resolved model answers to, for source-model matching (F-2).
+
+    The resolved descriptor alone is not enough: when the fallback was chosen
+    because the local model could not be loaded, `loaded` is a stand-in built
+    from the requested string, so a user who assigned ``sourceModels`` by the
+    model's *display name* would silently get no fallback. The catalog row is
+    therefore consulted too, and its id / name / provider_key all count.
+    """
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(value) -> None:
+        if isinstance(value, str) and value.strip() and value.strip().casefold() not in seen:
+            seen.add(value.strip().casefold())
+            values.append(value.strip())
+
+    if isinstance(loaded, dict):
+        for key in ("id", "name", "provider_key"):
+            add(loaded.get(key))
+    add(requested)
+    if state is not None:
+        try:
+            row = _find_model(state, requested) if requested else None
+        except Exception:  # noqa: BLE001 - alias building must never fail a request
+            row = None
+        if isinstance(row, dict):
+            for key in ("id", "name", "provider_key"):
+                add(row.get(key))
+    return tuple(values)
+
+
+def _fallback_available(request: Request, requested: str, images: list[str],
+                        loaded: dict | None = None) -> bool:
+    """Whether an external model could take this request right now.
+
+    ``loaded`` (when the model did resolve) contributes its names, and the
+    catalog row contributes the display name, so a ``sourceModels`` entry
+    written either way matches (H-1).
+    """
+    service = _fallback_service(request)
+    if service is None:
+        return False
+    try:
+        return service.should_fallback(
+            requested, has_images=bool(images),
+            aliases=_fallback_aliases(loaded, app_state(request), requested))
+    except Exception:  # noqa: BLE001 - a broken setting must not break the API
+        return False
+
+
+def _fallback_for_local_error(request: Request, requested: str, exc: MLXBarError,
+                              has_images: bool) -> dict | None:
+    """A stand-in "loaded" descriptor when an external model will answer.
+
+    Returns None when this error is not a fallback trigger or no external model
+    is assigned to ``requested``, in which case the caller re-raises ``exc``
+    unchanged (the v4.0.2 behaviour).
+    """
+    from ..fallback.service import is_trigger
+    if not is_trigger(exc):
+        return None
+    service = _fallback_service(request)
+    if service is None:
+        return None
+    try:
+        # H-1: the catalog row's display name counts too, so a `sourceModels`
+        # entry written with the name the GUI shows still matches.
+        if not service.should_fallback(
+                requested, has_images=has_images,
+                aliases=_fallback_aliases(None, app_state(request), requested)):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    request.state.api_log["fallback_reason"] = exc.code
+    # The response keeps naming the model the client asked for; only the
+    # destination differs, which the log and the fallback status record.
+    return {"id": requested, "name": requested, "external": True}
+
+
+def _fallback_generation(request: Request, loaded: dict, requested: str,
+                         messages: list[dict], images: list[str], options: dict,
+                         reason: str):
+    """An async event generator backed by an external provider.
+
+    Returns None when the service is missing, so the caller keeps its exact
+    local path. The events have the worker vocabulary, so every downstream
+    encoder works unchanged.
+    """
+    service = _fallback_service(request)
+    if service is None:
+        return None
+    return service.run(requested, messages, images, options, reason=reason,
+                       aliases=_fallback_aliases(loaded, app_state(request), requested))
+
+
+def _fallback_failure_detail(original: MLXBarError, failure: FallbackError) -> dict:
+    """The original local error, plus what the external attempts did."""
+    detail = original.as_dict()["error"]
+    detail["fallback"] = {"code": failure.code, "message": failure.message,
+                          "retryable": failure.retryable}
+    return detail
 
 
 async def _ensure_requested_model(request: Request, requested: str) -> dict:
