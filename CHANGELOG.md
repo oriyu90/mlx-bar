@@ -2,6 +2,41 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [5.0.2] - 2026-11-10
+
+**Niwaki 退化生成の修正。** mlx-vlm 0.7.12 の batch-invariant decode が単一トークンデコード時に bundled ローダー側の compact MoE（`CompactMasked`）の remap を迂回するため、bundled モデルにだけ batch-invariant を無効化して通常 forward へ戻します。あわせて、modalities のテンソル証拠準拠、失敗時の部分ロード解放、キャッシュ fingerprint への loaderId 混ぜ込み、bundled への admission strict 強制を行いました。`models.bundledLoaders` の既定は無効のまま、非 bundled モデルの経路は変更ありません。
+
+### 追加
+
+- **bundled 限定の batch-invariant decode 無効化**: `Workers/mlx_vlm_worker/adapter.py` の `_disable_batch_invariant_for_bundled()`（bundled ロード直後に呼ばれる）。`language_model._supports_batch_invariant_decode` を `False` を返す callable で instance 属性として差し替え、通常 forward へ戻します。非 bundled モデルは batch-invariant 経路のままです。`language_model` が無い場合および例外時はログのみで、ロード・生成は止めません（fail-open）
+- **modalities のテンソル証拠準拠**: `common.vision.inspect()` で vision テンソルの有無を確認し、`["text", "image"]` / `["text"]` を決めます。inspect が例外を投げた場合のみ、従来の config のみ判定へフォールバックします
+- **キャッシュ fingerprint への loaderId 混ぜ込み**: `_model_fingerprint(path, runtime_version, loader_id=None)` に `loaderId` を混ぜ込み、bundled モデルの KV / ディスクキャッシュの namespace が stock ローダーと衝突しなくなります
+- **bundled への admission strict 強制**: `Coordinator/mlxbar/workers/model_pool.py` の `_cold_estimate` で、`loaderId`（`loaderId` / `loader_id`）を持つ行は `memoryAdmission` 設定が `balanced` でも `strict` 係数（1.35x）で見積もります
+- **失敗時の部分ロード解放**: `Workers/mlx_vlm_worker/adapter.py` の `_release_partial_load()`。ロード失敗時に半構築モデルへの参照を落として GC と MLX キャッシュを解放します（元の例外はそのまま再送出します）
+
+### 安全性・互換性
+
+- `models.bundledLoaders` の既定は `false` のまま（無効時は従来どおり `MODEL_NEEDS_BUNDLED_LOADER` で即失敗です）
+- batch-invariant 無効化は `_bundled_loader_id` が設定されている bundled モデルにだけ適用され、非 bundled モデルは通常の batch-invariant 経路のままです。差し替えや inspect の失敗はログのみで、ロード自体の成否に影響しません
+- `_release_partial_load` の cleanup は元のロードエラーを決してマスクしません（例外は握りつぶして元の例外を再送出します）
+- 設定スキーマは `schemaVersion=1` のまま、`CATALOG_CLASSIFIER_VERSION` は `"4"` のまま（v5.0.2 は分類規則を変更しないため版数を上げません）
+- Python 側の変更のみで、Swift / UI 文言の変更はありません
+
+### 修正
+
+- **Niwaki の退化生成**: mlx-vlm 0.7.12 が `LanguageModel.__call__` から `_batch_invariant_decode` を呼び、`CompactMasked` の `_kept_mask` / `_remap` ルーティングを迂回していた問題を修正。bundled モデルは通常 forward 経路に戻ります（外部 API で `!!!!` のような退化が通常化することを期待。実機再検証は別タスク）
+- **Niwaki が image 対応に誤分類されていた問題**: `vision_config` を宣言しつつ vision テンソル 0 件（実 export で 0/3434）の Niwaki を config のみで `["text", "image"]` としていた問題を修正。テンソル証拠により `["text"]` となり、coordinator の分類（`_capabilities`）と一致します
+- **bundled / stock ローダー間のキャッシュ衝突**: 同一ディレクトリでもローダーが違うと既存の namespace を再利用して古い KV を serve し得た問題を修正。fingerprint への loaderId 混ぜ込みで namespace が分離します
+- **bundled のメモリ見積り不足**: bundled モデルが余分なバッファを materialize するのに `balanced` 係数で過小評価されていた問題を修正。bundled は常に `strict` で評価します
+- **ロード失敗時のメモリ滞留**: vlm アダプタに mlx-lm 側相当の cleanup が無く、失敗したロードの数十 GB が coordinator がワーカーを kill するまで残っていた問題を修正。失敗直後に `_release_partial_load` で解放します
+
+### 検証
+
+- `pytest`: 1091 passed / 1 skipped / 0 failed（`cd Coordinator && .venv/bin/python -m pytest ../Tests -q -p no:randomly`）
+- `check_i18n`: 529 keys / 0 missing（`python3 scripts/check_i18n.py`）
+- 新規テスト `Tests/test_v5_0_2_niwaki_regressions.py`（30件、収録済み）。自動テスト期待値は `TEST_PLAN_v5.0.2.md` を参照
+- Swift 側の変更はありません（Python 側の変更のみで Swift / UI 文言の変更なし）。よって swift build / swift test の v5.0.2 実測値は本エントリに含めません
+
 ## [5.0.1] - 2026-11-09
 
 **JANG・Niwaki の取り扱い改善。** JANGH2（jangtq2）形式は MLXBar / MLX LM / MLX VLM / LM Studio / oMLX のいずれでも実行できないため、カタログ検出とロード前失敗で Osaurus 0.25.24+ での実行を案内するようになりました。Niwaki（Qwen3.8-Flash-Next qwen4_exp）などの非標準形式は既存の同梱ローダーで読み込み可能で、エラー文言とカタログバナーで有効化経路を案内します（既定は無効のまま）。カタログ分類版は `CATALOG_CLASSIFIER_VERSION "3" → "4"` で、既存インストールでも起動時に再走査されます。

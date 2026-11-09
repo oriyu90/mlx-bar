@@ -548,7 +548,17 @@ class ModelPoolSupervisor:
         # overhead and load transients get 35% (balanced: 15%), with a 512 MiB
         # process floor. The MLX allocator ceiling and RSS watchdog remain the
         # hard backstops. Used for the per-model cap and the global budget.
-        factor = ADMISSION_FACTORS[self._admission_mode()]
+        # v5.0.2: bundled-loader models (loaderId set: niwaki, jang) may
+        # materialize extra buffers the balanced factor undercounts, so they
+        # always use the strict factor even when memoryAdmission is balanced.
+        loader_id = model.get("loaderId") or model.get("loader_id")
+        if loader_id:
+            factor = ADMISSION_FACTORS["strict"]
+            LOGGER.info(
+                "Bundled loader %s forces strict memory estimate (factor %.2f)",
+                loader_id, factor)
+        else:
+            factor = ADMISSION_FACTORS[self._admission_mode()]
         weight_bytes = self._weights_bytes(model)
         return max(ANONYMOUS_FLOOR_BYTES, int(weight_bytes * factor) + ANONYMOUS_FLOOR_BYTES)
 

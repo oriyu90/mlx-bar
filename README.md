@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 5.0.1 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 5.0.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -20,6 +20,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - Anthropic Messages API互換の`/anthropic`入口（Claude Code向け）：messages・streaming・tool use・画像・count_tokens・models
 - **APIフォールバック（v5.0.0・既定で無効）**：キューが一杯のときやローカルで応答できないときに、登録した外部AIプロバイダー（OpenAI Chat Completions / OpenAI Responses / Anthropic Messages）へリクエストを転送します。モデルごとの優先順位・フォールバック元モデル・レート上限・画像対応・コンテキスト上限を設定できます。設定画面の「APIフォールバック」タブ、または `mlxbarctl fallback` で管理します
 - **JANG・Niwaki 対応（v5.0.1）**：JANGH2（jangtq2）形式は MLXBar / MLX LM / MLX VLM / LM Studio / oMLX では実行できないため、Osaurus 0.25.24+ での実行を案内して数秒で即失敗します。Niwaki（Qwen3.8-Flash-Next qwen4_exp）などの非標準形式は既存の同梱ローダで読み込みでき（既定は無効）、有効化すると案内されます
+- **Niwaki 退化修正（v5.0.2）**：同梱ローダ利用時に mlx-vlm 0.7.12 の batch-invariant decode が compact MoE の remap を迂回して退化していた問題を修正。bundled モデルにだけ batch-invariant を無効化して通常 forward へ戻し、非 bundled モデルは従来どおりです
 - 同一モデルの並列常駐&生成（`models.pool.profiles[].replicas`）
 - API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
@@ -70,7 +71,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-3.3.2.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-5.0.2.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -661,7 +662,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-5.0.1.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-5.0.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 

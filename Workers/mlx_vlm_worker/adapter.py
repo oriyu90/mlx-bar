@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import hashlib
 import importlib.metadata
 import json
@@ -19,6 +20,7 @@ os.environ.setdefault("RAYON_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from common import cache_state
+from common import vision
 from common.server import BaseAdapter, memory_pressure_reason, run
 from common.tool_calls import parse_tool_markup, tool_template_kwargs_attempts
 
@@ -149,13 +151,19 @@ class MLXVLMAdapter(BaseAdapter):
         return "" if self.kv_bits is None else f"-kv-{self.kv_mode}"
 
     @staticmethod
-    def _model_fingerprint(path: Path, runtime_version: str) -> str:
+    def _model_fingerprint(path: Path, runtime_version: str,
+                           loader_id: str | None = None) -> str:
         """Fingerprint cache compatibility without reading multi-GB weights."""
         digest = hashlib.sha256()
         digest.update(b"mlxbar-vlm-apc-v1\0")
         digest.update(str(path.resolve()).encode("utf-8", errors="surrogateescape"))
         digest.update(b"\0")
         digest.update(runtime_version.encode("ascii", errors="replace"))
+        # v5.0.2: bundled-loader output is not compatible with the stock
+        # loader's KV/disk cache. Without this the old namespace could be
+        # reused after the loader changed and serve stale KV.
+        if loader_id is not None:
+            digest.update(b"bundled:" + loader_id.encode("utf-8", errors="surrogateescape"))
         metadata_names = {
             "config.json", "tokenizer.json", "tokenizer_config.json",
             "processor_config.json", "preprocessor_config.json",
@@ -210,7 +218,8 @@ class MLXVLMAdapter(BaseAdapter):
             os.environ.setdefault("APC_EXACT_CACHE_ENTRIES", "0")
             os.environ.setdefault("APC_EXACT_PREFIX_GUARD_TOKENS", "256")
             runtime_version = importlib.metadata.version("mlx-vlm")
-            fingerprint = self._model_fingerprint(Path(model_path), runtime_version)
+            fingerprint = self._model_fingerprint(
+                Path(model_path), runtime_version, loader_id=self._bundled_loader_id)
             self.apc_root = Path(root_value)
             self.apc_root.mkdir(parents=True, exist_ok=True)
             os.chmod(self.apc_root, 0o700)
@@ -516,7 +525,7 @@ class MLXVLMAdapter(BaseAdapter):
             runtime_version = importlib.metadata.version("mlx-vlm")
         except Exception:
             runtime_version = "unknown"
-        namespace = (f"mlxbar-vlm-ckpt-v1-{self._model_fingerprint(Path(model_path), runtime_version)}"
+        namespace = (f"mlxbar-vlm-ckpt-v1-{self._model_fingerprint(Path(model_path), runtime_version, loader_id=self._bundled_loader_id)}"
                      f"{self._kv_namespace_suffix()}")
         disk_enabled = self._truthy(os.environ.get("MLXBAR_PROMPT_CACHE_DISK_ENABLED", "1"))
         self.checkpoints = CheckpointStore(
@@ -554,6 +563,62 @@ class MLXVLMAdapter(BaseAdapter):
             LOGGER.warning("Checkpoint restore failed; continuing cold: %s", exc)
             return None
 
+    def _release_partial_load(self) -> None:
+        """Drop a half-built model (v5.0.2) before re-raising a load failure.
+
+        The vlm adapter had no equivalent of the mlx-lm worker's cleanup, so
+        a failed bundled/regular load left tens of gigabytes of partially
+        loaded tensors reachable until the coordinator killed the worker.
+        Dropping the reference and clearing the MLX cache frees the residue
+        immediately. Cleanup never masks the original error.
+        """
+        try:
+            if getattr(self, "model", None) is not None:
+                self.model = None
+            self.processor = None
+            gc.collect()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the load error
+            pass
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the load error
+            pass
+
+    def _disable_batch_invariant_for_bundled(self) -> None:
+        """Disable mlx-vlm's batch-invariant decode for bundled models (v5.0.2).
+
+        mlx-vlm 0.7.12 calls ``_batch_invariant_decode`` from
+        ``LanguageModel.__call__`` for single-token decodes, bypassing the
+        bundled loader's ``CompactMasked`` ``_kept_mask``/``_remap`` routing
+        and degrading generation. Only bundled models are affected, so only
+        they are patched: an instance attribute returning ``False`` shadows
+        the class method (``getattr`` prefers the instance dict) and routes
+        decode back through the normal forward. Non-bundled models keep the
+        batch-invariant path. A failure here only logs -- the model loads
+        and generates either way.
+        """
+        if self._bundled_loader_id is None:
+            return
+        try:
+            target = getattr(self.model, "language_model", None)
+            if target is None:
+                LOGGER.warning(
+                    "Bundled model %s has no language_model; "
+                    "batch-invariant decode left enabled",
+                    self._bundled_loader_id)
+                return
+            target._supports_batch_invariant_decode = lambda: False
+            LOGGER.warning(
+                "Bundled loader %s: batch-invariant decode disabled "
+                "(CompactMasked bypass in mlx-vlm 0.7.12)",
+                self._bundled_loader_id)
+        except Exception as exc:  # noqa: BLE001 - fall back to stock decode
+            LOGGER.warning(
+                "Could not disable batch-invariant decode for bundled model %s; "
+                "continuing with stock forward: %s",
+                self._bundled_loader_id, exc)
+
     def load(self, path: str, trust_remote_code: bool = False,
              allow_vlm: bool = False) -> dict:
         # v2.10.0: `allow_vlm` is accepted for protocol parity with the
@@ -581,35 +646,51 @@ class MLXVLMAdapter(BaseAdapter):
                            str(exc)[:300])
             raise
         config = load_plan["config"]
-        has_visual_input = any(config.get(key) not in (None, {}) for key in (
-            "vision_config", "vision_tower", "visual", "image_token_id",
-        ))
-        self.modalities = ["text", "image"] if has_visual_input else ["text"]
-        self.apply_memory_limits()
-        if load_plan["loader"] is not None:
-            # Opt-in path (models.bundledLoaders): repository code only. The
-            # log line is deliberate -- AC-5-4 asks for explicit consent *and*
-            # a record of every use.
-            LOGGER.warning("Bundled loader enabled: %s for %s",
-                           load_plan["loaderId"], path)
-            self._bundled_loader_id = load_plan["loaderId"]
-            self.model, self.processor = load_plan["loader"].load(
-                path, trust_remote_code=trust_remote_code)
-        else:
-            from mlx_vlm import load
-            self._bundled_loader_id = None
-            self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
-        self.model_path = path
-        self.apply_memory_limits()
-        self._reset_prompt_cache()
-        # Order matters: the cache budget and the rollback probe are inputs to
-        # how the APC pool and the checkpoint store are sized.
-        self.cache_budget = cache_state.model_cache_budget(config)
-        self._probe_rollback_capability()
-        self._init_kv_quant_from_env()
-        self._init_apc(path)
-        self._init_checkpoints(path)
-        self._log_cache_plan()
+        # v5.0.2: config-only vision claims mislabel tensor-less exports
+        # (Niwaki declares a vision_config but ships 0/3434 vision tensors)
+        # as image models. common.vision.inspect() requires tensor evidence;
+        # on any failure fall back to the historical config-only reading.
+        try:
+            vision_supported = bool(vision.inspect(path).get("vision"))
+            self.modalities = ["text", "image"] if vision_supported else ["text"]
+        except Exception as exc:  # noqa: BLE001 - fall back, never fail a load
+            LOGGER.warning("Vision inspect failed for %s; falling back to config: %s",
+                           path, exc)
+            has_visual_input = any(config.get(key) not in (None, {}) for key in (
+                "vision_config", "vision_tower", "visual", "image_token_id",
+            ))
+            self.modalities = ["text", "image"] if has_visual_input else ["text"]
+        try:
+            self.apply_memory_limits()
+            if load_plan["loader"] is not None:
+                # Opt-in path (models.bundledLoaders): repository code only. The
+                # log line is deliberate -- AC-5-4 asks for explicit consent *and*
+                # a record of every use.
+                LOGGER.warning("Bundled loader enabled: %s for %s",
+                               load_plan["loaderId"], path)
+                self._bundled_loader_id = load_plan["loaderId"]
+                self.model, self.processor = load_plan["loader"].load(
+                    path, trust_remote_code=trust_remote_code)
+                self._disable_batch_invariant_for_bundled()
+            else:
+                from mlx_vlm import load
+                self._bundled_loader_id = None
+                self.model, self.processor = load(path, trust_remote_code=trust_remote_code)
+            self.model_path = path
+            self.apply_memory_limits()
+            self._reset_prompt_cache()
+            # Order matters: the cache budget and the rollback probe are inputs to
+            # how the APC pool and the checkpoint store are sized.
+            self.cache_budget = cache_state.model_cache_budget(config)
+            self._probe_rollback_capability()
+            self._init_kv_quant_from_env()
+            self._init_apc(path)
+            self._init_checkpoints(path)
+            self._log_cache_plan()
+        except Exception:
+            # v5.0.2: free a partial load instead of waiting for a kill.
+            self._release_partial_load()
+            raise
         return self.capabilities()
 
     def _log_cache_plan(self) -> None:
