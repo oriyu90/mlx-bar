@@ -205,11 +205,17 @@ enum CoordinatorErrorText {
             "ロード後の実測メモリが上限を超えたため、モデルを解放しました",
             "Measured memory after loading exceeded the limit, so the model was unloaded."),
         "MODEL_NEEDS_BUNDLED_LOADER": (
-            "このモデルは同梱ローダが必要です。対応版で読み込めます",
-            "This model requires a bundled loader, available in a later version."),
+            "このモデルは同梱ローダーが必要です。設定→モデル→バンドル済みローダーを許可を有効にしてください（既定は無効）",
+            "This model requires a bundled loader. Enable Settings → Models → Bundled loaders (off by default)."),
         "MODEL_FORMAT_UNSUPPORTED": (
             "このモデルの形式には対応していません",
             "This model's format is not supported."),
+        // v5.0.1 (HIGH-1): JANG (jangtq2) has a dedicated code so the
+        // generic MODEL_FORMAT_UNSUPPORTED sentence cannot swallow the
+        // Osaurus guidance in an English interface.
+        "MODEL_JANG_OSAURUS_REQUIRED": (
+            "このモデルの量子化（JANG jangtq2）は MLXBar では実行できません。Osaurus 0.25.24+ で開いてください。LM Studio・oMLX は使えません",
+            "This model's JANG jangtq2 quantization cannot run in MLXBar. Open it with Osaurus 0.25.24+. LM Studio and oMLX cannot run it."),
         "MODEL_QUANT_UNSUPPORTED": (
             "このモデルの量子化形式には対応していません",
             "This model's quantization format is not supported."),

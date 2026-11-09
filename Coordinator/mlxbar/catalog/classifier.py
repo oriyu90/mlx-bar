@@ -109,7 +109,23 @@ REASONING_KEYS = {"reasoning_config", "reasoning_effort", "enable_thinking"}
 TOOL_MARKERS = ("<tool_call", "tool_calls", "tools=", "tool_call_id")
 # Config keys that mark a non-standard artifact needing a bundled loader
 # (ISS-5). Detection only: this module never imports or executes model code.
+# v5.0.1: JANG detection is a primary rule set in `_is_jang_artifact`
+# (jang_config.json / quantization mode / osaurus.json); it is intentionally
+# NOT a config-key fallback here -- a bare `jang_config` key in config.json
+# must not claim loaderId=jang without the artifact evidence, so that
+# `_loader_id` (path-less, niwaki only) and `classify`'s is_jang runtimeFit
+# never disagree (MEDIUM-2).
 BUNDLED_LOADER_KEYS = {"niwaki": "niwaki-qwen4-exp"}
+# v5.0.1: JANG (jangtq2 / JANGH2) artifacts. Narrow on purpose -- exact
+# "jangtq2" (case-insensitive) for format/mode, "jangtq" substring for
+# weight_format only, plus osaurus.json existence. A normal affine model
+# (e.g. qwen3_5_moe) can never match.
+JANG_MODE = "jangtq2"
+JANG_WEIGHT_MARKER = "jangtq"
+JANG_LOADER_ID = "jang-osaurus-required"
+JANG_REASON = ("JANGH2（jangtq2）量子化を検出: "
+               "Osaurus 0.25.24+ で開いてください"
+               "（LM Studio・oMLX は JANG に対応していないため MLXBar ではロードできません）")
 # Cap protected against a corrupt/hostile safetensors header.
 MAX_SAFETENSORS_HEADER_BYTES = 64 << 20
 
@@ -390,12 +406,82 @@ def _runtime_fit(config: dict, capabilities: dict, fmt: str) -> dict:
     return fit
 
 
-def _loader_id(config: dict) -> str | None:
+def _contains_jang_quant_mode(obj: object, _depth: int = 0) -> bool:
+    """True when a (possibly nested) ``quantization`` dict has mode jangtq2."""
+    if _depth > 20:
+        return False
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == "quantization" and isinstance(value, dict):
+                mode = value.get("mode")
+                if isinstance(mode, str) and mode.strip().casefold() == JANG_MODE:
+                    return True
+            if _contains_jang_quant_mode(value, _depth + 1):
+                return True
+    elif isinstance(obj, list):
+        return any(_contains_jang_quant_mode(item, _depth + 1) for item in obj)
+    return False
+
+
+def _is_jang_artifact(config: dict, path: Path) -> tuple[bool, str | None]:
+    """Whether ``path`` is a JANG (jangtq2) artifact, with short evidence.
+
+    Rules (any one matches; tensor names are never scanned):
+    (a) ``jang_config.json`` exists with ``format == "jangtq2"`` or
+    ``weight_format`` containing ``jangtq``;
+    (b) ``config.json`` (recursively) has a ``quantization`` dict whose
+    ``mode`` is exactly ``jangtq2``;
+    (c) ``osaurus.json`` exists.
+    Reads only config/jang_config (+ existence checks) -- never weights.
+    """
+    path = Path(path)
+    evidences: list[str] = []
+    jang_path = path / "jang_config.json"
+    try:
+        if jang_path.exists():
+            try:
+                data = json.loads(jang_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                fmt = data.get("format")
+                if isinstance(fmt, str) and fmt.strip().casefold() == JANG_MODE:
+                    evidences.append(f"jang_config.json format={fmt.strip()}")
+                weight_format = data.get("weight_format")
+                if isinstance(weight_format, str) and JANG_WEIGHT_MARKER in weight_format.casefold():
+                    evidences.append("jang_config.json weight_format contains jangtq")
+    except OSError:
+        pass
+    if _contains_jang_quant_mode(config):
+        evidences.append("config.json quantization mode=jangtq2")
+    try:
+        if (path / "osaurus.json").exists():
+            evidences.append("osaurus.json 存在")
+    except OSError:
+        pass
+    if not evidences:
+        return False, None
+    return True, "; ".join(evidences)
+
+
+def _loader_id(config: dict, path: Path | None = None) -> str | None:
     """Bundled loader this artifact needs, when it is a known non-standard one.
 
-    Detection is a config-key lookup only: no model-supplied Python is
-    imported, scanned or executed here (ISS-5 / AC-5-4).
+    Detection is config/directory evidence only: no model-supplied Python is
+    imported, scanned or executed here (ISS-5 / AC-5-4). The JANG nested
+    quantization rule works from ``config`` alone; the file-based rules
+    (:func:`_is_jang_artifact`) need ``path`` and are checked first when it
+    is given.
     """
+    if path is not None:
+        try:
+            is_jang, _evidence = _is_jang_artifact(config, Path(path))
+        except Exception:  # noqa: BLE001 - detection must never break a scan
+            is_jang = False
+        if is_jang:
+            return JANG_LOADER_ID
+    elif _contains_jang_quant_mode(config):
+        return JANG_LOADER_ID
     for key, loader in BUNDLED_LOADER_KEYS.items():
         if key in config:
             return loader
@@ -439,6 +525,7 @@ def classify(path: Path, *, engine_override: str | None = None,
     capabilities = _capabilities(config, path, tensors, verdict)
     fmt = "mlx_vlm" if verdict["engine"] == "mlx-vlm" else "mlx_lm"
     modalities = ["text"] + (["image"] if capabilities["vision"] else [])
+    loader_id = _loader_id(config, path)
     evidence = {
         "architecture": config.get("model_type"),
         "architectures": _architecture_strings(config),
@@ -452,7 +539,7 @@ def classify(path: Path, *, engine_override: str | None = None,
         "tensors": tensors,
         "engineBranch": verdict["branch"],
         "engineReason": verdict["reason"],
-        "loaderHint": _loader_id(config),
+        "loaderHint": loader_id,
     }
     result = {
         "format": fmt,
@@ -467,8 +554,27 @@ def classify(path: Path, *, engine_override: str | None = None,
         "capabilities": capabilities,
         "runtimeFit": _runtime_fit(config, capabilities, fmt),
         "evidence": evidence,
-        "loaderId": _loader_id(config),
+        "loaderId": loader_id,
     }
+    try:
+        is_jang, jang_evidence = _is_jang_artifact(config, path)
+    except Exception:  # noqa: BLE001 - detection must never break a scan
+        is_jang, jang_evidence = False, None
+    if is_jang:
+        # v5.0.1: JANGH2 cannot be served by any MLXBar runtime. Keep
+        # engine=mlx-vlm (never None) so stale-row self-heal and existing
+        # display stay compatible; runtimeFit is where the refusal is
+        # recorded (all runtimes unsupported). reason/evidence carry the
+        # Osaurus 0.25.24+ guidance in the existing Japanese style.
+        result["engine"] = "mlx-vlm"
+        result["format"] = "mlx_vlm"
+        result["confidence"] = 0.95
+        result["reason"] = JANG_REASON
+        result["loaderId"] = JANG_LOADER_ID
+        result["runtimeFit"] = {"mlx-lm": "unsupported", "mlx-vlm": "unsupported",
+                                 "omlx": "unsupported", "lm-studio": "unsupported"}
+        result["evidence"] = {**evidence, "loaderHint": JANG_LOADER_ID,
+                              "jangEvidence": jang_evidence, "reason": JANG_REASON}
     return _apply_overrides(result, engine_override, capabilities_override)
 
 
@@ -500,6 +606,12 @@ def _apply_overrides(result: dict, engine_override: str | None,
             {"model_type": evidence.get("architecture"),
              "architectures": evidence.get("architectures") or []},
             result["capabilities"], str(result.get("format") or ""))
+    if result.get("loaderId") == JANG_LOADER_ID:
+        # v5.0.1: a manual override must not resurrect a JANG artifact as
+        # loadable. The engine override above still stands (explicit user
+        # choice), but every runtime stays unsupported.
+        result["runtimeFit"] = {"mlx-lm": "unsupported", "mlx-vlm": "unsupported",
+                                 "omlx": "unsupported", "lm-studio": "unsupported"}
     return result
 
 

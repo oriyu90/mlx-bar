@@ -600,9 +600,9 @@ class DatabaseClassificationTests(unittest.TestCase):
 
 class VersionMarkerTests(unittest.TestCase):
     def test_classifier_version_bumped(self):
-        """A changed classifier must rescan existing installs; "3" is the
-        v2.10.0 VLM-heuristics bump."""
-        self.assertEqual(state_module.CATALOG_CLASSIFIER_VERSION, "3")
+        """A changed classifier must rescan existing installs; "4" is the
+        v5.0.1 JANG (jangtq2) re-scan bump."""
+        self.assertEqual(state_module.CATALOG_CLASSIFIER_VERSION, "4")
 
 
 if __name__ == "__main__":

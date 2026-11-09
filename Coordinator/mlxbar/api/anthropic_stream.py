@@ -377,6 +377,7 @@ def _anthropic_error_type(code: str | None) -> str:
         # retry will not help — say so with the non-retryable class.
         "MODEL_NEEDS_BUNDLED_LOADER": "invalid_request_error",
         "MODEL_FORMAT_UNSUPPORTED": "invalid_request_error",
+        "MODEL_JANG_OSAURUS_REQUIRED": "invalid_request_error",
         "MODEL_QUANT_UNSUPPORTED": "invalid_request_error",
         "MODEL_TOKENIZER_MISSING": "invalid_request_error",
         # TASK-003: index 参照の重み欠落も artifact の属性（再試行不可）。

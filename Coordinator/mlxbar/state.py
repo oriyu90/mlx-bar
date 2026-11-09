@@ -28,7 +28,10 @@ from .workers.model_pool import ModelPoolSupervisor
 # startup and picks up the corrected VLM classification (classifier.py).
 # Bump this together with any change to `catalog/classifier.py` decision
 # rules, or stale rows keep serving the wrong engine until a manual scan.
-CATALOG_CLASSIFIER_VERSION = "3"
+# v5.0.1: bumped to "4" so existing installs rescan and pick up JANGH2
+# (jangtq2) detection -- loaderId "jang-osaurus-required", all runtimes
+# unsupported, Osaurus 0.25.24+ guidance (classifier.py _is_jang_artifact).
+CATALOG_CLASSIFIER_VERSION = "4"
 # v3.2.0 (ISS-2): the capability/catalog columns (`capabilities`,
 # `runtimeFit`, `evidence`, `loaderId`) landed without changing the classifier
 # version, whose value is pinned by an existing test (and by the v3.1.0

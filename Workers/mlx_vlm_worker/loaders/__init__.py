@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from common.jang import raise_if_jang
 from common.model_errors import ModelLoadError
 
 from .base import BundledLoader, LoaderSpec
@@ -134,6 +135,13 @@ def generic_preflight(path: str | Path) -> dict:
     """
     path = Path(path)
     config = read_config(path)
+    # v5.0.1: JANG (jangtq2) artifacts must fail here, before any stock load
+    # attempt. The stock mlx-vlm loader does not understand the layout and dies
+    # later with a rotation error far from the cause. The check reads only
+    # config.json / jang_config.json (+ osaurus.json existence) -- never
+    # safetensors, never model-supplied *.py. Shared rule lives in
+    # common/jang.py so the mlx-lm worker applies the identical verdict.
+    raise_if_jang(config, path)
     report = {"path": str(path), "checks": []}
 
     tokenizer_present = any((path / name).exists() for name in TOKENIZER_FILES)
@@ -237,8 +245,11 @@ def plan(path: str | Path, *, bundled_loaders_enabled: bool) -> dict:
     if not bundled_loaders_enabled:
         raise ModelLoadError(
             "MODEL_NEEDS_BUNDLED_LOADER",
-            f"このモデルは同梱ローダ「{loader.spec.display_name}」が必要です"
-            "（既定では無効です。設定 models.bundledLoaders を有効にすると使用できます）",
+            f"このモデルは同梱ローダー『{loader.spec.display_name}』が必要です。"
+            "設定 models.bundledLoaders を有効（Settings → モデル → "
+            "バンドル済みローダーを許可、または mlxbarctl config set "
+            "models.bundledLoaders true）にしてから再試行してください。"
+            "既定は無効です",
             detail=loader.spec.description)
     if not loader.spec.implemented:
         raise ModelLoadError(

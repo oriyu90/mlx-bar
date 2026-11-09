@@ -2,6 +2,40 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [5.0.1] - 2026-11-09
+
+**JANG・Niwaki の取り扱い改善。** JANGH2（jangtq2）形式は MLXBar / MLX LM / MLX VLM / LM Studio / oMLX のいずれでも実行できないため、カタログ検出とロード前失敗で Osaurus 0.25.24+ での実行を案内するようになりました。Niwaki（Qwen3.8-Flash-Next qwen4_exp）などの非標準形式は既存の同梱ローダーで読み込み可能で、エラー文言とカタログバナーで有効化経路を案内します（既定は無効のまま）。カタログ分類版は `CATALOG_CLASSIFIER_VERSION "3" → "4"` で、既存インストールでも起動時に再走査されます。
+
+### 追加
+
+- **JANGH2 検出（3条件）**: `jang_config.json`（`format == "jangtq2"` または `weight_format` が `jangtq` を含む）、`config.json` の再帰走査で `quantization.mode == "jangtq2"`、`osaurus.json` の存在。該当行は `loaderId: jang-osaurus-required` になり、全 runtime の `runtimeFit` が `unsupported` になります
+- **ロード前失敗**: supervisor がカタログの `loaderId` から弾き、ワーカー preflight でも同じ規則で新規コード `MODEL_JANG_OSAURUS_REQUIRED`（`ErrorText.swift` に日英登録、`api/anthropic_stream.py` に `invalid_request_error` の分類を追加）を返します。メッセージに Osaurus 0.25.24+ での実行案内と、証拠の短い文言を含みます
+- **GUI 案内**: カタログ行に JANG バナー（「JANG jangtq2 形式です。このアプリでは実行できません。Osaurus 0.25.24+ で開いてください」）と Niwaki バナー（同梱ローダーの有効化経路）を表示します。日英両言語対応です
+- **Niwaki の有効化経路案内**: `MODEL_NEEDS_BUNDLED_LOADER` のエラー文言とカタログバナーで「設定 → モデル → バンドル済みローダーを許可」を有効にする経路を示します
+
+### 安全性・互換性
+
+- `models.bundledLoaders` の既定は `false` のまま（無効時は Niwaki が `MODEL_NEEDS_BUNDLED_LOADER` で即失敗し、従来の挙動です）
+- 通常の affine 量子化モデル（例: qwen3_5_moe）は JANG 検出に一致しません（`jangtq2` は完全一致、`jangtq` 部分一致は `weight_format` のみ）
+- エラーメッセージ・`evidence` に絶対パスは含みません（ファイル名・フィールド名のみ）
+- 設定スキーマは `schemaVersion=1` のまま。`CATALOG_CLASSIFIER_VERSION` の値上げは起動時の再走査で吸収され、旧カタログ行はそのまま読めます
+
+### 修正
+
+- JANG が深い読み込み段階（`SwitchLinear.to_quantized` の rotation エラー）で失敗する問題を修正。検出証拠から数秒で `MODEL_JANG_OSAURUS_REQUIRED` として即失敗します
+- Niwaki が既定無効で即失敗する際、回復手順が見えなかった問題を修正。エラー文言とカタログバナーが有効化経路を示します
+- 手動エンジン選択（override）でも JANG  artifact が「ロード可能」として復活しないよう、全 runtime `unsupported` を維持します
+
+### 検証
+
+- `pytest`: 1061 passed / 1 skipped / 0 failed（`cd Coordinator && .venv/bin/python -m pytest ../Tests -q -p no:randomly`、flaky 修正後）
+- `swift build`: pass（`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build`、警告のみ）
+- `swift test`: 45 tests / 0 failures（`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --disable-sandbox`）
+- `check_i18n`: 529 keys / 0 missing（`python3 scripts/check_i18n.py`）
+- 実機 `plan_load`: A（JANG）は `bundled True/False` どちらでも `MODEL_JANG_OSAURUS_REQUIRED`、B（Niwaki）は `False` で `MODEL_NEEDS_BUNDLED_LOADER` / `True` で plan 成功、C（通常 affine 回帰）は pass
+- 新規テスト `Tests/test_v5_0_1_jang_niwaki.py`（10件、収録済み）。自動テスト期待値は `TEST_PLAN_v5.0.1.md` を参照
+- 既知 flaky `Tests/test_worker_server.py::test_buffered_tool_generation_still_emits_heartbeats` の interval を 0.03→0.10 に緩めて安定化した（ロジック無変更）
+
 ## [5.0.0] - 2026-11-08
 
 **APIフォールバック。** キューが一杯のとき、レート上限に達しているとき、またはローカルモデルが応答できないときに、登録した外部AIプロバイダーへリクエストを転送できるようになりました。設定画面に「APIフォールバック」タブを追加し、GUIと `mlxbarctl fallback` の両方から設定できます。**既定は無効**で、無効時は v4.0.2 と同一の経路・同一のエラーを返します。

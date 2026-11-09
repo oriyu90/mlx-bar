@@ -19,6 +19,8 @@ LOGGER = logging.getLogger(__name__)
 
 from common import cache_state
 from common import vision
+from common.jang import raise_if_jang
+from common.model_errors import ModelLoadError
 from common.server import BaseAdapter, run
 from common.tool_calls import normalize_tool_call_messages, parse_tool_markup, tool_template_kwargs_attempts
 
@@ -141,6 +143,32 @@ class MLXLMAdapter(BaseAdapter):
     def load(self, path: str, trust_remote_code: bool = False, allow_vlm: bool = False) -> dict:
         if not path:
             raise ValueError("model path is required")
+        # v5.0.1: JANG (jangtq2) artifacts cannot be served by stock mlx-lm
+        # either. The mlx-vlm worker rejects them in preflight
+        # (mlx_vlm_worker/loaders.generic_preflight); this worker has no
+        # loaders.plan() call of its own, so the identical check runs here
+        # via the shared common/jang.py rule -- same evidence, same
+        # MODEL_JANG_OSAURUS_REQUIRED code, before stock `load()` can die with
+        # a rotation error far from the cause. Reads only config.json /
+        # jang_config.json (+ osaurus.json existence), never safetensors.
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+
+            try:
+                _config = _json.loads(
+                    (_Path(path) / "config.json").read_text(encoding="utf-8"))
+            except Exception:
+                _config = None
+            raise_if_jang(_config if isinstance(_config, dict) else None, path)
+        except ModelLoadError:
+            raise
+        except Exception:  # noqa: BLE001
+            # Evidence-read failures fall through to stock on purpose so a
+            # normal model's transient config-read problem cannot block its
+            # load; a JANG artifact still fails later at the stock loader's
+            # quantization rotation error, so no wrong output is produced.
+            pass
         # v2.10.0 vision guard: a model the coordinator (or the operator)
         # did NOT explicitly pin to mlx-lm must never be text-served here if
         # it is a vision-language model — its image inputs would be dropped

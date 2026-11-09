@@ -659,3 +659,9 @@
 "温度は0〜2の数値で指定してください" = "Temperature must be a number between 0 and 2";
 "top_pは0より大きく1以下の数値で指定してください" = "top_p must be greater than 0 and at most 1";
 "ヘッダーは「名前: 値」の形式で1行に1つ入力してください" = "Enter headers one per line as \"name: value\"";
+
+/* v5.0.1 -- JANG (Osaurus-only) and Niwaki (bundled-loader) catalog banners plus the bundledLoaders settings note. Keys are the Japanese source literals used with LS(_:). */
+"JANG jangtq2 形式です。このアプリでは実行できません。Osaurus 0.25.24+ で開いてください" = "JANG jangtq2 format. This app cannot run it. Open it with Osaurus 0.25.24+.";
+"LM Studio・oMLX では実行できません。" = "LM Studio and oMLX cannot run it.";
+"このモデルは同梱ローダー（Niwaki qwen4_exp）が必要です。設定→モデル→バンドル済みローダーを許可を有効にすると読み込めます" = "This model needs the bundled loader (Niwaki qwen4_exp). Enable Settings → Models → Bundled loaders to load it.";
+"Niwaki（Qwen3.8-Flash-Next qwen4_exp）など同梱ローダーが必要なモデルに使います。" = "Used for models that need a bundled loader, such as Niwaki (Qwen3.8-Flash-Next qwen4_exp).";

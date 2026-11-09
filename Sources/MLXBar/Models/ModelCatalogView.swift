@@ -42,7 +42,31 @@ struct ModelCatalogView: View {
             } else {
                 Table(filtered, selection: $selected) {
                     TableColumn(LS("モデル")) { item in
-                        VStack(alignment: .leading) { Text(item.name); Text(item.reason).font(.caption).foregroundStyle(.secondary) }
+                        VStack(alignment: .leading) {
+                            Text(item.name)
+                            Text(item.reason).font(.caption).foregroundStyle(.secondary)
+                            // v5.0.1: non-runnable / opt-in loader rows read as
+                            // "why can't I load this" before any click. Reuses the
+                            // v3.2.1 (WP-A) orange caption style of the loaded
+                            // footer's model warnings, without a timer.
+                            if item.loaderId == "jang-osaurus-required" {
+                                Label(LS("JANG jangtq2 形式です。このアプリでは実行できません。Osaurus 0.25.24+ で開いてください"), systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(3)
+                                    .accessibilityIdentifier("catalog-warning-jang")
+                                Text(LS("LM Studio・oMLX では実行できません。"))
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(2)
+                            } else if item.loaderId == "niwaki-qwen4-exp" {
+                                Label(LS("このモデルは同梱ローダー（Niwaki qwen4_exp）が必要です。設定→モデル→バンドル済みローダーを許可を有効にすると読み込めます"), systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(3)
+                                    .accessibilityIdentifier("catalog-warning-niwaki")
+                            }
+                        }
                     }
                     TableColumn(LS("形式")) { item in Text(item.format).font(.caption).padding(4).background(.quaternary, in: Capsule()) }.width(100)
                     TableColumn(LS("エンジン")) { item in Text(item.engine ?? LS("未対応")) }.width(100)

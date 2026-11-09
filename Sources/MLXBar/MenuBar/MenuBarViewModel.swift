@@ -12,6 +12,12 @@ struct CatalogModel: Identifiable, Hashable {
     let reason: String
     let size: Int64
     let modalities: [String]
+    /// Bundled loader this artifact needs, when any (v3.2.0 additive
+    /// `loaderId` in `/api/v1/models`; e.g. `niwaki-qwen4-exp`). Nil for
+    /// standard models and older coordinators. The catalog view branches on
+    /// this exact string for the JANG/Niwaki banners, so a missing key
+    /// degrades to "no banner" rather than a wrong one.
+    let loaderId: String?
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String, let name = value["name"] as? String else { return nil }
@@ -22,6 +28,7 @@ struct CatalogModel: Identifiable, Hashable {
         reason = value["reason"] as? String ?? ""
         size = (value["size_bytes"] as? NSNumber)?.int64Value ?? 0
         modalities = value["modalities"] as? [String] ?? []
+        loaderId = value["loaderId"] as? String
     }
 }
 

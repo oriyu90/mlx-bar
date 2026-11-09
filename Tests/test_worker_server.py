@@ -140,8 +140,8 @@ class SlowBufferedToolAdapter(ThreadBoundAdapter):
 
     def stream(self, request_id: str, params: dict):
         for text in self.CHUNKS:
-            # Each gap stays under the heartbeat interval; the cumulative silent
-            # span (32 chunks x 0.05 s) does not.
+            # Each gap (0.05 s) stays under the heartbeat interval (0.10 s);
+            # the cumulative silent span (32 chunks x 0.05 s) does not.
             time.sleep(0.05)
             yield {"type": "delta", "text": text}
 
@@ -151,8 +151,10 @@ def test_buffered_tool_generation_still_emits_heartbeats():
     # observe, so the heartbeat thread often lost the race and the test failed
     # with no heartbeat at all. The invariant under test ("a buffered tool
     # generation still emits heartbeats") only needs the interval to be shorter
-    # than the phase, so pin it well below.
-    interval = 0.03
+    # than the phase, so pin it well below. The interval (0.10 s) must still
+    # exceed the chunk gap (0.05 s) so a prefill heartbeat does not reset the
+    # tool_parse heartbeat clock on every chunk.
+    interval = 0.10
     previous = worker_server.GENERATION_HEARTBEAT_SECONDS
     worker_server.GENERATION_HEARTBEAT_SECONDS = interval
     try:

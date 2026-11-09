@@ -558,6 +558,28 @@ class WorkerSupervisor:
         if engine == "auto":
             engine = None
         chosen = engine or model.get("engine")
+        # v5.0.1: JANGH2 (jangtq2) artifacts are refused here, before any
+        # worker starts. The catalog marks them loaderId
+        # "jang-osaurus-required" with every runtime unsupported; the worker
+        # preflight (common/jang.py via loaders.generic_preflight, and the
+        # mlx-lm adapter guard) is the backup for rows without a fresh
+        # classification, so this branch only needs the catalog field and
+        # no filesystem I/O. Code is the dedicated
+        # MODEL_JANG_OSAURUS_REQUIRED so the GUI's EN table keeps the
+        # Osaurus 0.25.24+ guidance (MODEL_FORMAT_UNSUPPORTED resolves to a
+        # generic sentence and would swallow it); the message never carries
+        # an absolute path.
+        if model.get("loaderId") == "jang-osaurus-required":
+            jang_evidence = ""
+            evidence = model.get("evidence")
+            if isinstance(evidence, dict) and evidence.get("jangEvidence"):
+                jang_evidence = f"（証拠: {evidence['jangEvidence']}）"
+            raise MLXBarError(
+                "MODEL_JANG_OSAURUS_REQUIRED",
+                "このモデルの量子化（JANG jangtq2）は MLXBar では実行できません。"
+                "Osaurus 0.25.24+（または対応する MLX Studio / jang-tools）で開いてください。"
+                f"LM Studio と oMLX は JANG に対応していないため使えません{jang_evidence}",
+                400, False)
         # v3.3.1: catalogue/model metadata reads touch the model directory.
         # On an external or sleeping volume that blocks the event loop for the
         # whole coordinator (the startup preload then makes the app appear hung).

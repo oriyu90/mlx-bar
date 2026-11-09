@@ -965,6 +965,11 @@ struct ModelSourceSettingsView: View {
                 Text(LS("標準形式でないモデルを読み込むときに、同梱のローダーを使えるようにします。モデル供給元のPythonは実行しません。使用した場合はログに残ります。既定は無効です。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                // v5.0.1: name the concrete model the toggle unblocks so the
+                // Models row banner has somewhere to point.
+                Text(LS("Niwaki（Qwen3.8-Flash-Next qwen4_exp）など同梱ローダーが必要なモデルに使います。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Picker(LS("メモリ見積り"), selection: Binding(
                     get: { memoryAdmission },
                     set: { value in Task { await model.setConfig("models.pool.memoryAdmission", value: value) } }
