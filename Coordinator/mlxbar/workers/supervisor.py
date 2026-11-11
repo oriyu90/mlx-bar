@@ -428,7 +428,16 @@ class WorkerSupervisor:
             log.close()
         self.engine = engine
         self._write_manifest(engine, self.process.pid)
-        for _ in range(50):
+        # 5 s by default. A worker started from a cold runtime (a freshly
+        # installed slot, or a copied one in a test home) can take longer to
+        # import its runtime, so the budget is overridable -- the coordinator
+        # itself never sets this.
+        try:
+            startup_seconds = max(1.0, float(os.environ.get(
+                "MLXBAR_WORKER_STARTUP_SECONDS", "5")))
+        except (TypeError, ValueError):
+            startup_seconds = 5.0
+        for _ in range(int(startup_seconds * 10)):
             if self.process.returncode is not None:
                 detail = self._read_log_tail(log_path)
                 self._record_crash("worker exited during startup")

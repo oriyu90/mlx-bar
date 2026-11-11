@@ -46,6 +46,7 @@ class FakeGenerator:
     def __init__(self, model, *, completion_batch_size=32, prefill_batch_size=8,
                  prefill_step_size=2048, **_):
         self.model = model
+        self._prompt_cache_factory = lambda: [_MergeableLayer()]
         self.completion_batch_size = completion_batch_size
         self.prefill_batch_size = prefill_batch_size
         self.prefill_step_size = prefill_step_size
@@ -95,9 +96,13 @@ class FakeGenerator:
                     reason = "length"
                 elif sequence["emitted"] >= len(sequence["script"]):
                     reason = "stop"
+                # Like the real runtime: a finishing response carries the
+                # sequence's cache and its full token list.
                 generation_responses.append(SimpleNamespace(
                     uid=uid, token=token, logprobs=None, finish_reason=reason,
-                    prompt_cache=None, all_tokens=None))
+                    prompt_cache=(self._prompt_cache_factory() if reason else None),
+                    all_tokens=(list(sequence["prompt"]) + sequence["script"][:sequence["emitted"]]
+                                if reason else None)))
                 if reason is not None:
                     self.sequences.pop(uid, None)
         return prompt_responses, generation_responses
@@ -245,6 +250,94 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(generator.closed)
 
 
+class FakePromptCache:
+    """The subset of PromptCacheStore the scheduler uses."""
+
+    def __init__(self, hit=None, tier="memory"):
+        self.hit = hit
+        self.tier = tier
+        self.fetched: list[list[int]] = []
+        self.stored: list[tuple[list[int], int]] = []
+
+    def fetch(self, model, tokens):
+        self.fetched.append(list(tokens))
+        if self.hit is None:
+            return None, list(tokens), "cold"
+        reused, cache = self.hit
+        return cache, list(tokens)[reused:], self.tier
+
+    def store(self, model, tokens, cache, prompt_length=None):
+        self.stored.append((list(tokens), prompt_length))
+
+
+class _MergeableLayer:
+    def merge(self, *args):
+        return self
+
+
+class SchedulerPromptCacheTests(unittest.TestCase):
+    def make(self, prompt_cache) -> BatchScheduler:
+        FakeGenerator.instances = []
+        FakeGenerator.scripts = {}
+        FakeGenerator.fail_at_step = None
+        FakeGenerator.step_delay = 0.0
+        scheduler = BatchScheduler(
+            object(), max_sequences=2, prefill_batch_size=2, prefill_step_size=1024,
+            make_prompt_cache=lambda model: [_MergeableLayer()],
+            batch_generator_factory=FakeGenerator, prompt_cache=prompt_cache)
+        self.assertTrue(scheduler.probe())
+        scheduler.start()
+        self.addCleanup(scheduler.shutdown)
+        return scheduler
+
+    def test_a_proven_prefix_is_reused(self):
+        store = FakePromptCache(hit=(2, [_MergeableLayer()]))
+        scheduler = self.make(store)
+        request = BatchRequest("r1", [7, 8, 9], 8)
+        scheduler.submit(request)
+        self.assertEqual(drain(request)[-1]["type"], "finished")
+        self.assertEqual(FakeGenerator.instances[0].sequences, {})
+        self.assertEqual(request.reused_tokens, 2)
+        self.assertEqual(request.cache_tier, "memory")
+
+    def test_a_finished_sequence_is_stored(self):
+        store = FakePromptCache()
+        scheduler = self.make(store)
+        request = BatchRequest("r1", [7, 8], 8)
+        scheduler.submit(request)
+        drain(request)
+        self.assertEqual(len(store.stored), 1)
+        tokens, prompt_length = store.stored[0]
+        self.assertEqual(prompt_length, 2)
+        self.assertEqual(tokens[:2], [7, 8])
+
+    def test_a_hit_that_is_not_a_prefix_is_ignored(self):
+        # 3 tokens "reused" but the remaining tokens are not this prompt's
+        # suffix: the request must be prefilled cold, not continued wrongly.
+        store = FakePromptCache(hit=(1, [_MergeableLayer()]))
+        store.fetch = lambda model, tokens: ([_MergeableLayer()], [999, 999], "memory")
+        scheduler = self.make(store)
+        request = BatchRequest("r1", [7, 8], 8)
+        scheduler.submit(request)
+        drain(request)
+        self.assertEqual(request.reused_tokens, 0)
+        self.assertEqual(request.cache_tier, "cold")
+
+    def test_a_store_failure_never_fails_the_request(self):
+        class Broken(FakePromptCache):
+            def fetch(self, model, tokens):
+                raise RuntimeError("cache is corrupt")
+
+            def store(self, *args, **kwargs):
+                raise RuntimeError("disk full")
+
+        scheduler = self.make(Broken())
+        request = BatchRequest("r1", [7, 8], 8)
+        scheduler.submit(request)
+        self.assertEqual(drain(request)[-1]["type"], "finished")
+        self.assertEqual(len(request.generated), 2)
+
+
 class _BatchCapableAdapter:
     """The subset of the mlx-lm adapter the worker's stream selector uses."""
 
@@ -285,6 +378,18 @@ class WorkerSelectionTests(unittest.TestCase):
         events = list(select_stream(adapter, "r1", {}))
         self.assertEqual(events[0]["text"], "batched")
         self.assertEqual(adapter.single_calls, 0)
+
+    def test_batched_signature_matches_the_selector(self):
+        """The selector calls `stream_batched(request_id, params)`.
+
+        Pinned because the first live run failed with "missing 1 required
+        positional argument: 'prompt'" -- the adapter had an extra parameter
+        that no unit test exercised.
+        """
+        import inspect
+        from mlx_lm_worker.adapter import MLXLMAdapter
+        signature = inspect.signature(MLXLMAdapter.stream_batched)
+        self.assertEqual(list(signature.parameters), ["self", "request_id", "params"])
 
     def test_declined_request_restarts_on_the_single_path(self):
         from common.server import select_stream
@@ -327,9 +432,12 @@ class AdapterEligibilityTests(unittest.TestCase):
     def test_kv_quantization_is_refused(self):
         self.assertEqual(self.adapter(kv_bits=8)._batch_eligible({}), (False, "kv_quantization"))
 
-    def test_prompt_cache_is_refused(self):
-        self.assertEqual(self.adapter(prompt_cache=object())._batch_eligible({}),
-                         (False, "prompt_cache"))
+    def test_prompt_cache_is_allowed(self):
+        # v5.1.0: the scheduler reuses a stored prefix per sequence and stores
+        # the finished one back, so the prompt cache no longer forces the
+        # single path.
+        eligible, reason = self.adapter(prompt_cache=object())._batch_eligible({})
+        self.assertTrue(eligible, reason)
 
     def test_images_are_refused(self):
         self.assertEqual(self.adapter()._batch_eligible({"images": ["/tmp/a.png"]}),

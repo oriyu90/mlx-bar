@@ -1670,7 +1670,10 @@ final class MenuBarViewModel: ObservableObject {
     /// install may have produced an `omlx` CLI, a start may have made the
     /// server answer.
     private func monitorOMLXSetupJob(_ action: String, initial: [String: Any]) async {
-        guard let id = initial["id"] as? String else { return }
+        // Only the presence of an id matters here: `waitForJob` polls the job
+        // it was given. (Binding it to a name produced an unused-variable
+        // warning on every build.)
+        guard initial["id"] is String else { return }
         defer {
             omlxBusySetupActions.remove(action)
         }

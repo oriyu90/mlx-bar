@@ -313,6 +313,10 @@ class MLXLMAdapter(BaseAdapter):
             self._batch_capable = False
             self._batch_reason = f"runtime_without_batch_generator:{type(exc).__name__}"
             return
+        # A prompt cache left over from a previous model must never serve this
+        # one, so the store is only handed over when it belongs to the same
+        # loaded path.
+        prompt_cache = self.prompt_cache if self.prompt_cache is not None else None
         scheduler = BatchScheduler(
             self.model,
             max_sequences=settings["maxSequences"],
@@ -321,6 +325,7 @@ class MLXLMAdapter(BaseAdapter):
             make_prompt_cache=make_prompt_cache,
             batch_generator_factory=BatchGenerator,
             tokenizer=self.processor,
+            prompt_cache=prompt_cache,
         )
         if scheduler.probe():
             self.batch_scheduler = scheduler
@@ -383,11 +388,10 @@ class MLXLMAdapter(BaseAdapter):
             return False, "seed"
         if self.kv_bits is not None:
             return False, "kv_quantization"
-        if self.prompt_cache is not None:
-            # v5.1.0 keeps prompt-cache reuse on the single path. Sharing a
-            # stored prefix between batched sequences is a per-sequence cache
-            # question the runtime does not answer yet.
-            return False, "prompt_cache"
+        # Prompt-cache reuse is supported on the batched path (v5.1.0): the
+        # scheduler asks the store for a proven prefix per sequence and hands
+        # the finished sequence's cache back, so a batched conversation is not
+        # re-prefilled from scratch on every turn.
         adaptive = params.get("adaptiveMemory") or {}
         if isinstance(adaptive, dict) and adaptive.get("enabled"):
             return False, "adaptive_memory"
@@ -427,8 +431,13 @@ class MLXLMAdapter(BaseAdapter):
             return None
         return StopSequences([[token] for token in stop_tokens])
 
-    def stream_batched(self, request_id: str, params: dict, prompt: str):
+    def stream_batched(self, request_id: str, params: dict):
         """Yield worker events for one request served by the batch scheduler.
+
+        The signature is the one the worker's stream selector calls:
+        ``stream_batched(request_id, params)``. The rendered prompt is produced
+        here with the same template path ``stream()`` uses, so a batched
+        request is rendered exactly like a single one.
 
         The event vocabulary is exactly the one ``stream()`` emits (``delta``,
         ``token_progress``, ``usage``, ``metrics``, ``completed``), so the
@@ -439,6 +448,12 @@ class MLXLMAdapter(BaseAdapter):
         scheduler = getattr(self, "batch_scheduler", None)
         if scheduler is None:
             yield {"type": "batch_fallback", "reason": "not_capable"}
+            return
+        try:
+            prompt = self._render_prompt(params)
+        except Exception as exc:  # noqa: BLE001 - the single path reports it
+            LOGGER.warning("Batched request could not be rendered: %s", exc)
+            yield {"type": "batch_fallback", "reason": "render_failed"}
             return
         try:
             prompt_tokens = self._encode(prompt)
@@ -528,6 +543,16 @@ class MLXLMAdapter(BaseAdapter):
                 elif kind == "error":
                     yield event
                     return
+            if finish_reason == "error" and generated == 0:
+                # Nothing was produced and the scheduler reported a failure:
+                # the single path is still a valid first attempt (the batched
+                # path never emitted a token), so let the worker restart the
+                # request there instead of failing it. Once a token exists the
+                # error is reported as-is -- no silent regeneration.
+                LOGGER.warning("Continuous batching failed before any output for %s; "
+                               "retrying on the single-generation path", request_id)
+                yield {"type": "batch_fallback", "reason": "batch_error_before_output"}
+                return
             trailing = detokenizer.flush()
             if trailing:
                 yield {"type": "delta", "text": trailing,

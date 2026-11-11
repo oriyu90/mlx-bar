@@ -12,6 +12,7 @@ import resource
 import subprocess
 import threading
 import time
+import traceback
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -901,6 +902,9 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 # Japanese `message` (shown by the GUI) and keep the raw text in
                 # `detail` for the coordinator log.
                 text = str(exc)
+                LOGGER.error("Generation failed for %s: %s: %s\n%s", request_id,
+                             type(exc).__name__, text,
+                             "".join(traceback.format_exception(exc))[-4000:])
                 lowered = text.lower()
                 if "out of memory" in lowered or "insufficient memory" in lowered or (
                         "metal" in lowered and "memory" in lowered):

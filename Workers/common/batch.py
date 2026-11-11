@@ -38,7 +38,9 @@ rule the rest of the worker follows for runtime internals.
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -79,6 +81,10 @@ class BatchRequest:
     prompt_tokens_processed: int = 0
     started_at: float = 0.0
     first_token_at: float | None = None
+    #: Prompt-cache reuse for this sequence: the tier that served it and how
+    #: many of its prompt tokens came from the store.
+    cache_tier: str = "cold"
+    reused_tokens: int = 0
     finished_at: float | None = None
     finish_reason: str | None = None
 
@@ -120,12 +126,18 @@ class BatchScheduler:
 
     def __init__(self, model, *, max_sequences: int = 2, prefill_batch_size: int = 2,
                  prefill_step_size: int = 2048, make_prompt_cache=None,
-                 batch_generator_factory=None, tokenizer=None):
+                 batch_generator_factory=None, tokenizer=None,
+                 prompt_cache=None):
         self.model = model
         self.max_sequences = max(1, int(max_sequences))
         self.prefill_batch_size = max(1, min(self.max_sequences, int(prefill_batch_size)))
         self.prefill_step_size = max(256, int(prefill_step_size))
         self.tokenizer = tokenizer
+        # v5.1.0: the worker's own prompt-cache store. A batched sequence gets
+        # the longest stored prefix for its prompt and its cache is handed back
+        # when it finishes, so continuous batching does not turn into "every
+        # request re-prefills the whole conversation".
+        self.prompt_cache = prompt_cache
         self._make_prompt_cache = make_prompt_cache
         self._factory = batch_generator_factory
         self._generator = None
@@ -262,7 +274,18 @@ class BatchScheduler:
                 prompt_responses, generation_responses = self._generator.next()
             except Exception as exc:  # noqa: BLE001 - whole batch fails together
                 self.errors += 1
-                LOGGER.exception("Batched generation failed")
+                LOGGER.exception("Batched generation failed: %s: %s",
+                                 type(exc).__name__, exc)
+                # Persisted for diagnosis: the worker's own log is not always
+                # reachable (the coordinator owns it), and this is the one
+                # failure a user can report without a debugger.
+                try:
+                    import traceback
+                    with open(os.path.join(tempfile.gettempdir(),
+                                           "mlxbar-batch-error.log"), "a") as handle:
+                        traceback.print_exc(file=handle)
+                except Exception:  # noqa: BLE001
+                    pass
                 self._fail_all({"type": "error", "code": "GENERATION_FAILED",
                                 "message": "生成に失敗しました（ランタイムエラー）",
                                 "detail": str(exc)[-1000:], "retryable": False})
@@ -272,7 +295,8 @@ class BatchScheduler:
             self._emit_prompt(prompt_responses)
             self._emit_generation(generation_responses)
         self._fail_all({"type": "error", "code": "GENERATION_FAILED",
-                        "message": "ワーカーが停止しました", "retryable": True})
+                        "message": "連続バッチ処理を開始できませんでした",
+                        "detail": "batch_generator_unavailable", "retryable": False})
         self._idle.set()
 
     def _drain_inbox(self) -> None:
@@ -298,15 +322,8 @@ class BatchScheduler:
                 self._finish(request, "cancelled", emit_completed=True)
                 continue
             try:
-                (uid,) = self._generator.insert(
-                    [request.prompt_tokens],
-                    max_tokens=[request.max_tokens],
-                    samplers=[request.sampler] if request.sampler is not None else None,
-                    logits_processors=([request.logits_processors]
-                                       if request.logits_processors is not None else None),
-                    stop_sequences=([request.stop_sequences]
-                                    if request.stop_sequences is not None else None),
-                )
+                tokens, caches = self._prepare_prompt(request)
+                uid = self._insert(tokens, caches, request)
             except Exception as exc:  # noqa: BLE001 - one bad request, not the batch
                 LOGGER.warning("Could not insert a batched request: %s", exc)
                 self._put(request, {"type": "error", "code": "GENERATION_FAILED",
@@ -319,6 +336,45 @@ class BatchScheduler:
                 self._active[uid] = request
             self.batch_peak = max(self.batch_peak, len(self._active))
             room -= 1
+
+    def _insert(self, tokens: list[int], caches, request: BatchRequest) -> int:
+        """Insert one sequence, retrying once without a reused cache.
+
+        A cache that came from the prompt store is an optimisation: if the
+        runtime refuses it (a shape or dtype it cannot continue from), the
+        request is re-inserted from a cold prefill. Nothing has been generated
+        yet, so this cannot duplicate output -- it is the same rule the single
+        path applies to a restored cache.
+        """
+        try:
+            (uid,) = self._generator.insert(
+                [tokens],
+                max_tokens=[request.max_tokens],
+                caches=[caches],
+                samplers=[request.sampler] if request.sampler is not None else None,
+                logits_processors=([request.logits_processors]
+                                   if request.logits_processors is not None else None),
+                stop_sequences=([request.stop_sequences]
+                                if request.stop_sequences is not None else None),
+            )
+            return uid
+        except Exception as exc:  # noqa: BLE001 - retried cold below
+            if caches is None:
+                raise
+            LOGGER.warning("Batched insert rejected a reused prompt cache (%s: %s); "
+                           "prefilling cold instead", type(exc).__name__, exc)
+            request.cache_tier = "cold"
+            request.reused_tokens = 0
+            (uid,) = self._generator.insert(
+                [request.prompt_tokens],
+                max_tokens=[request.max_tokens],
+                samplers=[request.sampler] if request.sampler is not None else None,
+                logits_processors=([request.logits_processors]
+                                   if request.logits_processors is not None else None),
+                stop_sequences=([request.stop_sequences]
+                                if request.stop_sequences is not None else None),
+            )
+            return uid
 
     def _apply_cancellations(self) -> None:
         with self._lock:
@@ -369,9 +425,17 @@ class BatchScheduler:
                 if request.first_token_at is None:
                     request.first_token_at = time.monotonic()
                 self._put(request, {"type": "token", "token": token})
+            elif is_token and finish_reason is None:
+                # A token the runtime produced but that is not part of the
+                # answer (it completes a stop sequence). It is dropped, but the
+                # request still made progress: report a heartbeat so a client
+                # waiting on a long sequence is not mistaken for a stall.
+                self._put(request, {"type": "token_progress",
+                                    "generated_tokens": len(request.generated)})
             if finish_reason is not None:
                 with self._lock:
                     self._active.pop(uid, None)
+                self._remember_prompt(request, response, finish_reason)
                 self._put(request, {"type": "finished", "finish_reason": finish_reason,
                                     "generated_tokens": len(request.generated)})
                 self._finish(request, finish_reason, emit_completed=False)
@@ -383,6 +447,101 @@ class BatchScheduler:
         if emit_completed:
             self._put(request, {"type": "finished", "finish_reason": reason,
                                 "generated_tokens": len(request.generated)})
+
+    def _prepare_prompt(self, request: BatchRequest) -> tuple[list[int], list | None]:
+        """The tokens to prefill and, when a prefix was reused, its cache.
+
+        Reuse is an optimisation with a hard rule: a cache is only handed to
+        the runtime when the store says it is a proven prefix of this prompt.
+        Any failure (no store, no match, a runtime that rejects the cache)
+        falls back to prefilling the whole prompt -- never to wrong output.
+        """
+        store = self.prompt_cache
+        if store is None:
+            return request.prompt_tokens, None
+        # The store is shared with the single-generation path, whose caches
+        # are plain per-layer objects. The batched generator merges the caches
+        # of the sequences it holds, which needs the batchable cache type, so a
+        # reused cache is rebuilt as a batchable one carrying the same state.
+        # Without this, a reused hit silently produced no tokens at all.
+        try:
+            cache, remaining, tier = store.fetch(self.model, request.prompt_tokens)
+        except Exception:  # noqa: BLE001 - reuse must never fail a request
+            LOGGER.debug("Prompt cache fetch failed for a batched request", exc_info=True)
+            return request.prompt_tokens, None
+        if cache is None or not remaining:
+            return request.prompt_tokens, None
+        # A reused cache is only safe if it is a *prefix* of this prompt: the
+        # runtime continues from it and never re-reads those tokens. The store
+        # reports the tokens still to process; anything but a strict suffix of
+        # this prompt (or a reuse of every token, which leaves nothing to
+        # prefill) is treated as a miss rather than guessed at.
+        reused = len(request.prompt_tokens) - len(remaining)
+        if reused <= 0 or list(request.prompt_tokens[reused:]) != list(remaining):
+            LOGGER.warning("Ignoring a prompt-cache hit that is not a prefix of the "
+                           "request (reused=%d, remaining=%d, prompt=%d)",
+                           reused, len(remaining), len(request.prompt_tokens))
+            return request.prompt_tokens, None
+        batchable = self._as_batchable(cache)
+        if batchable is None:
+            return request.prompt_tokens, None
+        request.cache_tier = tier
+        request.reused_tokens = reused
+        return list(remaining), batchable
+
+    def _as_batchable(self, cache) -> list | None:
+        """Rebuild a stored cache as a batchable one, or None when impossible.
+
+        ``BatchGenerator`` merges the caches of the sequences in its batch each
+        step, so every cache it holds must be of the batchable type. The store
+        hands out the single-generation type; the state (keys, values, offset,
+        metadata) is copied over, and anything unexpected means "no reuse".
+        """
+        try:
+            layers = list(cache)
+        except TypeError:
+            return None
+        if not layers:
+            return None
+        if all(hasattr(layer, "merge") for layer in layers):
+            return layers
+        try:
+            from mlx_lm.models.cache import make_prompt_cache
+            target = make_prompt_cache(self.model)
+        except Exception:  # noqa: BLE001 - no batchable cache type, no reuse
+            return None
+        if len(target) != len(layers):
+            return None
+        for layer, source in zip(target, layers):
+            if type(layer) is type(source):
+                continue
+            for name, value in vars(source).items():
+                try:
+                    setattr(layer, name, value)
+                except Exception:  # noqa: BLE001
+                    return None
+        if not all(hasattr(layer, "merge") for layer in target):
+            return None
+        return target
+
+    def _remember_prompt(self, request: BatchRequest, response, finish_reason: str) -> None:
+        """Store a finished sequence's cache for the next request (best effort).
+
+        Only a sequence that ended on its own terms is stored: a cancelled or
+        failed one may have advanced its cache past what it can label.
+        """
+        store = self.prompt_cache
+        if store is None or finish_reason not in {"stop", "length"}:
+            return
+        cache = getattr(response, "prompt_cache", None)
+        all_tokens = getattr(response, "all_tokens", None)
+        if cache is None or not all_tokens:
+            return
+        try:
+            store.store(self.model, list(all_tokens), list(cache),
+                        prompt_length=len(request.prompt_tokens))
+        except Exception:  # noqa: BLE001 - storing is optional
+            LOGGER.debug("Prompt cache store failed for a batched request", exc_info=True)
 
     def _put(self, request: BatchRequest, event: dict) -> None:
         if request.events.qsize() >= MAX_QUEUED_EVENTS:
