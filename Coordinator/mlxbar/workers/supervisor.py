@@ -195,6 +195,40 @@ class WorkerSupervisor:
         env["MLXBAR_KV_QUANT_GROUP_SIZE"] = "64"
         env["MLXBAR_KV_QUANT_START"] = "0"
 
+    def _configure_batch_environment(self, env: dict[str, str], engine: str) -> None:
+        """v5.1.0: hand the continuous-batching limits to the worker.
+
+        The pool sets these four variables on its own environment from the
+        model's ``models.pool.profiles[].continuousBatching`` entry before it
+        starts a worker. Only the mlx-lm worker can batch (its runtime ships
+        ``BatchGenerator``); every other engine is left with batching off, so
+        the worker never even probes. Absent variables mean "off", which is the
+        settings default and keeps a worker started outside the pool identical
+        to v5.0.2.
+        """
+        def _int(name: str, default: int, low: int, high: int) -> int:
+            try:
+                value = int(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return max(low, min(high, value))
+
+        enabled = (engine == "mlx-lm"
+                   and str(os.environ.get("MLXBAR_BATCH_ENABLED", "0")).strip().lower()
+                   in {"1", "true", "yes", "on"})
+        if not enabled:
+            for name in ("MLXBAR_BATCH_ENABLED", "MLXBAR_BATCH_MAX_SEQUENCES",
+                         "MLXBAR_BATCH_PREFILL_BATCH_SIZE", "MLXBAR_BATCH_PREFILL_STEP_SIZE"):
+                env.pop(name, None)
+            return
+        env["MLXBAR_BATCH_ENABLED"] = "1"
+        env["MLXBAR_BATCH_MAX_SEQUENCES"] = str(
+            _int("MLXBAR_BATCH_MAX_SEQUENCES", 2, 1, 8))
+        env["MLXBAR_BATCH_PREFILL_BATCH_SIZE"] = str(
+            _int("MLXBAR_BATCH_PREFILL_BATCH_SIZE", 2, 1, 8))
+        env["MLXBAR_BATCH_PREFILL_STEP_SIZE"] = str(
+            _int("MLXBAR_BATCH_PREFILL_STEP_SIZE", 2048, 256, 32768))
+
     def _configure_paged_cache_environment(self, env: dict[str, str], engine: str) -> None:
         paged = ((self.settings.data.get("experimental", {}) or {})
                  .get("pagedKVCache", {}) or {})
@@ -345,6 +379,7 @@ class WorkerSupervisor:
             env.pop("MLXBAR_BUNDLED_LOADERS", None)
         self._configure_paged_cache_environment(env, engine)
         self._configure_kv_quant_environment(env, engine)
+        self._configure_batch_environment(env, engine)
         # Stable block hashes are required for reuse across Python processes.
         # PromptCacheState owns the RAM tier, so do not duplicate exact hybrid
         # snapshots inside APC's separate in-memory LRU.
@@ -538,7 +573,12 @@ class WorkerSupervisor:
         self._metadata_cache[key] = value
         return value
 
-    async def load(self, model: dict, engine: str | None = None, explicit: bool | None = None) -> dict:
+    async def load(self, model: dict, engine: str | None = None, explicit: bool | None = None,
+                   **kwargs) -> dict:
+        # v5.1.0: the pool passes `origin` (why this load happened) so it can
+        # decide pinning; the single-model supervisor has no pin concept, so
+        # the extra keyword is accepted and ignored rather than raising when
+        # the pool is disabled.
         # v2.10.0: `explicit` records the difference between "the caller named
         # this engine" (management body engine / CLI --engine / a resolved
         # replica or reload) and "use the catalog engine, auto-resolved"

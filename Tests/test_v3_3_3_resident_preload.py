@@ -53,7 +53,8 @@ class _FakeWorkers:
     def __init__(self):
         self.loaded = []
 
-    async def load(self, model, engine=None, explicit=None, pin=True):
+    async def load(self, model, engine=None, explicit=None, pin=True, **kwargs):
+        # v5.1.0: the preload passes `origin=`; this fake only records loads.
         self.loaded.append(model["id"])
         return {"id": model["id"]}
 

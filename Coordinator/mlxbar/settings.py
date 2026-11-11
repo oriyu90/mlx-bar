@@ -687,6 +687,27 @@ class SettingsStore:
             if (isinstance(maximum, bool) or not isinstance(maximum, (int, float))
                     or not 1 <= float(maximum) <= 512):
                 raise ValueError("models.pool profile maxMemoryGB must be between 1 and 512")
+            # v5.1.0: continuous batching is opt-in per model. A malformed entry
+            # is rejected at write time (so the GUI sees the error) rather than
+            # silently ignored at request time.
+            batching = profile.get("continuousBatching")
+            if batching is not None:
+                if not isinstance(batching, dict):
+                    raise ValueError("models.pool profile continuousBatching must be an object")
+                for key in ("enabled", "fallback"):
+                    if key in batching and not isinstance(batching[key], bool):
+                        raise ValueError(
+                            f"models.pool profile continuousBatching.{key} must be boolean")
+                ranges = {"maxSequences": (1, 8), "prefillBatchSize": (1, 8),
+                          "prefillStepSize": (256, 32768)}
+                for key, (low, high) in ranges.items():
+                    if key not in batching:
+                        continue
+                    value = batching[key]
+                    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                        raise ValueError(
+                            f"models.pool profile continuousBatching.{key} must be an integer "
+                            f"between {low} and {high}")
         omlx = data.get("models", {}).get("omlx", {})
         if not isinstance(omlx.get("enabled", False), bool):
             raise ValueError("models.omlx.enabled must be boolean")

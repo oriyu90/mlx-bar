@@ -1145,7 +1145,12 @@ async def _ensure_requested_model(request: Request, requested: str) -> dict:
             raise MLXBarError("ENGINE_BUSY", "別のモデルが応答中のため、モデルを切り替えられません", 429, True)
         load_for_api = getattr(state.workers, "load_for_api", None)
         result = await (load_for_api(model) if load_for_api else state.workers.load(model))
-        state.database.set_metadata_value("last_loaded_model_id", model["id"])
+        # v5.1.0: an API request must not turn into a persistent choice. The
+        # model it autoloaded is recorded separately (`last_api_model_id`) and
+        # is never what the next start restores -- `last_loaded_model_id` keeps
+        # its meaning ("the model the user last asked to keep"). Without this,
+        # one request could make a model come back on every restart.
+        state.database.set_metadata_value("last_api_model_id", model["id"])
         state.database.set_metadata_value("api_autoload_suspended", "0")
         _record_cache_capability(state, result)
         return result

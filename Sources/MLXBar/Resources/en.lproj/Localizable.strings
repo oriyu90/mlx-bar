@@ -665,3 +665,12 @@
 "LM Studio・oMLX では実行できません。" = "LM Studio and oMLX cannot run it.";
 "このモデルは同梱ローダー（Niwaki qwen4_exp）が必要です。設定→モデル→バンドル済みローダーを許可を有効にすると読み込めます" = "This model needs the bundled loader (Niwaki qwen4_exp). Enable Settings → Models → Bundled loaders to load it.";
 "Niwaki（Qwen3.8-Flash-Next qwen4_exp）など同梱ローダーが必要なモデルに使います。" = "Used for models that need a bundled loader, such as Niwaki (Qwen3.8-Flash-Next qwen4_exp).";
+
+/* v5.1.0 -- continuous batching (one loaded model, several sequences). Keys are the Japanese source literals used with LS(_:). */
+"連続バッチ処理（実験的）" = "Continuous batching (experimental)";
+"同時シーケンス数" = "Concurrent sequences";
+"単一生成で動作" = "single generation";
+"1つのモデルを1回だけロードしたまま、複数の要求を同時に生成します。モデルの複製（レプリカ）は作りません。既定は無効で、有効にすると2シーケンスから始まります。" = "Serves several requests at once from one loaded model, without duplicating the weights (no replicas). Off by default; when enabled it starts at two sequences.";
+"連続バッチ処理に対応しないモデル（ハイブリッド・再帰型キャッシュなど）や、seed指定・KVキャッシュ量子化・プロンプトキャッシュを使う要求は、自動的に従来の単一生成へ切り替わります。設定は次にモデルをロードしたときから反映されます。" = "Models that cannot batch (hybrid or recurrent caches, for example) and requests that use a seed, KV-cache quantization or the prompt cache fall back to single generation automatically. The setting takes effect the next time the model is loaded.";
+"レプリカ方式（モデルごとの並列数）とは別の機能です。レプリカはモデルを複製してメモリを増やしますが、連続バッチ処理は同じモデルを共有します。" = "This is separate from replicas (the per-model parallel count): replicas duplicate the model and its memory, while continuous batching shares one model.";
+"同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを1つ増やして並行し、余裕がなければ順番待ちになります。最大常駐モデル数は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません。連続バッチ処理を有効にしたモデルは、レプリカを増やさずに同じモデルで並行します。" = "Concurrent requests for the same model run in parallel on a free replica. If none is free and memory allows, one replica is added automatically; otherwise the request waits its turn. The maximum resident model count limits distinct models, not replicas of one model. A model with continuous batching enabled runs them in parallel on the same model without adding replicas.";

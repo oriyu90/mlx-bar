@@ -38,6 +38,26 @@ struct CatalogModel: Identifiable, Hashable {
 /// reports every one of them in `loadedModels`. The single `loadedModel` field
 /// stays the *primary* (most recently used) model for the existing header UI;
 /// this type backs the list of all residents.
+/// v5.1.0: `loadedModels[].continuousBatching`, decoded into a value type so
+/// `ResidentModel` can stay `Hashable`. Every field is additive on the
+/// coordinator side; a coordinator older than v5.1.0 simply omits the object.
+struct ContinuousBatchingStatus: Hashable {
+    let enabled: Bool
+    let capable: Bool
+    let maxSequences: Int
+    let activeSequences: Int
+    let fallbackReason: String?
+
+    init?(_ value: [String: Any]) {
+        guard let enabled = value["enabled"] as? Bool else { return nil }
+        self.enabled = enabled
+        capable = value["capable"] as? Bool ?? false
+        maxSequences = (value["maxSequences"] as? NSNumber)?.intValue ?? 1
+        activeSequences = (value["activeSequences"] as? NSNumber)?.intValue ?? 0
+        fallbackReason = value["fallbackReason"] as? String
+    }
+}
+
 struct ResidentModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -92,6 +112,15 @@ struct ResidentModel: Identifiable, Hashable {
     /// additive `warnings` in `loadedModels[]`). Empty when nothing is wrong;
     /// the menu row renders each one as an orange line.
     let warnings: [ModelWarning]
+    /// v5.1.0 continuous batching for this model (`loadedModels[].continuousBatching`).
+    /// Nil on coordinators older than v5.1.0, where the row shows nothing.
+    ///
+    /// Stored as the typed `ContinuousBatchingStatus` rather than the raw
+    /// dictionary: `ResidentModel` is `Hashable` (it feeds `ForEach`), and a
+    /// `[String: Any]` member cannot synthesise that conformance.
+    let continuousBatching: ContinuousBatchingStatus?
+    /// How many requests this worker is serving at once (`batchActiveSequences`).
+    let batchActiveSequences: Int
 
     init?(_ value: [String: Any]) {
         guard let id = value["id"] as? String else { return nil }
@@ -124,6 +153,9 @@ struct ResidentModel: Identifiable, Hashable {
         }
         resident = value["resident"] as? Bool ?? true
         warnings = ModelWarning.list(from: value)
+        continuousBatching = (value["continuousBatching"] as? [String: Any])
+            .flatMap(ContinuousBatchingStatus.init)
+        batchActiveSequences = (value["batchActiveSequences"] as? NSNumber)?.intValue ?? 0
         let rate = (value["generationTokensPerSecond"] as? NSNumber)?.doubleValue
         generationTokensPerSecond = (rate ?? 0) > 0 ? rate : nil
     }
@@ -191,6 +223,27 @@ struct ResidentModel: Identifiable, Hashable {
     func idleCountdownText(japanese: Bool) -> String? {
         guard isIdleManaged, let remaining = idleSecondsRemaining, remaining > 0 else { return nil }
         return japanese ? "あと\(remaining)秒で解放" : "Unloads in \(remaining) sec"
+    }
+
+    /// v5.1.0: a short continuous-batching line for the row, or nil.
+    ///
+    /// Only shown while the model is actually serving more than one request at
+    /// once, or when batching is enabled but the worker cannot batch: a line
+    /// that said "1/4 sequences" on every idle row would be noise.
+    func batchStatusText(japanese: Bool) -> String? {
+        guard let batching = continuousBatching else { return nil }
+        let enabled = batching.enabled
+        let capable = batching.capable
+        let maximum = batching.maxSequences
+        if enabled && !capable {
+            return japanese
+                ? "連続バッチ非対応のため単一生成で動作します"
+                : "Continuous batching unavailable; using single generation"
+        }
+        guard enabled, capable, batchActiveSequences > 1 else { return nil }
+        return japanese
+            ? "連続バッチ: \(batchActiveSequences)/\(maximum) 並列"
+            : "Continuous batching: \(batchActiveSequences)/\(maximum) in parallel"
     }
 }
 
@@ -2876,6 +2929,48 @@ final class MenuBarViewModel: ObservableObject {
             _ = try await self.json(
                 "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
                 ["keepLoaded": true, "replicas": replicas])
+            await self.refreshSettings()
+        }
+    }
+
+    /// v5.1.0: turn continuous batching on/off for one model.
+    ///
+    /// Only the `continuousBatching` object is sent, and the server merges it
+    /// per field, so this can never drop another model's residency settings or
+    /// another field of this model's batching settings. The change takes
+    /// effect for the next request after the model is (re)loaded, because the
+    /// worker decides batchability from the model it has in memory.
+    func setContinuousBatching(_ modelId: String, enabled: Bool) async {
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
+        await perform {
+            _ = try await self.json(
+                "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
+                ["continuousBatching": ["enabled": enabled]])
+            await self.refreshSettings()
+            await self.refreshStatus()
+        }
+    }
+
+    /// v5.1.0: the sequence ceiling for one model's continuous batching.
+    func setContinuousBatchingSequences(_ modelId: String, sequences: Int) async {
+        guard 1...8 ~= sequences else {
+            errorMessage = ui("Concurrent sequences must be between 1 and 8",
+                              "同時シーケンス数は1〜8で指定してください")
+            return
+        }
+        guard settingsLoaded else {
+            errorMessage = ui("Loading settings. Try again in a moment.",
+                              "設定を読み込み中です。少し待ってからもう一度お試しください")
+            return
+        }
+        await perform {
+            _ = try await self.json(
+                "PUT", "/api/v1/settings/models/pool/profiles/\(self.pathComponent(modelId))",
+                ["continuousBatching": ["maxSequences": sequences]])
             await self.refreshSettings()
         }
     }

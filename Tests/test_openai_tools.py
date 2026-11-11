@@ -468,7 +468,12 @@ def test_api_request_restores_requested_model_after_restart():
         assert response.json()["choices"][0]["message"]["content"] == "ok"
         assert response.json()["usage"] == {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13}
         assert worker.load_calls == 1
-        assert database.metadata_value("last_loaded_model_id") == "laguna-id"
+        # v5.1.0: an API request no longer rewrites the "model to restore at
+        # the next start" memory -- that made one request persist a model
+        # across restarts. The autoload is recorded separately, and the
+        # restore key stays untouched.
+        assert database.metadata_value("last_api_model_id") == "laguna-id"
+        assert database.metadata_value("last_loaded_model_id") is None
 
         second = client.post("/v1/chat/completions", json={
             "model": "Laguna-S-2.1-oQ2e", "messages": [{"role": "user", "content": "again"}],

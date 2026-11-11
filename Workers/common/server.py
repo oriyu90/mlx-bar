@@ -428,6 +428,52 @@ def _orphan_limit_seconds(params: dict) -> float:
     return value
 
 
+def select_stream(adapter: BaseAdapter, request_id: str, params: dict):
+    """Choose the batched or the single-generation iterator for one request.
+
+    v5.1.0: continuous batching is an optimisation layered *under* the existing
+    event vocabulary, so everything above this point (tool splitter, stop
+    filter, heartbeats, memory guard, cancellation) is shared by both paths and
+    behaves identically. Two rules keep the choice safe:
+
+    * the adapter opts in explicitly (``stream_batched`` + ``batch_status``),
+      and only the mlx-lm worker implements it;
+    * if the batched path decides it cannot serve this request (seed, KV
+      quantization, an image, a runtime without ``BatchGenerator`` ...), it
+      yields ``batch_fallback`` *before* producing any output, and the single
+      path starts from scratch. Nothing has been sent to the client yet, so
+      this is not a silent regeneration -- it is the first attempt.
+    """
+    batched = getattr(adapter, "stream_batched", None)
+    if not callable(batched):
+        return adapter.stream(request_id, params)
+    try:
+        status = adapter.batch_status()
+    except Exception:  # noqa: BLE001 - a broken probe must not fail a request
+        LOGGER.exception("Continuous batching status probe failed; using single generation")
+        return adapter.stream(request_id, params)
+    if not status.get("capable"):
+        return adapter.stream(request_id, params)
+    return _with_batch_fallback(adapter, request_id, params, batched)
+
+
+def _with_batch_fallback(adapter: BaseAdapter, request_id: str, params: dict, batched):
+    """Run the batched stream, restarting on the single path if it declines.
+
+    The restart is allowed only while nothing has been yielded, which is what
+    ``batch_fallback`` guarantees: it is emitted before the first token. After
+    any real event the batched path is authoritative, and an error is reported
+    as an error rather than retried.
+    """
+    for event in batched(request_id, params):
+        if event.get("type") == "batch_fallback":
+            LOGGER.info("Continuous batching declined request %s (%s); "
+                        "using single generation", request_id, event.get("reason"))
+            yield from adapter.stream(request_id, params)
+            return
+        yield event
+
+
 def create_app(adapter: BaseAdapter) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None)
     # MLX keeps GPU stream state per thread.  Loading on asyncio.to_thread()
@@ -648,7 +694,7 @@ def create_app(adapter: BaseAdapter) -> FastAPI:
                 first_delta_at = None
                 last_progress = started
                 prefill_estimate = None
-                iterator = adapter.stream(request_id, params)
+                iterator = select_stream(adapter, request_id, params)
                 # v2.8.0: a generation that has outlived every plausible client
                 # is an orphan, not a long answer. The coordinator's
                 # `tokenIdleTimeoutSeconds` only catches a worker that went

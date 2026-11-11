@@ -321,6 +321,11 @@ struct MenuBarView: View {
             }
             Text(residentDetail(resident)).font(.caption2).foregroundStyle(.secondary)
                 .padding(.leading, isVirtualLoadingRow ? 0 : 18)
+            // v5.1.0: continuous batching, only when it is doing something.
+            if let batch = resident.batchStatusText(japanese: model.guiLanguage == "ja") {
+                Text(batch).font(.caption2).foregroundStyle(.secondary)
+                    .padding(.leading, isVirtualLoadingRow ? 0 : 18)
+            }
             // Per-row model-state warnings (A2). Without this line a warning
             // on a non-primary resident only exists in `loadedModels[]`, so
             // loading a second model made the first one's warning disappear

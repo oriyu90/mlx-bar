@@ -70,6 +70,12 @@ PRESSURE_REFUSE_LEVEL = 4
 PRESSURE_WARN_LEVEL = 2
 
 
+#: Load origins that count as an explicit "keep this model" request. Anything
+#: else (an API request, the reaper, an on-demand replica) is transient and
+#: must stay subject to the idle TTL.
+EXPLICIT_LOAD_ORIGINS = frozenset({"manual", "preload"})
+
+
 class _LaneAbandoned(Exception):
     """Internal: an in-flight lane acquisition was abandoned by its parent.
 
@@ -117,6 +123,11 @@ class PoolSlot:
     gen_permit: bool = False
     gen_recoveries: int = 0
     gen_queued: dict[str, QueuedRequest] = field(default_factory=dict)
+    # v5.1.0 continuous batching: requests handed to this slot's worker at the
+    # same time. Empty for every non-batching slot; a batched lane writes only
+    # this set plus the pool-wide permit (see `_acquire_batched_lane`), so the
+    # single-generation bookkeeping above keeps its exact meaning.
+    gen_active: set[str] = field(default_factory=set)
     # Orphan recovery needs two observations before it frees a lane: a request
     # that has already acquired the lane but not yet started its worker call
     # looks exactly like a vanished owner for the fraction of a second between
@@ -920,9 +931,27 @@ class ModelPoolSupervisor:
         else:
             self._model_crashes.pop(model_id, None)
 
-    async def load(self, model: dict, engine: str | None = None, *, pin: bool = True) -> dict:
+    async def load(self, model: dict, engine: str | None = None, *, pin: bool = True,
+                   origin: str | None = None) -> dict:
+        """Ensure ``model`` is resident.
+
+        ``pin`` has always meant "this load is an explicit keep request" and is
+        what makes a model session-pinned (never idle-unloaded). v5.1.0 adds
+        ``origin`` so the *reason* travels with it: ``"manual"`` (GUI/CLI),
+        ``"preload"`` (startup restore), ``"api"`` (autoload on an API request),
+        ``"reaper"`` (background replica top-up) or ``"expand"`` (on-demand
+        replica for a second request). Only an explicit origin may pin.
+
+        Before v5.1.0 the reaper re-loaded a model with ``pin=<session_pinned>``,
+        so a model that had ever been loaded manually stayed pinned for the
+        life of the process: the idle TTL never applied, and the reaper kept
+        topping it up to its configured replica count. That is the "the model
+        persists by itself" report this parameter fixes.
+        """
         if not self.enabled:
             return await self._legacy.load(model, engine)
+        if origin is not None:
+            pin = pin and origin in EXPLICIT_LOAD_ORIGINS
         if self._closing:
             raise MLXBarError("ENGINE_SHUTTING_DOWN",
                               "終了処理中のため、モデルを読み込めません", 503, True)
@@ -991,7 +1020,7 @@ class ModelPoolSupervisor:
         for replica_index in range(desired):
             try:
                 result = await self._load_replica(model, engine, model_id, replica_index,
-                                                  pin=pin, explicit=explicit)
+                                                  pin=pin, explicit=explicit, origin=origin)
             except MLXBarError as exc:
                 if replica_index == 0 or result is None:
                     raise
@@ -1016,7 +1045,8 @@ class ModelPoolSupervisor:
 
     async def _load_replica(self, model: dict, engine: str | None, model_id: str,
                             replica_index: int, *, pin: bool,
-                            explicit: bool | None = None) -> dict:
+                            explicit: bool | None = None,
+                            origin: str | None = None) -> dict:
         """Ensure one copy (replica) of ``model`` is resident. Singleflight per
         replica; replica 0 is byte-identical to the pre-v1.8.0 single slot.
 
@@ -1025,6 +1055,10 @@ class ModelPoolSupervisor:
         self-heal a stale catalog classification after a successful load."""
         if explicit is None:
             explicit = bool(engine and engine != "auto")
+        # v5.1.0: only an explicit origin may pin. `pin` alone is not enough:
+        # the reaper used to pass the slot's *current* pin state back in, which
+        # turned one manual load into a permanent one.
+        pin = bool(pin and (origin is None or origin in EXPLICIT_LOAD_ORIGINS))
         slot_key = self._slot_key(model_id, replica_index)
         async with self._pool_lock:
             existing = self._slots.get(slot_key)
@@ -1097,6 +1131,12 @@ class ModelPoolSupervisor:
                         self.root, self.settings, instance_key=instance_key,
                         memory_limit_bytes=reservation, reap_orphans=False,
                     )
+                    # v5.1.0: the worker reads its batching limits from the
+                    # environment its supervisor copies (see
+                    # `_configure_batch_environment`). They are set only around
+                    # the construction that starts the process, so two models
+                    # with different profiles can never see each other's value.
+                    batch_env = self._apply_batch_environment(model_id)
                     profile = self._profile(model_id)
                     existing = PoolSlot(
                         model=dict(model), worker=worker, reservation_bytes=reservation,
@@ -1126,7 +1166,10 @@ class ModelPoolSupervisor:
             for victim in victims:
                 await self._evict_slot(victim)
             try:
-                result = await existing.worker.load(model, engine, explicit=explicit)
+                try:
+                    result = await existing.worker.load(model, engine, explicit=explicit)
+                finally:
+                    self._restore_batch_environment(batch_env)
                 if (not explicit and str(result.get("engine", "")) in {"mlx-lm", "mlx-vlm"}
                         and str(model.get("engine", "")) != str(result.get("engine", ""))):
                     # v2.10.1: the write reads config files and takes the
@@ -1212,7 +1255,10 @@ class ModelPoolSupervisor:
                 raise
 
     async def load_for_api(self, model: dict, engine: str | None = None) -> dict:
-        return await self.load(model, engine, pin=False)
+        # v5.1.0: the origin is what keeps an API autoload transient. It is
+        # never pinned, never promoted into a resident slot, and never recorded
+        # as the model to restore at the next start.
+        return await self.load(model, engine, pin=False, origin="api")
 
     def find_loaded_model(self, requested: str) -> dict | None:
         # v2.7.2: two-pass resolution so a real model that happens to be
@@ -1489,6 +1535,11 @@ class ModelPoolSupervisor:
             return True
         if self._gen_concurrency <= 1:
             return False
+        if slot.gen_active:
+            # v5.1.0: another sequence on the same worker is not a second
+            # lane, so the cross-model lane cap does not apply to it. It is
+            # still charged the head-room below.
+            return self._batched_sequence_ok(slot)
         budget = self._global_budget()
         if budget <= 0:
             return False
@@ -1498,7 +1549,25 @@ class ModelPoolSupervisor:
                 continue
             if other.gen_owner is not None or other.worker.active_requests:
                 charge += self._per_generation_headroom(other)
+            # v5.1.0: a batched slot already running N sequences needs one more
+            # sequence's head-room, not one more lane's.
+            charge += self._per_generation_headroom(other) * len(other.gen_active)
         charge += self._per_generation_headroom(slot)
+        return charge <= budget
+
+    def _batched_sequence_ok(self, slot: PoolSlot) -> bool:
+        """Whether one more sequence fits on an already-batched worker."""
+        budget = self._global_budget()
+        if budget <= 0:
+            return False
+        charge = self._resident_charge()
+        for other in self._slots.values():
+            if other is slot:
+                continue
+            if other.gen_owner is not None or other.worker.active_requests:
+                charge += self._per_generation_headroom(other)
+            charge += self._per_generation_headroom(other) * len(other.gen_active)
+        charge += self._per_generation_headroom(slot) * (len(slot.gen_active) + 1)
         return charge <= budget
 
     async def _concurrent_start_ok(self, slot: PoolSlot) -> bool:
@@ -1508,6 +1577,166 @@ class ModelPoolSupervisor:
             return False
         _, pressure = await asyncio.to_thread(self._host_capacity)
         return pressure < 2
+
+    # --- v5.1.0 continuous batching lanes --------------------------------
+
+    def _batch_slot_room(self, slot: PoolSlot) -> int:
+        """How many more sequences this batched slot may accept right now.
+
+        Zero for every slot that is not batch-capable, which is what keeps the
+        pre-v5.1.0 single-lane path untouched.
+        """
+        if not self._slot_batch_capable(slot):
+            return 0
+        configured = self._continuous_batching(slot.model.get("id"))
+        # Only the profile caps a batched worker. `generationConcurrency` bounds
+        # how many *lanes* run at once, and a second sequence on the same
+        # worker is not a new lane; its memory cost is charged separately
+        # (`_batched_sequence_ok`), which is the guard that actually matters.
+        ceiling = max(1, int(configured.get("maxSequences", 1)))
+        return max(0, ceiling - len(slot.gen_active))
+
+    def _continuous_batching(self, model_id: str | None) -> dict:
+        """This model's continuous-batching profile, normalised.
+
+        Reads the profile on every call so a settings change takes effect for
+        the next request without a restart. A malformed entry is treated as
+        disabled rather than raising: batching is an optimisation, and losing
+        it must never turn a working request into an error.
+        """
+        profile = self._profile(str(model_id or "")) if model_id else {}
+        raw = profile.get("continuousBatching") if isinstance(profile, dict) else None
+        if not isinstance(raw, dict):
+            raw = {}
+        try:
+            max_sequences = int(raw.get("maxSequences", 2))
+        except (TypeError, ValueError):
+            max_sequences = 2
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "maxSequences": max(1, min(8, max_sequences)),
+            "prefillBatchSize": max(1, min(8, int(raw.get("prefillBatchSize", 2) or 2))),
+            "prefillStepSize": max(256, min(32768, int(raw.get("prefillStepSize", 2048) or 2048))),
+            "fallback": bool(raw.get("fallback", True)),
+        }
+
+    BATCH_ENV_NAMES = ("MLXBAR_BATCH_ENABLED", "MLXBAR_BATCH_MAX_SEQUENCES",
+                       "MLXBAR_BATCH_PREFILL_BATCH_SIZE", "MLXBAR_BATCH_PREFILL_STEP_SIZE")
+
+    def _apply_batch_environment(self, model_id: str) -> dict:
+        """Put this model's batching limits on the coordinator environment.
+
+        The worker supervisor copies ``os.environ`` into the child it starts,
+        and that copy is the only channel the worker reads its limits from
+        (``_configure_batch_environment``). Setting them here -- immediately
+        before the load, restored immediately after -- keeps them scoped to the
+        one process being started, so two models with different profiles can
+        never be started with each other's numbers.
+
+        Returns the previous values for ``_restore_batch_environment``.
+        """
+        previous = {name: os.environ.get(name) for name in self.BATCH_ENV_NAMES}
+        settings = self._continuous_batching(model_id)
+        if not settings.get("enabled"):
+            for name in self.BATCH_ENV_NAMES:
+                os.environ.pop(name, None)
+            return previous
+        os.environ["MLXBAR_BATCH_ENABLED"] = "1"
+        os.environ["MLXBAR_BATCH_MAX_SEQUENCES"] = str(settings["maxSequences"])
+        os.environ["MLXBAR_BATCH_PREFILL_BATCH_SIZE"] = str(settings["prefillBatchSize"])
+        os.environ["MLXBAR_BATCH_PREFILL_STEP_SIZE"] = str(settings["prefillStepSize"])
+        return previous
+
+    @staticmethod
+    def _restore_batch_environment(previous: dict) -> None:
+        for name, value in (previous or {}).items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _slot_batch_capable(self, slot: PoolSlot) -> bool:
+        """Whether this slot's worker can serve several requests at once.
+
+        The worker reports it in its load capabilities (`continuousBatching`),
+        because only the worker can see whether the loaded runtime actually
+        supports batching for this model (mlx-lm's `BatchGenerator`, the cache
+        types, the absence of a draft model). A slot whose load predates
+        v5.1.0 simply has no such key and is never batched.
+        """
+        if not self._continuous_batching(slot.model.get("id")).get("enabled"):
+            return False
+        loaded = slot.worker.loaded or {}
+        capabilities = loaded.get("capabilities") or {}
+        status = capabilities.get("continuousBatching") or {}
+        return bool(status.get("capable"))
+
+    async def _acquire_batched_lane(self, slot: PoolSlot, request_id: str) -> bool:
+        """Take one pool permit for a sequence that shares ``slot``'s worker.
+
+        Unlike ``_acquire_lane`` this never takes the per-model ``gen_lock``:
+        the point of continuous batching is that several sequences run on the
+        same model at once. It still takes a pool-wide permit, so
+        ``generationConcurrency`` keeps its documented meaning ("how many
+        generations run at once"), and it still re-checks the memory
+        head-room, so a batched sequence is admitted on the same terms as a
+        second lane. Waiting for a permit is the one case where a batched
+        request waits: with ``generationConcurrency`` saturated by other
+        models, a second sequence must not exceed the configured cap.
+
+        Returns False when the sequence was not admitted (no room left, memory
+        guard, or cancellation). The caller then falls back to the ordinary
+        lane, which queues exactly as before.
+        """
+        raw_permit = False
+        try:
+            while True:
+                # `acquire()` yields even when a permit is free, so a second
+                # caller can enter while the first is still between "took a
+                # permit" and "registered its sequence". Re-checking the room
+                # after every await is what keeps the profile's `maxSequences`
+                # exact under simultaneous requests.
+                if self._batch_slot_room(slot) <= 0:
+                    return False
+                await self._gen_slots.acquire()
+                raw_permit = True
+                if self._batch_slot_room(slot) <= 0:
+                    self._gen_slots.release()
+                    return False
+                if not self._admit_concurrent(slot):
+                    self._gen_slots.release()
+                    raw_permit = False
+                    # A refusal here is not transient: the head-room only
+                    # shrinks while this model is running, so waiting would
+                    # hold the caller's request forever. The caller falls back
+                    # to the ordinary lane, which queues with heartbeats.
+                    return False
+                _, pressure = await asyncio.to_thread(self._host_capacity)
+                if pressure >= 2 or self._batch_slot_room(slot) <= 0:
+                    self._gen_slots.release()
+                    raw_permit = False
+                    if pressure >= 2:
+                        await asyncio.sleep(0.05)
+                        continue
+                    return False
+                break
+        except BaseException:
+            if raw_permit:
+                self._gen_slots.release()
+            raise
+        self._gen_active_lanes += 1
+        # Registered before the generator yields anything, so the caller's
+        # finalizer (which runs on disconnect) always has something to release.
+        slot.gen_active.add(request_id)
+        return True
+
+    def _release_batched_lane(self, slot: PoolSlot, request_id: str) -> bool:
+        if request_id not in slot.gen_active:
+            return False
+        slot.gen_active.discard(request_id)
+        self._gen_slots.release()
+        self._gen_active_lanes = max(0, self._gen_active_lanes - 1)
+        return True
 
     async def _acquire_lane(self, slot: PoolSlot, request_id: str) -> None:
         """Serialise this model, then take one pool-wide concurrency permit.
@@ -1729,7 +1958,7 @@ class ModelPoolSupervisor:
                   or busy_slot.model.get("engine"))
         try:
             await self._load_replica(dict(busy_slot.model), engine, model_id,
-                                     index, pin=False)
+                                     index, pin=False, origin="expand")
         except MLXBarError as exc:
             ready = len([slot for slot in self._replica_slots(model_id)
                          if slot.state == "ready"])
@@ -1770,11 +1999,13 @@ class ModelPoolSupervisor:
         slot = self._pick_replica(model_id)
         if slot is None:
             raise MLXBarError("MODEL_NOT_LOADED", "要求されたモデルがロードされていません", 409, True)
-        if slot.gen_lock.locked() or slot.gen_queued:
+        if (slot.gen_lock.locked() or slot.gen_queued) and self._batch_slot_room(slot) <= 0:
             # Every ready replica is busy (idle replicas are preferred by
             # _pick_replica). Grow one best-effort on-demand copy so the 2nd
             # parallel generation has a lane instead of queueing behind the
             # 1st. Falls back to the busy slot when memory/pressure refuses.
+            # v5.1.0: a batch-capable slot with a free sequence never gets
+            # here -- continuous batching is the alternative to replicas.
             slot = await self._maybe_expand_replica(slot, model_id)
         request_id = request_id or hashlib.sha256(os.urandom(16)).hexdigest()
         self._recover_lane(slot, "new_request")
@@ -1782,6 +2013,14 @@ class ModelPoolSupervisor:
         queued = None
         acquire_task = None
         cancel_task = None
+        # v5.1.0: a batch-capable slot takes a second (third ...) sequence on
+        # the same worker instead of serialising or growing a replica. The
+        # permit is taken before the lease is touched, and the room is
+        # re-checked after every await inside, so two callers can never both
+        # claim the last free sequence.
+        batched = False
+        if self._batch_slot_room(slot) > 0:
+            batched = await self._acquire_batched_lane(slot, request_id)
         try:
             limits = self.settings.data["generation"]
             # Fast path only when the whole pool is idle: with no active lane,
@@ -1790,9 +2029,12 @@ class ModelPoolSupervisor:
             # Every concurrent start goes through the queue loop below, which
             # keeps emitting heartbeats even if `_acquire_lane` blocks on the
             # semaphore or the memory guard.
-            must_wait = (slot.gen_lock.locked() or slot.gen_queued
-                         or self._gen_active_lanes > 0)
-            if must_wait:
+            must_wait = (not batched
+                         and (slot.gen_lock.locked() or slot.gen_queued
+                              or self._gen_active_lanes > 0))
+            if batched:
+                self._request_workers[request_id] = slot.worker
+            elif must_wait:
                 total_queued = sum(len(item.gen_queued) for item in self._slots.values())
                 if total_queued >= limits.get("maxQueuedRequests", 16):
                     raise MLXBarError("QUEUE_FULL", "生成待ちが上限に達しています", 429, True)
@@ -1859,6 +2101,7 @@ class ModelPoolSupervisor:
             self._abandoned_lanes.add(request_id)
             slot.gen_queued.pop(request_id, None)
             self._request_workers.pop(request_id, None)
+            self._release_batched_lane(slot, request_id)
             self._release_lane(slot, request_id)
             slot.leases = max(0, slot.leases - 1)
             slot.last_released_at = time.monotonic()
@@ -2116,8 +2359,11 @@ class ModelPoolSupervisor:
             child = slot.worker.status()
             slot.keep_loaded = bool(self._profile(str(slot.model.get("id", ""))).get(
                 "keepLoaded", False))
-            if slot.gen_owner is not None or slot.worker.active_requests:
-                active_generations += 1
+            if (slot.gen_owner is not None or slot.gen_active
+                    or slot.worker.active_requests):
+                # v5.1.0: a batched slot runs several generations at once, so
+                # it contributes one per active sequence rather than one.
+                active_generations += max(1, len(slot.gen_active))
             if child.get("loadedModel"):
                 model_id = str(slot.model.get("id", ""))
                 idle_remaining = self._idle_remaining(slot)
@@ -2134,6 +2380,10 @@ class ModelPoolSupervisor:
                          "replicaShortfall": self._replica_admission_failures.get(model_id),
                          "laneQueueDepth": len(slot.gen_queued),
                          "laneRecoveries": slot.gen_recoveries,
+                         # v5.1.0: how many requests this worker is serving at
+                         # once. 0 for every non-batching slot.
+                         "batchActiveSequences": len(slot.gen_active),
+                         "continuousBatching": self._batch_status(slot, model_id),
                          "keepLoaded": slot.keep_loaded or slot.session_pinned,
                          # v3.2.0 (ISS-7 / WP-710, AC-7-1): `keepLoaded` above
                          # also covers a plain manual load (session pin), which
@@ -2261,6 +2511,32 @@ class ModelPoolSupervisor:
             "activeGenerations": active_generations,
             "maintenanceEngines": sorted(self.maintenance_engines),
             "modelPool": self._model_pool_status(loaded_models, active_generations),
+        }
+
+    def _batch_status(self, slot: PoolSlot, model_id: str) -> dict:
+        """Continuous-batching state for one slot, as the GUI reports it.
+
+        ``enabled`` is the profile's answer, ``capable`` is the worker's (it
+        reflects the loaded model's caches), and ``fallbackReason`` is why a
+        request would not be batched right now. All three are additive fields;
+        an older GUI ignores them and an older coordinator never sends them.
+        """
+        settings = self._continuous_batching(model_id)
+        capabilities = (slot.worker.loaded or {}).get("capabilities") or {}
+        worker = capabilities.get("continuousBatching") or {}
+        capable = bool(worker.get("capable"))
+        reason = worker.get("reason")
+        if settings.get("enabled") and not capable:
+            reason = reason or "worker_not_capable"
+        return {
+            "enabled": bool(settings.get("enabled")),
+            "capable": capable,
+            "maxSequences": settings.get("maxSequences", 1),
+            "activeSequences": len(slot.gen_active),
+            "prefillBatchSize": settings.get("prefillBatchSize", 1),
+            "prefillStepSize": settings.get("prefillStepSize", 2048),
+            "fallback": bool(settings.get("fallback", True)),
+            "fallbackReason": None if capable else reason,
         }
 
     def _model_pool_status(self, loaded_models: list[dict], active_generations: int) -> dict:
@@ -2434,7 +2710,11 @@ class ModelPoolSupervisor:
             if not replicas:
                 continue
             base = replicas[0]
-            if not (base.keep_loaded or base.session_pinned):
+            # v5.1.0: only a `keepLoaded` profile is a standing request for N
+            # copies. A session pin (a manual load) is one copy the user asked
+            # to keep, not a licence to grow replicas in the background -- that
+            # is what made an API request appear to add models by itself.
+            if not base.keep_loaded:
                 continue
             desired = self._desired_replicas(model_id)
             ready = [s for s in replicas if s.state == "ready"]
@@ -2451,7 +2731,7 @@ class ModelPoolSupervisor:
                     # choice — keep the auto semantics (re-derive + candidate
                     # chain) so a stale profile engine still self-heals.
                     await self._load_replica(model, model.get("engine"), model_id, index,
-                                             pin=base.session_pinned, explicit=False)
+                                             pin=True, explicit=False, origin="reaper")
                 except MLXBarError as exc:
                     attempts = int((self._replica_retry.get(model_id) or {}
                                     ).get("attempts", 0)) + 1

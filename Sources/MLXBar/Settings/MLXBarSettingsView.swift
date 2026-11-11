@@ -849,6 +849,11 @@ struct ModelSourceSettingsView: View {
     @State private var pinnedModelIds: Set<String> = []
     @State private var pinnedModelReplicas: [String: Int] = [:]
     @State private var pinnedModelMaxGB: [String: Int] = [:]
+    /// v5.1.0 continuous batching, per model. Read from the same pool snapshot
+    /// as the pin drafts above and written through the per-model profile PUT,
+    /// so one switch can never rewrite another model's settings.
+    @State private var batchEnabledModelIds: Set<String> = []
+    @State private var batchSequences: [String: Int] = [:]
     /// Draft for the explicit per-model ceiling (WP-009). Kept apart from
     /// `perModelMaxGB` so the residency form and the explicit-limit control
     /// each save exactly the value they display.
@@ -948,7 +953,7 @@ struct ModelSourceSettingsView: View {
                 Text(LS("モデルごとに独立したWorkerを使います。異なるモデルは同時生成の上限まで並行して生成し、同一モデルへの要求は到着順に直列化します。1にすると従来どおり全体で1件ずつです。手動ロードや常駐指定したモデルは停止まで保持し、APIが自動ロードしたモデルは未使用時間後に解放します。macOSが深刻なメモリ逼迫を報告した場合は固定モデルも安全のため解放します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text(LS("同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを1つ増やして並行し、余裕がなければ順番待ちになります。最大常駐モデル数は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません。"))
+                Text(LS("同一モデルへの同時要求は、空きレプリカがあれば並行します。空きがなくメモリに余裕があれば自動でレプリカを1つ増やして並行し、余裕がなければ順番待ちになります。最大常駐モデル数は異なるモデルの種類数の上限で、同一モデルのレプリカは数えません。連続バッチ処理を有効にしたモデルは、レプリカを増やさずに同じモデルで並行します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Text(LS("非固定モデルの待機時間は再起動不要で、次の見回りから反映されます。一覧の待機中の行には解放までの残り時間を表示します。"))
@@ -1124,6 +1129,72 @@ struct ModelSourceSettingsView: View {
                     }
                 }
                 Text(LS("常駐指定したモデルはサービス起動時に自動でロードされ、未使用でも解放されません。今すぐ反映したい場合はモデル画面からロードしてください。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Section(LS("連続バッチ処理（実験的）")) {
+                // v5.1.0: one loaded model serves several requests at once
+                // instead of serialising them or loading a second copy. Off by
+                // default, per model, and only for models whose runtime can
+                // actually batch (the coordinator decides that from the loaded
+                // model, so the row below reports it rather than guessing).
+                if !model.settingsLoaded {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(LS("設定を読み込み中")).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if model.models.isEmpty {
+                    Text(LS("モデルが見つかりません。フォルダを追加して再スキャンしてください。"))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ForEach(model.models.filter { $0.engine != nil }) { item in
+                    Toggle(isOn: Binding(
+                        get: { batchEnabledModelIds.contains(item.id) },
+                        set: { value in
+                            if value { batchEnabledModelIds.insert(item.id) }
+                            else { batchEnabledModelIds.remove(item.id) }
+                            Task { await model.setContinuousBatching(item.id, enabled: value) }
+                        }
+                    )) {
+                        Text(item.name).lineLimit(1).truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .disabled(!model.settingsLoaded)
+                    if batchEnabledModelIds.contains(item.id) {
+                        Stepper("\(LS("同時シーケンス数")): \(batchSequences[item.id] ?? 2)",
+                                value: Binding(
+                                    get: { batchSequences[item.id] ?? 2 },
+                                    set: { value in
+                                        batchSequences[item.id] = value
+                                        Task { await model.setContinuousBatchingSequences(item.id, sequences: value) }
+                                    }),
+                                in: 1...8)
+                            .font(.caption)
+                            .padding(.leading, 20)
+                            .disabled(!model.settingsLoaded)
+                        if let status = batchStatus(for: item.id) {
+                            let capable = status.capable
+                            let reason = status.fallbackReason
+                            Text(capable
+                                 ? "\(LS("状態")): \(LS("対応"))"
+                                 : "\(LS("状態")): \(LS("単一生成で動作"))\(reason.map { " (\($0))" } ?? "")")
+                                .font(.caption2)
+                                .foregroundStyle(capable ? Color.secondary : Color.orange)
+                                .padding(.leading, 20)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                Text(LS("1つのモデルを1回だけロードしたまま、複数の要求を同時に生成します。モデルの複製（レプリカ）は作りません。既定は無効で、有効にすると2シーケンスから始まります。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(LS("連続バッチ処理に対応しないモデル（ハイブリッド・再帰型キャッシュなど）や、seed指定・KVキャッシュ量子化・プロンプトキャッシュを使う要求は、自動的に従来の単一生成へ切り替わります。設定は次にモデルをロードしたときから反映されます。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(LS("レプリカ方式（モデルごとの並列数）とは別の機能です。レプリカはモデルを複製してメモリを増やしますが、連続バッチ処理は同じモデルを共有します。"))
                     .font(.caption).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1357,6 +1428,29 @@ struct ModelSourceSettingsView: View {
                 }
             },
             uniquingKeysWith: { first, _ in first })
+        applyBatchingProfiles(profiles)
+    }
+
+    /// v5.1.0: rebuild the continuous-batching drafts from the same snapshot.
+    private func applyBatchingProfiles(_ profiles: [[String: Any]]) {
+        batchEnabledModelIds = Set(profiles.compactMap { profile in
+            guard let id = profile["modelId"] as? String,
+                  let batching = profile["continuousBatching"] as? [String: Any],
+                  (batching["enabled"] as? Bool) ?? false else { return nil }
+            return id
+        })
+        batchSequences = Dictionary(
+            profiles.compactMap { profile in
+                guard let id = profile["modelId"] as? String else { return nil }
+                let batching = profile["continuousBatching"] as? [String: Any]
+                return (id, (batching?["maxSequences"] as? NSNumber)?.intValue ?? 2)
+            },
+            uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The batching state the coordinator reports for a loaded model, if any.
+    private func batchStatus(for modelId: String) -> ContinuousBatchingStatus? {
+        model.residentModels.first(where: { $0.id == modelId })?.continuousBatching
     }
 
     /// Label above value, instead of one row with a `Spacer` between them or

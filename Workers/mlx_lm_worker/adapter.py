@@ -5,6 +5,7 @@ import gc
 import importlib.metadata
 import logging
 import os
+import queue
 import time
 
 # v2.8.0: bound the Rust tokeniser's thread pool (P2 of the CPU report, where
@@ -19,6 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 from common import cache_state
 from common import vision
+from common.batch import BatchRequest, BatchScheduler, BatchUnavailable
 from common.jang import raise_if_jang
 from common.model_errors import ModelLoadError
 from common.server import BaseAdapter, run
@@ -45,6 +47,13 @@ class MLXLMAdapter(BaseAdapter):
         self.kv_start = 0
         self.kv_mode = "bf16"
         self.kv_fallback_reason: str | None = None
+        # v5.1.0 continuous batching. None until a load decides; the scheduler
+        # itself starts lazily on the first batched request.
+        self.batch_scheduler: BatchScheduler | None = None
+        self._batch_capable = False
+        self._batch_reason: str | None = "not_loaded"
+        self._batch_settings_latched: dict = {}
+        self._batch_requests: dict[str, BatchRequest] = {}
 
     def capabilities(self) -> dict:
         result = super().capabilities()
@@ -53,6 +62,10 @@ class MLXLMAdapter(BaseAdapter):
         result["cacheBudget"] = dict(self.cache_budget)
         result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
         result["kvQuant"] = self._kv_quant_status()
+        # v5.1.0: the coordinator decides whether to route a second request to
+        # this worker from this flag, so it must reflect the loaded model, not
+        # the settings.
+        result["continuousBatching"] = self.batch_status()
         return result
 
     def _kv_quant_status(self) -> dict:
@@ -220,6 +233,16 @@ class MLXLMAdapter(BaseAdapter):
         self.apply_memory_limits()
         self.cache_budget = _read_cache_budget(path)
         self._init_prompt_cache(path)
+        # v5.1.0: decide batchability once, from the loaded model's own caches
+        # (never from a version number). Failure to probe is a fallback, not a
+        # load error.
+        try:
+            self._init_batch_scheduler()
+        except Exception:  # noqa: BLE001 - batching is an optimisation
+            LOGGER.exception("Continuous batching probe failed; using single generation")
+            self.batch_scheduler = None
+            self._batch_capable = False
+            self._batch_reason = "probe_failed"
         return self.capabilities()
 
     def _release_partial_load(self) -> None:
@@ -240,9 +263,301 @@ class MLXLMAdapter(BaseAdapter):
             pass
 
     def unload(self) -> None:
+        # v5.1.0: the batch scheduler owns MLX state (its own thread and a
+        # BatchGenerator holding per-sequence caches). It must be stopped
+        # before the weights are dropped, or the thread would keep a reference
+        # to a model the coordinator believes is gone.
+        self._stop_batch_scheduler()
         self.prompt_cache = None
         self.model_path = None
         super().unload()
+
+    # --- v5.1.0 continuous batching --------------------------------------
+
+    def _batch_settings(self) -> dict:
+        """Batching limits from the coordinator's environment, fail-safe."""
+        def _int(name: str, default: int, low: int, high: int) -> int:
+            try:
+                value = int(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return max(low, min(high, value))
+
+        return {
+            "enabled": self._truthy(os.environ.get("MLXBAR_BATCH_ENABLED", "0")),
+            "maxSequences": _int("MLXBAR_BATCH_MAX_SEQUENCES", 2, 1, 8),
+            "prefillBatchSize": _int("MLXBAR_BATCH_PREFILL_BATCH_SIZE", 2, 1, 8),
+            "prefillStepSize": _int("MLXBAR_BATCH_PREFILL_STEP_SIZE", 2048, 256, 32768),
+        }
+
+    def _init_batch_scheduler(self) -> None:
+        """Prepare (but do not start) the batch scheduler after a load.
+
+        The scheduler is started lazily on the first batched request, so a
+        model nobody batches never pays for the extra thread or the
+        ``BatchGenerator``'s wired-limit bookkeeping.
+        """
+        self._stop_batch_scheduler()
+        settings = self._batch_settings()
+        self._batch_settings_latched = settings
+        if not settings["enabled"] or self.model is None:
+            self.batch_scheduler = None
+            self._batch_capable, self._batch_reason = False, (
+                "disabled" if not settings["enabled"] else "no_model")
+            return
+        try:
+            from mlx_lm.generate import BatchGenerator
+            from mlx_lm.models.cache import make_prompt_cache
+        except Exception as exc:  # noqa: BLE001 - an older runtime is not an error
+            self.batch_scheduler = None
+            self._batch_capable = False
+            self._batch_reason = f"runtime_without_batch_generator:{type(exc).__name__}"
+            return
+        scheduler = BatchScheduler(
+            self.model,
+            max_sequences=settings["maxSequences"],
+            prefill_batch_size=settings["prefillBatchSize"],
+            prefill_step_size=settings["prefillStepSize"],
+            make_prompt_cache=make_prompt_cache,
+            batch_generator_factory=BatchGenerator,
+            tokenizer=self.processor,
+        )
+        if scheduler.probe():
+            self.batch_scheduler = scheduler
+            self._batch_capable = True
+            self._batch_reason = None
+        else:
+            # Not an error: hybrid/recurrent caches without `merge` cannot be
+            # batched, and the request falls back to single generation.
+            self.batch_scheduler = None
+            self._batch_capable = False
+            self._batch_reason = scheduler.capable_reason
+
+    def _stop_batch_scheduler(self) -> None:
+        scheduler = getattr(self, "batch_scheduler", None)
+        self.batch_scheduler = None
+        self._batch_capable = False
+        self._batch_reason = getattr(self, "_batch_reason", None) or "not_loaded"
+        if scheduler is not None:
+            try:
+                scheduler.shutdown()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                LOGGER.debug("Batch scheduler shutdown failed", exc_info=True)
+
+    def batch_status(self) -> dict:
+        scheduler = getattr(self, "batch_scheduler", None)
+        settings = getattr(self, "_batch_settings_latched", self._batch_settings())
+        status = scheduler.status() if scheduler is not None else {}
+        return {
+            "capable": bool(getattr(self, "_batch_capable", False)),
+            "reason": getattr(self, "_batch_reason", None),
+            "maxSequences": settings.get("maxSequences", 1),
+            "prefillBatchSize": settings.get("prefillBatchSize", 1),
+            "prefillStepSize": settings.get("prefillStepSize", 2048),
+            "started": scheduler is not None,
+            "activeSequences": status.get("activeSequences", 0),
+            "queuedSequences": status.get("queuedSequences", 0),
+            "steps": status.get("steps", 0),
+            "peakSequences": status.get("peakSequences", 0),
+            "errors": status.get("errors", 0),
+        }
+
+    def _batch_eligible(self, params: dict) -> tuple[bool, str | None]:
+        """Whether this request may run on the batched path, and why not.
+
+        The conditions mirror ``mlx_lm.server.ModelProvider._is_batchable``
+        plus this project's own cache features. Anything that changes the KV
+        cache the runtime is asked to batch is refused rather than guessed at:
+        a wrong answer here is silent corruption, while falling back is only
+        slower.
+        """
+        scheduler = getattr(self, "batch_scheduler", None)
+        if scheduler is None or not getattr(self, "_batch_capable", False):
+            return False, getattr(self, "_batch_reason", None) or "not_capable"
+        if params.get("images"):
+            return False, "images"
+        seed = params.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            # mlx-lm refuses to batch seeded requests: the sampler's RNG is
+            # global, so a batched seed would not reproduce single generation.
+            return False, "seed"
+        if self.kv_bits is not None:
+            return False, "kv_quantization"
+        if self.prompt_cache is not None:
+            # v5.1.0 keeps prompt-cache reuse on the single path. Sharing a
+            # stored prefix between batched sequences is a per-sequence cache
+            # question the runtime does not answer yet.
+            return False, "prompt_cache"
+        adaptive = params.get("adaptiveMemory") or {}
+        if isinstance(adaptive, dict) and adaptive.get("enabled"):
+            return False, "adaptive_memory"
+        return True, None
+
+    def _batch_sampler(self, params: dict):
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        temperature = float(params.get("temperature", 0.7))
+        top_p = float(params.get("top_p", 1.0))
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        repetition_penalty = float(params.get("repetition_penalty", 1.0))
+        processors = make_logits_processors(
+            repetition_penalty=(repetition_penalty if repetition_penalty != 1.0 else None),
+            repetition_context_size=int(params.get("repetition_context_size", 20)),
+            presence_penalty=float(params.get("presence_penalty", 0.0)) or None,
+            frequency_penalty=float(params.get("frequency_penalty", 0.0)) or None,
+        )
+        return sampler, list(processors or [])
+
+    def _batch_stop_sequences(self, params: dict):
+        """Token-id stop sequences for one request (or None for the defaults).
+
+        mlx-lm's batched generator matches stop sequences on token ids, and the
+        model's own EOS/eot ids are its default. An OpenAI ``stop`` string is
+        still applied on the text side by the worker's ``StopSequenceFilter``,
+        exactly as on the single path, so the two never disagree.
+        """
+        from mlx_lm.generate import StopSequences
+
+        stop_tokens = getattr(self.processor, "eos_token_ids", None)
+        if stop_tokens is None:
+            eos = getattr(self.processor, "eos_token_id", None)
+            stop_tokens = [eos] if eos is not None else []
+        stop_tokens = [int(token) for token in stop_tokens if token is not None]
+        if not stop_tokens:
+            return None
+        return StopSequences([[token] for token in stop_tokens])
+
+    def stream_batched(self, request_id: str, params: dict, prompt: str):
+        """Yield worker events for one request served by the batch scheduler.
+
+        The event vocabulary is exactly the one ``stream()`` emits (``delta``,
+        ``token_progress``, ``usage``, ``metrics``, ``completed``), so the
+        worker's tool splitter, stop filter, heartbeats and memory guard run
+        unchanged on top of it. The only new event type is ``batch_fallback``,
+        which the server turns into a transparent retry on the single path.
+        """
+        scheduler = getattr(self, "batch_scheduler", None)
+        if scheduler is None:
+            yield {"type": "batch_fallback", "reason": "not_capable"}
+            return
+        try:
+            prompt_tokens = self._encode(prompt)
+        except Exception as exc:  # noqa: BLE001 - fall back, never fail
+            LOGGER.warning("Batched request could not be tokenized: %s", exc)
+            yield {"type": "batch_fallback", "reason": "tokenize_failed"}
+            return
+        if not prompt_tokens:
+            yield {"type": "batch_fallback", "reason": "empty_prompt"}
+            return
+        max_tokens = int(params.get("max_tokens", 512))
+        if max_tokens < 1:
+            yield {"type": "batch_fallback", "reason": "invalid_max_tokens"}
+            return
+        try:
+            sampler, processors = self._batch_sampler(params)
+            stop_sequences = self._batch_stop_sequences(params)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Batched request could not be prepared: %s", exc)
+            yield {"type": "batch_fallback", "reason": "sampler_failed"}
+            return
+        request = BatchRequest(
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=processors,
+            stop_sequences=stop_sequences,
+        )
+        try:
+            scheduler.start()
+        except BatchUnavailable as exc:
+            yield {"type": "batch_fallback", "reason": f"start_failed:{exc}"}
+            return
+        self._batch_requests[request_id] = request
+        try:
+            scheduler.submit(request)
+        except BatchUnavailable as exc:
+            self._batch_requests.pop(request_id, None)
+            yield {"type": "batch_fallback", "reason": f"submit_failed:{exc}"}
+            return
+        detokenizer = _BatchDetokenizer(self.processor)
+        ticker = _ProgressTicker(params)
+        started = time.monotonic()
+        generated = 0
+        first_token_at: float | None = None
+        finish_reason = "stop"
+        try:
+            while True:
+                if request_id in self.cancelled or self.is_aborted(request_id):
+                    scheduler.cancel(request_id)
+                    yield {"type": "completed", "finish_reason": "cancelled"}
+                    return
+                try:
+                    event = request.events.get(timeout=0.2)
+                except queue.Empty:
+                    if request.finished:
+                        break
+                    continue
+                kind = event.get("type")
+                if kind == "token":
+                    generated += 1
+                    if first_token_at is None:
+                        first_token_at = time.monotonic()
+                    text = detokenizer.add(event["token"])
+                    if text:
+                        yield {"type": "delta", "text": text,
+                               "tokens": generated,
+                               **_batch_rate(generated, first_token_at)}
+                    elif ticker.due():
+                        yield {"type": "token_progress", "tokens": generated,
+                               **_batch_rate(generated, first_token_at)}
+                elif kind == "prompt_progress":
+                    processed = int(event.get("processed_tokens") or 0)
+                    total = int(event.get("total_tokens") or 0)
+                    if total and processed < total:
+                        yield {"type": "prefill_progress", "processed_tokens": processed,
+                               "total_tokens": total}
+                elif kind == "finished":
+                    finish_reason = str(event.get("finish_reason") or "stop")
+                    if finish_reason == "cancelled":
+                        yield {"type": "completed", "finish_reason": "cancelled"}
+                        return
+                    if finish_reason == "error":
+                        return
+                    break
+                elif kind == "error":
+                    yield event
+                    return
+            trailing = detokenizer.flush()
+            if trailing:
+                yield {"type": "delta", "text": trailing,
+                       "tokens": generated, **_batch_rate(generated, first_token_at)}
+            if finish_reason == "length" or generated >= max_tokens:
+                finish_reason = "length"
+            elapsed = max(time.monotonic() - started, 0.001)
+            yield {"type": "usage", "prompt_tokens": len(prompt_tokens),
+                   "completion_tokens": generated}
+            yield {"type": "metrics",
+                   "prompt_tokens": len(prompt_tokens),
+                   "completion_tokens": generated,
+                   "cached_tokens": 0,
+                   "cache_tier": "cold",
+                   "cold_reason": "continuous_batching",
+                   "shared_prefix_tokens": 0,
+                   "held_prefix_tokens": len(prompt_tokens),
+                   "finish_reason": finish_reason,
+                   "tool_support": "none",
+                   "prompt_tps": 0.0,
+                   "generation_tps": generated / elapsed,
+                   "continuous_batching": True}
+            yield {"type": "completed", "finish_reason": finish_reason}
+        finally:
+            self._batch_requests.pop(request_id, None)
+            if not request.finished:
+                # The consumer went away (disconnect, cancellation, an error in
+                # the worker's own post-processing). Remove the sequence so its
+                # KV cache is released and the slot is free for the next one.
+                scheduler.cancel(request_id)
 
     def clear_prompt_cache(self) -> None:
         if self.prompt_cache is not None:
@@ -267,6 +582,10 @@ class MLXLMAdapter(BaseAdapter):
         result["lastColdReason"] = self.last_cold_reason
         result["rollbackCapability"] = cache_state.ROLLBACK_TRIM
         result["kvQuant"] = self._kv_quant_status()
+        # v5.1.0: the coordinator decides whether to route a second request to
+        # this worker from this flag, so it must reflect the loaded model, not
+        # the settings.
+        result["continuousBatching"] = self.batch_status()
         return result
 
     def _encode(self, text: str) -> list[int]:
@@ -665,6 +984,53 @@ def _live_progress(response) -> dict:
     if isinstance(tps, (int, float)) and tps > 0:
         result["tps"] = float(tps)
     return result
+
+
+def _batch_rate(generated: int, first_token_at: float | None) -> dict:
+    """Live decode rate for a batched request (prefill excluded)."""
+    if first_token_at is None or generated <= 0:
+        return {}
+    span = time.monotonic() - first_token_at
+    if span <= 0.05:
+        return {}
+    return {"tps": generated / span}
+
+
+class _BatchDetokenizer:
+    """Incremental detokenizer for token ids produced by the batch scheduler.
+
+    ``stream_generate`` owns its own detokenizer; the batched path receives raw
+    token ids, so this reproduces the same visible text: decode the whole
+    sequence so far and emit only the new suffix, which keeps multi-byte
+    characters from being split across deltas. A tokenizer without ``decode``
+    (or one that raises) degrades to "no text", never to an error.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.tokens: list[int] = []
+        self.text = ""
+
+    def add(self, token: int) -> str:
+        self.tokens.append(int(token))
+        decode = getattr(self.tokenizer, "decode", None)
+        if not callable(decode):
+            return ""
+        try:
+            full = decode(self.tokens)
+        except Exception:  # noqa: BLE001 - never fail a generation on decoding
+            return ""
+        if not isinstance(full, str) or not full.startswith(self.text):
+            # The incremental assumption no longer holds (replacement text or
+            # a rewritten prefix). Resynchronise rather than emit garbage.
+            self.text = full if isinstance(full, str) else self.text
+            return ""
+        new = full[len(self.text):]
+        self.text = full
+        return new
+
+    def flush(self) -> str:
+        return ""
 
 
 def _tool_support(params: dict, rendered_kwargs: dict) -> str:

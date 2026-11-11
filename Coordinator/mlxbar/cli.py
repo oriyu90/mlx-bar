@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from pathlib import Path
 
 import httpx
@@ -129,6 +130,19 @@ def parser() -> argparse.ArgumentParser:
     set_pool.add_argument("--max-replicas-per-model", type=int, default=None)
     set_pool.add_argument("--per-generation-headroom-gb", type=float, default=None,
                           help="同時生成ヘッドルームGB（0で自動導出、または0.25〜32）")
+    set_batch = config.add_parser(
+        "set-continuous-batching",
+        help="モデル単位の連続バッチ処理（1回のロードで複数要求を同時生成。指定した項目だけ変更）")
+    set_batch.add_argument("--model", required=True, help="対象モデルのID")
+    set_batch.add_argument("--enabled", choices=["true", "false"], default=None)
+    set_batch.add_argument("--max-sequences", type=int, default=None,
+                           help="同時に処理するシーケンス数（1〜8）")
+    set_batch.add_argument("--prefill-batch-size", type=int, default=None,
+                           help="同時に前処理するプロンプト数（1〜8）")
+    set_batch.add_argument("--prefill-step-size", type=int, default=None,
+                           help="前処理の1ステップのトークン数（256〜32,768）")
+    set_batch.add_argument("--fallback", choices=["true", "false"], default=None,
+                           help="非対応時に従来の単一生成へ切り替える")
     set_compression = config.add_parser(
         "set-context-compression",
         help="長い会話の古い部分を要約して短縮する設定（指定したオプションだけ変更）")
@@ -748,6 +762,34 @@ def execute(args, client: Client):
             if not pool:
                 raise ValueError("変更するオプションを1つ以上指定してください")
             return client.request("PUT", "/api/v1/settings", {"models": {"pool": pool}}).json()
+        if args.action == "set-continuous-batching":
+            # Mirror the GUI's Models panel (setContinuousBatching). The
+            # endpoint merges per field, so only the given keys are sent.
+            batching: dict = {}
+            if args.enabled is not None:
+                batching["enabled"] = args.enabled == "true"
+            if args.max_sequences is not None:
+                if not 1 <= args.max_sequences <= 8:
+                    raise ValueError("同時シーケンス数は1〜8で指定してください")
+                batching["maxSequences"] = args.max_sequences
+            if args.prefill_batch_size is not None:
+                if not 1 <= args.prefill_batch_size <= 8:
+                    raise ValueError("前処理バッチ数は1〜8で指定してください")
+                batching["prefillBatchSize"] = args.prefill_batch_size
+            if args.prefill_step_size is not None:
+                if not 256 <= args.prefill_step_size <= 32768:
+                    raise ValueError("前処理ステップは256〜32,768で指定してください")
+                batching["prefillStepSize"] = args.prefill_step_size
+            if args.fallback is not None:
+                batching["fallback"] = args.fallback == "true"
+            if not batching:
+                raise ValueError("変更するオプションを1つ以上指定してください")
+            if not str(args.model).strip():
+                raise ValueError("--model に対象モデルのIDを指定してください")
+            return client.request(
+                "PUT",
+                f"/api/v1/settings/models/pool/profiles/{quote(str(args.model), safe='')}",
+                {"continuousBatching": batching}).json()
         if args.action == "set-context-compression":
             # Mirror the GUI's Settings > Models panel (setContextCompressionSettings):
             # the panel shows a percentage, the stored key is a 0..1 ratio.

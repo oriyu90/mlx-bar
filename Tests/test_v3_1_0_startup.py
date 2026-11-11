@@ -68,7 +68,8 @@ class _FakeWorkers:
         self.loaded = []
         self.failing = set(failing)
 
-    async def load(self, model, engine=None, explicit=None, pin=True):
+    async def load(self, model, engine=None, explicit=None, pin=True, **kwargs):
+        # v5.1.0: the preload passes `origin=`; this fake only records loads.
         model_id = model["id"]
         if model_id in self.failing:
             raise MLXBarError("MEMORY_HEADROOM_INSUFFICIENT", "空きメモリ不足", 503, True)

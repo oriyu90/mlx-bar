@@ -660,7 +660,8 @@ def _preload_last_model(state, *, retry_interval: float = RESIDENT_PRELOAD_RETRY
             async with state.model_autoload_lock:
                 catalog = {item.get("id"): item for item in state.database.list_models()}
 
-                async def load_one(model_id: str, *, pin: bool, resident: bool) -> None:
+                async def load_one(model_id: str, *, pin: bool, resident: bool,
+                                   origin: str = "preload") -> None:
                     model = catalog.get(model_id)
                     if model is None:
                         if resident:
@@ -684,7 +685,7 @@ def _preload_last_model(state, *, retry_interval: float = RESIDENT_PRELOAD_RETRY
                     _record_preload(state, "running", model_id=model_id)
                     started = time.monotonic()
                     try:
-                        await state.workers.load(model, pin=pin)
+                        await state.workers.load(model, pin=pin, origin=origin)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -710,7 +711,8 @@ def _preload_last_model(state, *, retry_interval: float = RESIDENT_PRELOAD_RETRY
                 for model_id in pinned_ids:
                     await load_one(model_id, pin=True, resident=True)
                 for model_id in transient_ids:
-                    await load_one(model_id, pin=False, resident=False)
+                    await load_one(model_id, pin=False, resident=False,
+                                   origin="preload-transient")
             # v4.0.0 (FIND-01): the retry pass runs outside the autoload lock.
             # Sleeping while holding it would block API autoloads for the whole
             # interval. Each round takes the lock only for its own load.

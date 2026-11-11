@@ -338,7 +338,12 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
         g2 = pool.generate_for_model("model-2", "b", [], {}, "r2")
         t1 = asyncio.create_task(anext(g1))
         t2 = asyncio.create_task(anext(g2))
-        await asyncio.sleep(0.05)
+        # v5.1.0: wait for both to be inside their worker instead of sleeping
+        # a fixed time (the lane path awaits the executor; see the note in
+        # test_concurrency_never_exceeds_the_configured_limit_under_load).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (w1.active_requests and w2.active_requests):
+            await asyncio.sleep(0.01)
         # Both are inside their worker's generate() at the same time.
         self.assertTrue(w1.active_requests)
         self.assertTrue(w2.active_requests)
@@ -615,7 +620,23 @@ class CrossModelGenerationTests(unittest.IsolatedAsyncioTestCase):
                 await gen.aclose()
 
         tasks = [asyncio.create_task(run(number)) for number in (1, 2, 3)]
-        await asyncio.sleep(0.05)
+
+        async def settled(predicate, timeout: float = 5.0) -> bool:
+            # v5.1.0: a fixed sleep is not a synchronisation primitive. Lane
+            # acquisition awaits `asyncio.to_thread(_host_capacity)` on the
+            # default executor, whose warm-up can exceed any sleep this test
+            # dares to use, so the old `sleep(0.05)` observed an arbitrary
+            # intermediate state and failed intermittently. Wait for the
+            # condition instead; the assertions below are unchanged.
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                await asyncio.sleep(0.01)
+            return predicate()
+
+        await settled(lambda: pool._gen_active_lanes == 2
+                      and sum(len(s.gen_queued) for s in pool._slots.values()) == 1)
         # Only two lanes may be active at once; the third request is queued.
         self.assertEqual(pool._gen_active_lanes, 2)
         self.assertEqual(sum(len(s.gen_queued) for s in pool._slots.values()), 1)

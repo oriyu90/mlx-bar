@@ -1,6 +1,6 @@
 # MLXBar
 
-Version 5.0.2 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
+Version 5.1.0 — repository: [oriyu90/mlx-bar](https://github.com/oriyu90/mlx-bar)
 
 MLXBarは、Apple Silicon Mac上のMLX LM、MLX VLM、LM Studioモデルをメニューバーから一元管理するmacOSアプリです。GUI、`mlxbarctl`、OpenAI互換APIが同じバックエンド状態を共有します。APIは既定でこのMacだけに公開され、明示的に有効化した場合だけローカルネットワークから接続できます。
 
@@ -21,8 +21,9 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 - **APIフォールバック（v5.0.0・既定で無効）**：キューが一杯のときやローカルで応答できないときに、登録した外部AIプロバイダー（OpenAI Chat Completions / OpenAI Responses / Anthropic Messages）へリクエストを転送します。モデルごとの優先順位・フォールバック元モデル・レート上限・画像対応・コンテキスト上限を設定できます。設定画面の「APIフォールバック」タブ、または `mlxbarctl fallback` で管理します
 - **JANG・Niwaki 対応（v5.0.1）**：JANGH2（jangtq2）形式は MLXBar / MLX LM / MLX VLM / LM Studio / oMLX では実行できないため、Osaurus 0.25.24+ での実行を案内して数秒で即失敗します。Niwaki（Qwen3.8-Flash-Next qwen4_exp）などの非標準形式は既存の同梱ローダで読み込みでき（既定は無効）、有効化すると案内されます
 - **Niwaki 退化修正（v5.0.2）**：同梱ローダ利用時に mlx-vlm 0.7.12 の batch-invariant decode が compact MoE の remap を迂回して退化していた問題を修正。bundled モデルにだけ batch-invariant を無効化して通常 forward へ戻し、非 bundled モデルは従来どおりです
+- **連続バッチ処理（v5.1.0・既定で無効）**：1つのモデルを1回だけロードしたまま、複数の要求を同時に生成します（`models.pool.profiles[].continuousBatching`）。モデルの複製（レプリカ）は作りません。mlx-lm の `BatchGenerator` を使い、要求ごとに KV キャッシュ・サンプラ・停止条件を独立管理します。非対応モデル（ハイブリッド・再帰型キャッシュなど）や seed 指定・KV量子化・プロンプトキャッシュを使う要求は自動的に単一生成へ切り替わります。設定画面の「連続バッチ処理（実験的）」または `mlxbarctl config set-continuous-batching` で管理します
 - 同一モデルの並列常駐&生成（`models.pool.profiles[].replicas`）
-- API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元
+- API要求で指定されたモデルの自動ロードと、アプリ／Worker再起動後の自動復元（復元するのは**明示的にロードして保持したモデル**だけです。API要求で自動ロードしたモデルは TTL で解放され、次回起動時に勝手に復活しません）
 - 長いZCode入力やtool calling解析中も接続を維持するストリームheartbeat
 - ZCodeの並列subagent要求を到着順に処理する生成キュー
 - mlx-lm・mlx-vlm両方で長いZCode prefixを再起動後も再利用する、容量制限付き永続プロンプトキャッシュ
@@ -71,7 +72,7 @@ GUIの標準言語はEnglishです。「Settings…」→「General」→「Lang
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-5.0.2.dmg`をダウンロードして開きます。
+1. [GitHub Releases](https://github.com/oriyu90/mlx-bar/releases)から`MLXBar-5.1.0.dmg`をダウンロードして開きます。
 2. `MLXBar.app`を`Applications`へコピーします。
 3. 初回起動時にmacOSの確認が表示された場合は、「システム設定」→「プライバシーとセキュリティ」から起動を許可します。
 4. 初回起動時に`mlx-lm`と`mlx-vlm`がない場合は、両ランタイムをバックグラウンドで自動インストールします。「Settings…」→「Runtime」で進捗やエラーを確認できます。
@@ -188,9 +189,31 @@ v1.7.0以降、**別々の常駐モデルは`models.pool.generationConcurrency`�
 - 各レプリカは独立Workerプロセス・独立メモリ予約・独立のmanifest/ログ/ソケットです。`replicas`は`models.pool.maxReplicasPerModel`（既定2、範囲1–8）で頭打ちになります。
 - admissionはレプリカごとに予算をchargeします。2つ合わせて予算に収まらなければ2つ目は`MEMORY_BUDGET_EXCEEDED`で拒否され、ロードできたレプリカだけでモデルは利用可能です。
 - 同一モデルへの並行要求は空きレプリカへ振り分けます。空きがなくメモリに余裕があれば、v2.7.0以降は自動でレプリカを1つ増やして並行します（上限は`maxReplicasPerModel`と`generationConcurrency`の小さい方）。プール全体の同時生成数は従来どおり`generationConcurrency`セマフォが束ね、2レーン目以降のメモリ・ヘッドルームガードも効きます。
-- 明示ロード（GUI・CLI・プリロード）は設定数すべてを今ロードします。API自動ロードは1コピーだけ立ち上げ、reaperがpin済みモデルを背景で`replicas`まで補充します（要求は追加admissionのコストを払いません）。`replicas`を下げると高インデックス側のidleレプリカから解放します。
+- 明示ロード（GUI・CLI・プリロード）は設定数すべてを今ロードします。API自動ロードは1コピーだけ立ち上げ、reaperが**`keepLoaded: true`のプロフィール**を背景で`replicas`まで補充します（要求は追加admissionのコストを払いません）。`replicas`を下げると高インデックス側のidleレプリカから解放します。v5.1.0以降、手動ロードしただけのモデル（セッション固定）は背景でレプリカを増やしません。
 - `mlxbarctl model pin <id> --replicas N`、メニューバーの`×N`バッジ、設定画面の「並列数（replicas）」Stepperで指定できます。
 - `replicas > 1`は`models.pool.enabled: true`が必須です。**合算メモリピークの実機計測は未実施です**（`TEST_PLAN_v1.8.0.md §2`）。メモリガードが「直列なら成功する要求」を落とさないよう安全側に倒しています。`replicas`既定1のとき挙動はv1.7.1と完全に同一です。
+
+### 連続バッチ処理（v5.1.0・既定で無効）
+
+1つのモデルを**1回だけロードしたまま**、複数の要求を同時に生成します。レプリカ方式がモデルを複製してメモリを増やすのに対し、連続バッチ処理は同じ重みを共有し、要求ごとの KV キャッシュだけを増やします（mlx-lm の `BatchGenerator`）。
+
+```json
+{"models":{"pool":{"profiles":[
+  {"modelId":"MODEL_ID","keepLoaded":true,
+   "continuousBatching":{"enabled":true,"maxSequences":4,
+                         "prefillBatchSize":2,"prefillStepSize":2048,"fallback":true}}
+]}}}
+```
+
+- 既定は無効です。有効にすると2シーケンスから始まり、`maxSequences` は1〜8です。
+- 設定画面の「モデル」→「連続バッチ処理（実験的）」、または `mlxbarctl config set-continuous-batching --model MODEL_ID --enabled true --max-sequences 4` で指定します。設定は**次にモデルをロードしたとき**から反映されます。
+- 対応するのは mlx-lm ランタイムのモデルだけです。**mlx-vlm（画像対応モデル）は未対応**で、従来どおり単一生成です（GUI に理由を表示します）。
+- 次の要求は自動的に従来の単一生成へ切り替わります（クライアントから見た応答は同じです）。
+  - バッチ非対応モデル（ハイブリッド・再帰型キャッシュなど、キャッシュが `merge` を持たないもの）
+  - `seed` 指定の要求、KV キャッシュ量子化、プロンプトキャッシュ、アダプティブメモリ、画像入力
+- 追加シーケンスごとに同時生成ヘッドルーム（`perGenerationHeadroomGB`、0なら自動）を計上し、メモリ予算を超えるときはバッチに入れず順番待ちにします。
+- キャンセル・切断はその要求だけに効きます。生成途中の不具合はエラーとして返し、黙って再生成はしません。
+- レプリカ方式とは別機能です。連続バッチ処理を有効にしたモデルは、レプリカを増やさずに同じモデルで並行します（`maxSequences` を超えた要求は従来どおりレプリカ拡張→順番待ち）。
 
 ### 既定の生成パラメータ
 
@@ -275,6 +298,8 @@ mlxbarctl config set-model-pool --enabled true --max-resident 3 --idle-ttl-secon
 mlxbarctl config set-flag auto-load-on-api true  # 他: anthropic-api / remote-image-urls / require-token / continue-after-gui-exit
 mlxbarctl config set-context-compression --enabled true --trigger-percent 70 \
   --keep-tail 8 --summary-max-tokens 800          # 指定したオプションだけ変更（v2.0.0〜）
+mlxbarctl config set-continuous-batching --model MODEL_ID --enabled true \
+  --max-sequences 4 --prefill-batch-size 2 --prefill-step-size 2048 --fallback true  # v5.1.0〜
 mlxbarctl config set-launch-at-login true        # デスクトップのGUIが次に起動したときにOS登録へ反映されます
 mlxbarctl config set-rag --enabled true --embedding-base-url http://127.0.0.1:1234/v1 \
   --embedding-model text-embedding-nomic-embed-text-v1.5 --chunk-size 1000 --default-top-k 4  # v2.1.0〜
@@ -320,6 +345,7 @@ GUIで操作できることは**すべて**`mlxbarctl`から操作できます�
 | メニューバーの各行 > 解放までの時間の延長欄（v2.8.0〜） | `model extend-idle MODEL_ID SECONDS` |
 | 設定 > モデル > 複数モデル常駐 | `config set-model-pool --…` |
 | 設定 > モデル > コンテキスト自動圧縮（v1.9.2〜） | `config set-context-compression --…`（v2.0.0〜） |
+| 設定 > モデル > 連続バッチ処理（v5.1.0〜） | `config set-continuous-batching --model MODEL_ID --…` |
 | 設定 > 知識ベース（v2.1.0〜） | `config set-rag --…` / `rag status` / `rag collection …` / `rag doc …` / `rag query` / `secrets set-rag-embedding-token` |
 | 設定 > 実験的機能 > アダプティブ・ハイブリッド・コンテキストメモリ（v2.2.0〜） | `config set-adaptive-memory --…` |
 | 設定 > モデル > Max token上限 / 既定の生成パラメータ / 並列リクエスト | `config set-max-tokens` / `config set-sampling-defaults` / `config set-queue-limits` |
@@ -662,7 +688,7 @@ swift build --disable-sandbox -c release
 ./scripts/build-release.sh
 ```
 
-出力は`dist/MLXBar.app`と`dist/MLXBar-5.0.2.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
+出力は`dist/MLXBar.app`と`dist/MLXBar-5.1.0.dmg`です。`Packaging/icon.ico`からmacOS用アイコンを生成してアプリへ組み込みます。環境変数`DEVELOPER_ID_APPLICATION`を設定するとその証明書で署名し、未設定時はad-hoc署名します。Apple公証には別途Developer ID資格情報が必要です。
 
 ## テスト
 
@@ -672,7 +698,7 @@ Coordinator/.venv/bin/pytest -q Tests
 swift build --disable-sandbox -c release
 ```
 
-テストには、管理ソケット、公開API認証とキー交換、認証なし切替、LM Studio Bearer認証、API要求による再起動後のモデル復元、Open Interpreter別名、LibreChatモデル取得、usageストリーム、温度・Top P・繰り返しペナルティの保存値／要求値優先と各ランタイムへの伝播、長いprefillとツール解析中のheartbeat、並列subagentのFIFO順序、待機中切断・キャンセル・全件停止、キュー満杯・期限切れ、ストリーム全体時間・内部エラーのログ記録、ロード中状態、同一実パスとProviderモデルの重複排除、同名別パスの保持、ポート競合時の継続動作、設定切替、モデル走査、LM Studio互換生成、通常／ツール呼び出しストリーミング、会話履歴保持、Lagunaツール形式解析、APIログ上限、停止不能Workerの強制終了、過大入力、メモリ圧迫、異常API入力、ランタイム進捗通知・中止・再接続・旧版削除保護を含む統合・障害注入試験があります。
+テストには、管理ソケット、公開API認証とキー交換、認証なし切替、LM Studio Bearer認証、API要求による再起動後のモデル復元（v5.1.0以降は「明示ロードしたモデルだけ」が対象）、連続バッチ処理（スケジューラの同時実行・要求単位キャンセル・単一生成へのフォールバック・レプリカを作らないこと・API要求がモデルを永続化しないこと）、Open Interpreter別名、LibreChatモデル取得、usageストリーム、温度・Top P・繰り返しペナルティの保存値／要求値優先と各ランタイムへの伝播、長いprefillとツール解析中のheartbeat、並列subagentのFIFO順序、待機中切断・キャンセル・全件停止、キュー満杯・期限切れ、ストリーム全体時間・内部エラーのログ記録、ロード中状態、同一実パスとProviderモデルの重複排除、同名別パスの保持、ポート競合時の継続動作、設定切替、モデル走査、LM Studio互換生成、通常／ツール呼び出しストリーミング、会話履歴保持、Lagunaツール形式解析、APIログ上限、停止不能Workerの強制終了、過大入力、メモリ圧迫、異常API入力、ランタイム進捗通知・中止・再接続・旧版削除保護を含む統合・障害注入試験があります。
 
 ## 起動時のトラブルシューティング
 

@@ -2,6 +2,42 @@
 
 このプロジェクトの主な変更を記録します。
 
+## [5.1.0] - 2026-11-11
+
+**単一モデルでの連続バッチ処理（既定で無効）と、モデル永続化の暴走修正。** 1つのモデルを1回だけロードしたまま複数の要求を同時に生成できるようになりました（mlx-lm の `BatchGenerator`、`models.pool.profiles[].continuousBatching`）。レプリカ方式とは別機能で、モデルを複製しません。非対応モデル・非対応要求は自動的に従来の単一生成へ切り替わります。あわせて、**API要求でモデルが勝手に常駐し続ける不具合**（一度手動ロードしたモデルが永久固定になり、reaper が背景でレプリカを増やし、API自動ロードが次回起動時の復元対象になっていた）を修正しました。既定値・設定スキーマは変わりません。
+
+### 追加
+
+- **連続バッチ処理（mlx-lm・既定で無効）**: `Workers/common/batch.py`（新規）の `BatchScheduler` が、ロード済みモデルを共有したまま `BatchGenerator` を専用スレッドで駆動します。要求ごとにサンプラ・logits processor・停止条件・トークン上限・KV キャッシュを独立管理し、`remove(uid)` で要求単位にキャンセルします。`Workers/mlx_lm_worker/adapter.py` の `stream_batched()` は既存のイベント語彙（`delta` / `token_progress` / `usage` / `metrics` / `completed`）をそのまま出すため、tool 分割・stop フィルタ・heartbeat・メモリ監視・キャンセルは既存コードを共有します
+- **設定**: `models.pool.profiles[].continuousBatching`（`enabled` / `maxSequences` 1–8 / `prefillBatchSize` 1–8 / `prefillStepSize` 256–32768 / `fallback`）。既定は無効、有効時は2シーケンスから。プロフィール PUT はフィールド単位のマージです
+- **Coordinator 統合**: バッチ可能なスロットでは `gen_lock` を取らずにプールの許可とメモリのヘッドルームだけで並行し、追加シーケンスごとに `perGenerationHeadroomGB` を計上します。`maxSequences` を超えた要求は従来どおり（レプリカ拡張→順番待ち）。バッチ可能なモデルはレプリカを増やしません
+- **状態**: `loadedModels[].continuousBatching`（`enabled` / `capable` / `maxSequences` / `activeSequences` / `fallbackReason` など）と `batchActiveSequences` を増分で追加
+- **GUI（日英）**: 設定 → モデル →「連続バッチ処理（実験的）」、メニューバーのモデル行にバッチ中の並列数と非対応理由を表示。`en.lproj` に7キー追加
+- **CLI**: `mlxbarctl config set-continuous-batching --model ID --enabled true --max-sequences 4 ...`
+- **実機検証スクリプト**: `scripts/verify-batch-runtime.py`（実コーディネーター + 実ワーカー + 実モデルで 2 並列・キャンセル・フォールバック・無効時の直列を確認）
+
+### 修正
+
+- **API要求でモデルが勝手に永続化する**: `ModelPoolSupervisor.load()` に `origin` を追加し、**明示ロード（GUI/CLI・起動時 preload）だけ**がセッション固定できるようにしました。v5.0.2 では reaper が `pin=<現在の pin 状態>` を渡していたため、一度手動ロードしたモデルが永久固定になり、`idleTTLSeconds` が効かず、`profiles[].replicas` があると API 要求のたびにレプリカが増えていました
+- **reaper のレプリカ補充**: `keepLoaded: true` のプロフィールだけを対象にしました（セッション固定は「1コピーを保持する」意味で、背景で増やす許可ではありません）
+- **次回起動時の復元対象**: API 自動ロードは `last_loaded_model_id` ではなく `last_api_model_id` に記録します。API 要求で自動ロードしたモデルが次回起動時に勝手に復活しなくなりました。`POST /models/{id}/load` の `pin: false` も復元対象にしません
+- **テストの決定化**: `Tests/test_model_pool.py` の固定 `sleep(0.05)` を条件待ちに変更（v5.1.0 で追加した `asyncio.to_thread` 経路により、固定時間では中間状態を観測して断続的に失敗していたため。アサーションは不変）
+
+### 安全性・互換性
+
+- `continuousBatching` 未設定のモデルは v5.0.2 と同一経路です（ワーカーにバッチ環境変数が渡らず、スケジューラも作られません）
+- バッチ非対応モデル（キャッシュが `merge` を持たないハイブリッド・再帰型）と、`seed` 指定・KV量子化・プロンプトキャッシュ・アダプティブメモリ・画像入力の要求は、最初のトークンより前に `batch_fallback` を出して単一経路で実行します（クライアントには何も送られていません）
+- **mlx-vlm は未対応**です。`ResponseGenerator` を唯一の所有者にすると bundled loader・prompt cache・KV量子化を失うため、v5.1.0 では実装せず、理由を GUI と status に表示します（`DESIGN_v5.1.0.md §1.1`）
+- バッチ全体の例外は全要求にエラーとして返し、黙って再生成・再送信しません
+- 新規エラーコードなし。`schemaVersion=1`、`CATALOG_CLASSIFIER_VERSION` は不変
+
+### 検証
+
+- `pytest`: 1142 passed / 1 skipped / 0 failed（既存 1101 + 新規 41。`cd Coordinator && .venv/bin/python -m pytest ../Tests -q`）
+- `swift build` / `swift test`: 後述（実測値を追記）
+- `check_i18n`: 535 keys / 0 missing
+- 実機 e2e `scripts/verify-batch-runtime.py`: 後述
+
 ## [5.0.2] - 2026-11-10
 
 **Niwaki 退化生成の修正。** mlx-vlm 0.7.12 の batch-invariant decode が単一トークンデコード時に bundled ローダー側の compact MoE（`CompactMasked`）の remap を迂回するため、bundled モデルにだけ batch-invariant を無効化して通常 forward へ戻します。あわせて、modalities のテンソル証拠準拠、失敗時の部分ロード解放、キャッシュ fingerprint への loaderId 混ぜ込み、bundled への admission strict 強制を行いました。`models.bundledLoaders` の既定は無効のまま、非 bundled モデルの経路は変更ありません。

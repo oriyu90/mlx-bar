@@ -352,8 +352,12 @@ async def load(model_id: str, request: Request, body: dict = Body(default_factor
         raise HTTPException(422, detail={"code": "INVALID_PIN", "message": "pinはtrue/falseで指定してください"})
     try:
         loaded = await app.workers.load(model, body.get("engine") if body.get("engine") != "auto" else None,
-                                        pin=pin)
-        app.database.set_metadata_value("last_loaded_model_id", model["id"])
+                                        pin=pin, origin="manual")
+        # v5.1.0: only a load the user asked to keep is the model to restore at
+        # the next start. `pin: false` is explicitly transient, so recording it
+        # would make the next start load a model the user had already released.
+        if pin:
+            app.database.set_metadata_value("last_loaded_model_id", model["id"])
         app.database.set_metadata_value("api_autoload_suspended", "0")
         _record_cache_capability(app, loaded)
         return loaded
@@ -428,6 +432,10 @@ async def unload_one(model_id: str, request: Request, force: bool = False):
     # it must not come back). The all-models unload below keeps the gate.
     if app.database.metadata_value("last_loaded_model_id") == model_id:
         app.database.set_metadata_value("last_loaded_model_id", "")
+    # v5.1.0: the API-autoload memory follows the same rule, or a restart would
+    # bring back a model the user just released.
+    if app.database.metadata_value("last_api_model_id") == model_id:
+        app.database.set_metadata_value("last_api_model_id", "")
     return result
 
 
@@ -944,6 +952,28 @@ async def put_model_profile(model_id: str, request: Request,
                 or not 1 <= float(memory) <= 512):
             raise HTTPException(422, detail={"code": "INVALID_PROFILE",
                                              "message": "maxMemoryGBは1〜512の数値で指定してください"})
+    if "continuousBatching" in body:
+        # v5.1.0: validated here so the GUI gets a precise message; the store
+        # validates again (single source of truth) for every other write path.
+        batching = body["continuousBatching"]
+        if batching is not None and not isinstance(batching, dict):
+            raise HTTPException(422, detail={"code": "INVALID_PROFILE",
+                                             "message": "continuousBatchingはJSONオブジェクトで指定してください"})
+        if isinstance(batching, dict):
+            for key in ("enabled", "fallback"):
+                if key in batching and not isinstance(batching[key], bool):
+                    raise HTTPException(422, detail={
+                        "code": "INVALID_PROFILE",
+                        "message": f"continuousBatching.{key}はtrue/falseで指定してください"})
+            for key, (low, high) in {"maxSequences": (1, 8), "prefillBatchSize": (1, 8),
+                                     "prefillStepSize": (256, 32768)}.items():
+                if key not in batching:
+                    continue
+                value = batching[key]
+                if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                    raise HTTPException(422, detail={
+                        "code": "INVALID_PROFILE",
+                        "message": f"continuousBatching.{key}は{low}〜{high}の整数で指定してください"})
     old_profiles = _profile_pin_map(app.settings.data)
     profiles = _pool_profiles(app.settings.data)
     index = next((position for position, item in enumerate(profiles)
@@ -954,6 +984,16 @@ async def put_model_profile(model_id: str, request: Request,
     for key in ("keepLoaded", "replicas", "maxMemoryGB"):
         if key in body:
             entry[key] = body[key]
+    if "continuousBatching" in body:
+        # Merged per field, so the GUI can change one switch without having to
+        # resend the whole object (the same partial-update rule the rest of
+        # this endpoint follows).
+        if body["continuousBatching"] is None:
+            entry.pop("continuousBatching", None)
+        else:
+            merged = dict(entry.get("continuousBatching") or {})
+            merged.update(body["continuousBatching"])
+            entry["continuousBatching"] = merged
     if index is not None:
         profiles[index] = entry
     else:

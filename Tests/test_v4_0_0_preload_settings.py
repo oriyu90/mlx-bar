@@ -72,7 +72,9 @@ class PreloadReasonTextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_failed_resident_preload_reports_its_message(self):
         class Workers:
-            async def load(self, model, pin=True):
+            async def load(self, model, pin=True, **kwargs):
+        # v5.1.0: the preload passes `origin=` so the pool knows the load
+        # is an explicit one; this fake only counts calls.
                 raise MLXBarError("MODEL_VOLUME_UNREADABLE",
                                   "外付けボリュームへのアクセスが許可されていません", 503, True)
 
@@ -164,7 +166,9 @@ class _Workers:
         self.calls = 0
         self._loaded = [{"id": model_id} for model_id in loaded_ids]
 
-    async def load(self, model, pin=True):
+    async def load(self, model, pin=True, **kwargs):
+        # v5.1.0: the preload passes `origin=` so the pool knows the load
+        # is an explicit one; this fake only counts calls.
         self.calls += 1
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if isinstance(outcome, BaseException):
@@ -271,7 +275,9 @@ class _RetryWorkers:
         self.outcomes = list(outcomes)
         self.calls = 0
 
-    async def load(self, model, pin=True):
+    async def load(self, model, pin=True, **kwargs):
+        # v5.1.0: the preload passes `origin=` so the pool knows the load
+        # is an explicit one; this fake only counts calls.
         self.calls += 1
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if isinstance(outcome, BaseException):
@@ -360,9 +366,9 @@ class ResidentRetryTests(unittest.IsolatedAsyncioTestCase):
         # Unpin during the first attempt's failure window: the retry must drop it.
         original = workers.load
 
-        async def load_then_unpin(model, pin=True):
+        async def load_then_unpin(model, pin=True, **kwargs):
             try:
-                return await original(model, pin=pin)
+                return await original(model, pin=pin, **kwargs)
             finally:
                 state.settings.data["models"]["pool"]["profiles"] = []
         workers.load = load_then_unpin

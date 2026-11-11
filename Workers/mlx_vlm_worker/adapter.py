@@ -93,6 +93,15 @@ class MLXVLMAdapter(BaseAdapter):
         result["cacheBudget"] = dict(self.cache_budget)
         result["rollbackCapability"] = self.rollback_capability
         result["kvQuant"] = self._kv_quant_status()
+        # v5.1.0: continuous batching is not implemented for this engine yet.
+        # Reported explicitly (rather than omitted) so the coordinator can say
+        # *why* a model with the setting enabled still runs one request at a
+        # time, instead of silently ignoring the switch.
+        result["continuousBatching"] = {
+            "capable": False,
+            "reason": "engine_not_supported",
+            "maxSequences": 1,
+        }
         return result
 
     @staticmethod
