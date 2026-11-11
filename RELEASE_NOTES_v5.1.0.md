@@ -87,7 +87,7 @@ API要求のたびにレプリカが増えていく問題を修正しました�
 DMG を開き、`MLXBar.app` を「アプリケーション」へコピーしてください。
 このビルドは **ad-hoc 署名**で、Apple の公証は受けていません。初回起動時に「システム設定」→「プライバシーとセキュリティ」からの許可が必要になることがあります。外付けボリューム上のモデルを使う場合は、更新のたびに「リムーバブルボリューム」の許可を求められることがあります（ad-hoc 署名のため）。
 
-SHA-256: `（ビルド後に差し替え）`
+SHA-256: `5d6c5e6c758ed3604eccfeabcb3fa6a6dc40af0fc2809fb3cc78a954bb5cd69e`
 
 ---
 
@@ -174,4 +174,4 @@ This build is **ad-hoc signed** and not notarized by Apple. On first launch you 
 under System Settings → Privacy & Security. If your models live on an external volume, macOS may ask
 for "Removable Volumes" access again after every update (a consequence of ad-hoc signing).
 
-SHA-256: `(filled in after the build)`
+SHA-256: `5d6c5e6c758ed3604eccfeabcb3fa6a6dc40af0fc2809fb3cc78a954bb5cd69e`
