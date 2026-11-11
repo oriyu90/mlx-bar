@@ -74,6 +74,7 @@ API要求のたびにレプリカが増えていく問題を修正しました�
 ## 検証
 
 - `pytest`: 1140 passed / 1 skipped / 1 failed（既知 flaky の heartbeat 1 件。変更前のコードでも同じ失敗を実測）
+- 新規テスト 50 件（`Tests/test_v5_1_0_batch.py` 37 / `Tests/test_v5_1_0_persistence.py` 13）
 - `swift build`: warning 0 / error 0、`swift test`: 45 tests / 0 failures、`check_i18n`: 535 keys / 0 missing
 - 実機 e2e `scripts/verify-batch-runtime.py`: 全チェック PASS（12 項目。実コーディネーター + 実ワーカー +
   実 mlx-lm モデル。2並列・1 Worker・キャンセル独立・seed フォールバック・無効時の直列）
@@ -158,6 +159,7 @@ with replicas growing in the background on every API request.
 ## Verification
 
 - `pytest`: 1140 passed / 1 skipped / 1 failed (one known-flaky heartbeat test that also fails on the pre-change code)
+- 50 new tests (`Tests/test_v5_1_0_batch.py` 37, `Tests/test_v5_1_0_persistence.py` 13)
 - `swift build`: 0 warnings / 0 errors, `swift test`: 45 tests / 0 failures, `check_i18n`: 535 keys / 0 missing
 - Live end-to-end `scripts/verify-batch-runtime.py`: all checks PASS (12) (real coordinator, real worker,
   real mlx-lm model: two sequences on one worker, independent cancel, seed fallback, serial when disabled)
