@@ -73,9 +73,9 @@ API要求のたびにレプリカが増えていく問題を修正しました�
 
 ## 検証
 
-- `pytest`: 1151 passed / 1 skipped / 0 failed（既存 1101 + 新規 50）
-- `swift build`: warning 0 / error 0、`swift test`: 45/0、`check_i18n`: 535 keys / 0 missing
-- 実機 e2e `scripts/verify-batch-runtime.py`: 13/13 PASS（実コーディネーター + 実ワーカー +
+- `pytest`: 1140 passed / 1 skipped / 1 failed（既知 flaky の heartbeat 1 件。変更前のコードでも同じ失敗を実測）
+- `swift build`: warning 0 / error 0、`swift test`: 45 tests / 0 failures、`check_i18n`: 535 keys / 0 missing
+- 実機 e2e `scripts/verify-batch-runtime.py`: 全チェック PASS（12 項目。実コーディネーター + 実ワーカー +
   実 mlx-lm モデル。2並列・1 Worker・キャンセル独立・seed フォールバック・無効時の直列）
 - 詳細は `DESIGN_v5.1.0.md`（設計）、`TEST_PLAN_v5.1.0.md`（検証）を参照してください
 
@@ -157,9 +157,9 @@ with replicas growing in the background on every API request.
 
 ## Verification
 
-- `pytest`: 1151 passed / 1 skipped / 0 failed (1101 existing + 50 new)
-- `swift build`: 0 warnings / 0 errors, `swift test`: 45/0, `check_i18n`: 535 keys / 0 missing
-- Live end-to-end `scripts/verify-batch-runtime.py`: 13/13 PASS (real coordinator, real worker,
+- `pytest`: 1140 passed / 1 skipped / 1 failed (one known-flaky heartbeat test that also fails on the pre-change code)
+- `swift build`: 0 warnings / 0 errors, `swift test`: 45 tests / 0 failures, `check_i18n`: 535 keys / 0 missing
+- Live end-to-end `scripts/verify-batch-runtime.py`: all checks PASS (12) (real coordinator, real worker,
   real mlx-lm model: two sequences on one worker, independent cancel, seed fallback, serial when disabled)
 - See `DESIGN_v5.1.0.md` (design) and `TEST_PLAN_v5.1.0.md` (verification)
 

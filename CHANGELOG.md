@@ -33,10 +33,10 @@
 
 ### 検証
 
-- `pytest`: 1142 passed / 1 skipped / 0 failed（既存 1101 + 新規 41。`cd Coordinator && .venv/bin/python -m pytest ../Tests -q`）
-- `swift build` / `swift test`: 後述（実測値を追記）
+- `pytest`: 1140 passed / 1 skipped / 1 failed（既知 flaky の heartbeat 1 件。v5.1.0 変更前のコードでも同じ失敗を実測。`cd Coordinator && .venv/bin/python -m pytest ../Tests -q`）
+- `swift build --disable-sandbox`: warning 0 / error 0、`swift test`: 45 tests / 0 failures
 - `check_i18n`: 535 keys / 0 missing
-- 実機 e2e `scripts/verify-batch-runtime.py`: 後述
+- 実機 e2e `scripts/verify-batch-runtime.py`: 全チェック PASS（2-1〜2-6、12 項目。実コーディネーター + 実ワーカー + 実 mlx-lm モデル）
 
 ## [5.0.2] - 2026-11-10
 
